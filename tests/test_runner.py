@@ -1,9 +1,8 @@
 """Tests for the shared command runner."""
 
 import os
+import sys
 from unittest.mock import patch
-
-import pytest
 
 from gf import runner
 
@@ -32,7 +31,7 @@ def test_stream_mode_streams_and_returns_output(capsys):
 
 def test_stream_mode_streams_stderr(capsys):
     result = runner.run_command(
-        ["python", "-c", "import sys; sys.stderr.write('err\\n')"],
+        [sys.executable, "-c", "import sys; sys.stderr.write('err\\n')"],
         os.environ.copy(),
         mode="stream",
     )

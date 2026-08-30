@@ -27,11 +27,15 @@ def tmp_path():
 
 @pytest.fixture(autouse=True)
 def _git_env(tmp_path, monkeypatch):
-    """Make sure git can commit in throwaway repos."""
+    """Hermetic git identity and a host-independent default branch."""
     for key in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"):
         monkeypatch.setenv(key, "gf-test")
     for key in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
         monkeypatch.setenv(key, "test@git-folders")
+    gitconfig = tmp_path / "gitconfig"
+    gitconfig.write_text("[init]\n\tdefaultBranch = master\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
 
 
 class Result:

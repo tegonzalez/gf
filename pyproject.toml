@@ -21,6 +21,9 @@ build-backend = "uv_build"
 module-name = "gf"
 module-root = "src"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [dependency-groups]
 dev = [
     "pyfakefs>=6.2.0",

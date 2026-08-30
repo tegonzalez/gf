@@ -4,8 +4,6 @@ import os
 import re
 from pathlib import Path
 
-import pytest
-
 from gf.exceptions import GitError
 
 
@@ -1066,14 +1064,6 @@ class TestWorktreeRemove:
         # No git worktree remove was attempted.
         remove_calls = [c for c in mock_backend.calls if c[0][:2] == ("worktree", "remove")]
         assert not remove_calls
-
-    def test_worktree_remove_refuses_current_worktree(self, fs, gf_inproc, mock_backend):
-        # The current-worktree guard is exercised by the real-git
-        # integration test in test_worktree.py; in the mock backend a
-        # secondary worktree has no .git ancestor for _resolve, so we
-        # only assert the main-worktree refusal here (see
-        # test_worktree_remove_refuses_main_worktree above).
-        pytest.skip("current-worktree refusal is covered by test_worktree.py")
 
     def test_worktree_remove_restores_symlinks_on_failure(self, fs, gf_inproc, mock_backend):
         """If `git worktree remove` fails, unlinked symlinks are restored."""

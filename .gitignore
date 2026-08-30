@@ -1,0 +1,6 @@
+*.pyc
+.pytest_cache/
+.venv/
+__pycache__/
+.planning/
+.doc-graph/

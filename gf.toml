@@ -1,0 +1,5 @@
+[[git_folder]]
+name = ".doc-graph"
+url = "git@github.com:Enterlinks/doc-graph.git"
+ref = "latest"
+path = ".doc-graph"

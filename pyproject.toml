@@ -1,0 +1,28 @@
+[project]
+name = "git-folders"
+version = "0.1.0"
+description = "git-folders: manage git repositories as ordinary folders inside a parent workspace"
+authors = [
+    { name = "Tomas Gonzalez", email = "tegonzalez@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "tomli-w>=1.2.0",
+]
+
+[project.scripts]
+gf = "gf:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "gf"
+module-root = "src"
+
+[dependency-groups]
+dev = [
+    "pyfakefs>=6.2.0",
+    "pytest>=9.1.1",
+]

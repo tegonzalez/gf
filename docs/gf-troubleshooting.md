@@ -10,9 +10,10 @@ Common issues and resolutions for `git-folders` users.
 
 ## Register
 
-| id       | kind                 | restatement                                                   | owner                    | seed     | disposition | retirement                              |
-| ---      | ---                  | ---                                                           | ---                      | ---      | ---         | ---                                     |
-| GF-TRB-1 | diagnostics-deferral | `gf clone` requires the URL as the first positional argument. | [gf-spec.md](gf-spec.md) | unseeded | documented  | absorbed into command parser validation |
+| id | datetime | kind | restatement | owner | seed | disposition | retirement |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| GF-TRB-1 | 2026-08-30T04:28:41Z | diagnostics-deferral | `gf clone` requires the URL as the first positional argument. | [gf-spec.md](gf-spec.md) | unseeded | documented | absorbed into command parser validation |
+| GF-TRB-2 | 2026-08-30T19:28:11Z | diagnostics-deferral | `tests/test_cli_permutations.py` is ~4-5x slower on macOS/c0dev because every `pyfakefs.fake_open` call extracts a stack trace, which triggers `linecache.updatecache` and real `posix.stat` calls; macOS `stat` latency is ~0.7 ms versus ~2.5 microseconds on Linux. | [gf-testing.md](gf-testing.md) | unseeded | documented | absorb by reducing `open()` calls and caching `_get_version()` / `ArgumentParser` |
 
 ## `gf clone <url>` says `url` is required
 

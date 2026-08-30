@@ -4,7 +4,7 @@ doc-graph: "When there is an intention to amend this document, first Adhere to [
 
 # git-folders Constraints
 
-Constraints are hard negative-knowledge rules. If a proposed change violates one of these, stop and ask.
+This document addresses the author implementing, extending, or reconsidering `gf`. Constraints are hard negative-knowledge rules. If a proposed change violates one of these, stop and ask.
 
 ## Do not place git-folder storage outside the parent worktree
 
@@ -53,3 +53,19 @@ The second column of `ls`/`status` is the git-folder `url` from `gf.toml`. The `
 ## Do not clone a local placeholder URL
 
 `gf pull` must skip a git-folder whose effective URL resolves to the child path itself, even if the child does not exist yet. It must not create a partial child by trying to clone the placeholder.
+
+## Do not branch on the host platform in command logic
+
+`src/gf/shelf.py`, `src/gf/cli.py`, and `src/gf/backends.py` must contain no `sys.platform`, `os.name`, `platform.system()`, or equivalent host test. A host branch inside command logic gives that command two execution paths of which each host runs only one, so the path belonging to the other host is never exercised by the suite that gates the change. It then drifts silently until a developer on that host reports it, and the report arrives without the failing test that would have located it.
+
+Detection signal: a match for `sys.platform`, `os.name`, or `platform.system` anywhere outside `src/gf/platform.py`. A second signal is any test that is skipped or xfailed because of the host.
+
+Instead: express the host-dependent behavior once in `src/gf/platform.py` as a primitive with one contract — path identity or process replacement — and let the command call it unconditionally. If a needed behavior cannot be stated as one host-independent primitive, stop and ask rather than adding the branch.
+
+## Do not wrap git, the manifest, or the `.gf` layout in the platform module
+
+`src/gf/platform.py` adapts the host and nothing else. It must not invoke `git`, read or write `gf.toml` or `gf.local.toml`, or interpret the `.gf` layout. A platform module that grows a git call becomes a second git owner beside `GitCliBackend`, and two owners disagree about quoting, environment, and error handling exactly where behavior is hardest to test. A platform module that grows manifest or layout knowledge splits parent discovery across two modules, so `_resolve(cwd)` stops being the single answer to "which parent am I in".
+
+Detection signal: `platform.py` importing `gf.backends`, `gf.manifest`, `gf.shelf`, or `tomllib`, or naming `git`, `gf.toml`, or `.gf` in any string it builds.
+
+Instead: keep `GitCliBackend` the only caller of `git` and `manifest.py` the only reader of the manifest, and have them call platform primitives. A portability problem that looks like it needs a git wrapper is usually a missing primitive; add the primitive, not the wrapper.

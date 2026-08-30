@@ -14,13 +14,35 @@ This document specifies the `gf` command-line tool and the `git-folders` manifes
 
 ## Terminology
 
-| Term               | Meaning                                                                                  |
-| ---                | ---                                                                                      |
-| Parent repo        | The git repository that declares and consumes git-folders.                               |
-| Consumer workspace | A single worktree of the parent repo.                                                    |
-| Git-folder         | An external git repository consumed by the parent repo.                                  |
-| Child              | A git-folder checkout in the consumer workspace.                                         |
-| Workspace binding  | A manifest entry that maps a git-folder name to a URL, a reference, and a consumer path. |
+| Term                   | Meaning                                                                                                                                                     |
+| ---                    | ---                                                                                                                                                         |
+| Parent repo            | The git repository that declares and consumes git-folders.                                                                                                  |
+| Consumer workspace     | A single worktree of the parent repo.                                                                                                                       |
+| Git-folder             | An external git repository consumed by the parent repo.                                                                                                     |
+| Child                  | A git-folder checkout in the consumer workspace.                                                                                                            |
+| Workspace binding      | A manifest entry that maps a git-folder name to a URL, a reference, and a consumer path.                                                                    |
+| POSIX host             | Linux or macOS. The host operating systems `gf` supports.                                                                                                   |
+| Logical cwd            | The directory named by `PWD` when `PWD` is absolute and names the same directory as the process working directory; otherwise the process working directory. |
+
+## Host platform
+
+`gf` runs on POSIX hosts. Linux and macOS are supported and behave identically: no command changes its algorithm, output, or exit code because of the host it runs on. Windows is not supported.
+
+Two behaviors depend on the host. They are specified here once and are the same on every supported host.
+
+### Path identity
+
+`gf` resolves its working directory as the logical cwd. When `PWD` is absolute and names the same directory as the process working directory, `gf` uses the `PWD` spelling; otherwise it uses the process working directory. A child reached through a relative symlink — the link `gf worktree add` places at `new-worktree/<git-folder-path>` — therefore keeps the spelling the user typed. A `gf` command run inside that symlink still resolves to the source child and operates on it.
+
+The global `-C <path>` option sets both the process working directory and the logical cwd to `<path>`.
+
+Two paths name the same location when they name the same directory, not when their strings match. `gf` compares paths by directory identity, so a symlinked spelling and the directory it resolves to are one location. If either path does not exist yet, they name the same location when their resolved spellings are equal. That comparison is what lets `gf pull` skip a local placeholder URL before the child directory is created.
+
+### Process replacement
+
+When a passthrough command (`gf sh`, `gf git`, `gf diff`, `gf log`) writes to a terminal, `gf` replaces its own process with the requested command so pagers and interactive programs own the terminal. When stdout is not a terminal, the command runs as a child process and its output is captured or streamed. Process replacement is the POSIX `exec` family; `gf` specifies no other replacement mechanism.
+
+The `bin/gf` development launcher re-execs `.venv/bin/python` when that file exists and is not already the current interpreter. A virtual environment belongs to one host. A `.venv` left over from another host is a dirty tree: remove it and run `uv sync` on this host. `gf` does not probe interpreter ABI or fall back to the current interpreter to paper over that case. The installed console script (`gf` from `pyproject.toml`) is unaffected: it already runs under the interpreter that installed it. When `.venv` is absent, `bin/gf` continues under the current interpreter with `src/` on `sys.path`.
 
 ## Physical layout
 
@@ -428,3 +450,10 @@ For a single child during `gf status --remote`:
   - Edit a git-folder file; `gf status` shows `local-dirty`; `gf sh -c "git diff"` works.
   - Add a parent `git worktree`; `gf pull` in the new worktree; verify the new worktree uses a symlink to the source child and has an independent `HEAD`.
   - Switch a git-folder to a fork via `gf.local.toml`; `gf pull` updates without changing tracked parent files.
+
+## Boundaries
+
+- Windows is not a supported host. `gf` specifies no behavior for Windows process creation, for `.venv/Scripts/python.exe`, or for any other Windows-only mechanism.
+- The platform surface covers path identity and process replacement only. It does not invoke `git`, read the manifest, or interpret the `.gf` layout; the git backend remains the only caller of `git` and the manifest layer the only reader of `gf.toml`.
+- Host support is gained by removing host assumptions, not by adding host-specific command behavior. There is no second git integration and no host-conditioned clone, pull, status, ls, rm, init, or worktree algorithm.
+- A virtual environment belongs to one host. `gf` specifies no recovery for a `.venv` shared between hosts with different ABIs; that tree is cleaned and recreated on the host that will run it.

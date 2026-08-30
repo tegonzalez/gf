@@ -8,18 +8,18 @@ This index routes the durable and temporal documentation for the `git-folders` g
 
 ## Durable product docs
 
-| Path                                           | Class                           | What it covers                                         |
-| ---                                            | ---                             | ---                                                    |
-| [README.md](../README.md)                      | `dc-doc-readme`                 | Quickstart and common commands                         |
-| [gf-goals.md](gf-goals.md)                     | `dc-doc-goals`                  | Durable outcomes and priorities (GF-G1..GF-G7)         |
-| [gf-spec.md](gf-spec.md)                       | `dc-doc-spec`                   | Canonical command reference and algorithms             |
-| [gf-arch.md](gf-arch.md)                       | `dc-doc-design`                 | Architecture: cli, manifest, state, backends, mock git |
-| [gf-constraints.md](gf-constraints.md)         | `dc-doc-constraints`            | Hard "do not" rules for agents and contributors        |
-| [gf-guidelines.md](gf-guidelines.md)           | `dc-doc-guidelines`             | Positive workflow guidance for agents                  |
-| [gf-principles.md](gf-principles.md)           | `dc-doc-engineering-principles` | Source-independent engineering decision criteria       |
-| [gf-testing.md](gf-testing.md)                 | `dc-doc-test-plan`              | Verification strategy and mock-backend contract        |
-| [gf-troubleshooting.md](gf-troubleshooting.md) | `dc-doc-known-issues`           | Common issues and resolutions                          |
-| [gf-changelog.md](gf-changelog.md)             | `dc-doc-release-notes`          | Release and change history                             |
+| Path                                           | Class                           | What it covers                                                     |
+| ---                                            | ---                             | ---                                                                |
+| [README.md](../README.md)                      | `dc-doc-readme`                 | Quickstart and common commands                                     |
+| [gf-goals.md](gf-goals.md)                     | `dc-doc-goals`                  | Durable outcomes and priorities (GF-G1..GF-G8)                     |
+| [gf-spec.md](gf-spec.md)                       | `dc-doc-spec`                   | Canonical command reference and algorithms                         |
+| [gf-arch.md](gf-arch.md)                       | `dc-doc-design`                 | Architecture: platform, cli, manifest, state, backends             |
+| [gf-constraints.md](gf-constraints.md)         | `dc-doc-constraints`            | Hard "do not" rules for agents and contributors                    |
+| [gf-guidelines.md](gf-guidelines.md)           | `dc-doc-guidelines`             | Positive workflow guidance for agents                              |
+| [gf-principles.md](gf-principles.md)           | `dc-doc-engineering-principles` | Source-independent engineering decision criteria                   |
+| [gf-testing.md](gf-testing.md)                 | `dc-doc-test-plan`              | Verification strategy and mock-backend contract                    |
+| [gf-troubleshooting.md](gf-troubleshooting.md) | `dc-doc-known-issues`           | Common issues and resolutions                                      |
+| [gf-changelog.md](gf-changelog.md)             | `dc-doc-release-notes`          | Release and change history                                         |
 
 ## Temporal docs
 

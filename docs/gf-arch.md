@@ -12,9 +12,21 @@ Describe the high-level architecture of the `git-folders` tool.
 
 `git-folders` is a git-folder repository manager for git. A parent git repository declares git-folders in a tracked manifest (`gf.toml`). Each git-folder is cloned into a user-defined child directory inside the parent workspace. The child is a real git worktree with its own history; its git metadata lives in `.gf/` instead of `.git/`. The child gitdir at `child/.gf/git` is a full, self-contained gitdir with `origin` pointing to the actual git-folder URL.
 
+`gf` is a POSIX tool. Linux and macOS are supported hosts and behave identically; Windows is not supported. Host adaptation is confined to one module so that no command module carries a host branch.
+
 ## Module Inventory
 
 ### Modules and responsibilities
+
+### `src/gf/platform.py`
+
+The host adaptation layer. It owns three primitives:
+
+- `logical_cwd()` — the working directory, preferring the `PWD` spelling when `PWD` is absolute and names the same directory as the process working directory. Moved here from `cli.py`, which now calls this module. Spelling is preserved; a command inside a `worktree add` symlink still targets the source child.
+- `same_path(a, b)` — path comparison by directory identity, so a symlinked spelling and its target compare equal. When either path does not exist, comparison falls back to resolved spelling so a local placeholder URL can be skipped before the child exists.
+- `exec_or_run(...)` — process replacement for the `exec` mode of the shared runner. `runner.py` keeps `capture` and `stream` and delegates only replacement here.
+
+Its inputs are the process environment and the filesystem; its outputs are a path, a comparison result, and a replaced process. It wraps the host, not git: it never invokes `git`, reads `gf.toml`, or interprets the `.gf` layout, so `GitCliBackend` remains the sole git owner and `manifest.py` the sole manifest owner. It does not probe interpreter ABI.
 
 ### `src/gf/cli.py`
 
@@ -32,6 +44,8 @@ The command-line entry point and parser. It implements the global `-C <path>` op
 - `cmd_diff`, `cmd_log`, `cmd_git` — passthrough commands that forward trailing `argparse.REMAINDER` args to git, with explicit reconstruction to preserve token order.
 - `cmd_worktree_add`, `cmd_worktree_list`, `cmd_worktree_remove`.
 - `cmd_sh` — runs a shell or command with `GIT_DIR` set to the child gitdir.
+
+Working-directory resolution and path comparison come from `platform.py`. `cli.py` contains no host or interpreter test of its own.
 
 ### `src/gf/shelf.py`
 
@@ -68,7 +82,11 @@ Per-child metadata stored at `.gf/state`. Records the resolved SHA, requested re
 - Shared command runner with three modes: `capture`, `stream`, and `exec`.
 - `capture` collects output for parsing.
 - `stream` echoes stdout/stderr live while collecting it for error messages.
-- `exec` replaces the process when stdout is a terminal so interactive programs (e.g. pagers) work.
+- `exec` replaces the process when stdout is a terminal so interactive programs (e.g. pagers) work. It delegates the replacement itself to `platform.py`; `runner.py` owns mode selection and the `capture` and `stream` implementations.
+
+### `bin/gf`
+
+The development launcher. If `.venv/bin/python` exists it re-execs that interpreter; if not, it continues under the current interpreter with `src/` prepended to `sys.path`. It carries no host test and no ABI probe. A developer must remove a virtual environment left from another host and recreate it with `uv sync`. The installed console script does not use this launcher.
 
 ### `tests/mock_git.py`
 
@@ -101,3 +119,15 @@ parent repo
 1. **Origin contract** — child `origin` fetches from and pushes to the actual git-folder URL.
 1. **Ref contract** — `latest` resolves to the remote default branch; branch refs track `origin/<branch>`; tag/commit refs resolve to a SHA and may detach.
 1. **Discovery contract** — `_resolve(cwd)` walks up from `cwd` to find the parent `.git` and `gf.toml`.
+1. **Platform contract** — `platform.py` owns path identity and process replacement, and the direction is one-way: command and backend modules consume the primitives, and none of them reads host identity. Its unit seam is `tests/test_platform.py`; runner failure translation remains owned by `tests/test_runner.py`.
+1. **Host contract** — Linux and macOS are supported and produce identical command behavior. Windows is a declared gap, not an unstated one: `gf` carries no Windows process-creation path and no `Scripts/python.exe` lookup.
+
+### Decision register
+
+Each entry is cited by identifier instead of restated. A `current` entry is design authority; a superseded entry would name its outcome and successor here.
+
+| ID      | Decision                                                                                                                                                             | Rationale                                                                                                                                                      | Alternatives rejected                                                                                                                                                                                                                                                                                                                                                                                                | Affected surfaces                                                   | Status  |
+| ---     | ---                                                                                                                                                                  | ---                                                                                                                                                            | ---                                                                                                                                                                                                                                                                                                                                                                                                                  | ---                                                                 | ---     |
+| `GF-D1` | Confine host adaptation to one module, `src/gf/platform.py`, and give every other module host-independent primitives.                                                | One owner gives one place to state, read, and verify host behavior, and each command keeps a single execution path that both supported hosts run.              | Host tests inside `cli.py` and `shelf.py`: each branch adds a per-command path that only one host executes, so the other host's path is never exercised by the suite that gates the change. A full abstraction layer that also wraps git: duplicates `GitCliBackend` and creates a second git owner.                                                                                                                 | `src/gf/platform.py`, `src/gf/cli.py`, `src/gf/runner.py`, `bin/gf` | current |
+| `GF-D2` | `bin/gf` re-execs a present `.venv/bin/python`; a developer removes and recreates a foreign `.venv` instead of probing it.                                           | ABI fallback would hide a dirty worktree and can continue under an interpreter without the environment's dependencies.                                         | ABI-matching fallback to `sys.executable`; always skipping re-exec even when the host-owned environment is valid.                                                                                                                                                                                                                                                                                                    | `bin/gf`                                                            | current |
+| `GF-D3` | Support POSIX hosts and declare Windows out of scope rather than unstated.                                                                                           | Linux and macOS share process replacement and path semantics, so one implementation serves both; a declared gap keeps the boundary reviewable.                 | Adding Windows: needs a separate process-creation path, a `Scripts/python.exe` layout, and a second set of expected outputs, none of which the supported hosts exercise. Leaving host scope unstated: every portability question reopens the same argument with no recorded outcome.                                                                                                                                 | `src/gf/platform.py`, `bin/gf`, `docs/gf-spec.md`                   | current |

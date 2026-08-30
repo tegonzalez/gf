@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Development launcher for gf (git-folders).
 
-Finds and uses the project virtual-environment interpreter if it exists,
-otherwise falls back to the current Python. Adds `src/` to `PYTHONPATH` so the
-package can be run without installation.
+If `.venv/bin/python` exists, replace this process with it. A virtual
+environment built for another host is a dirty tree: remove it and run
+`uv sync` on this host. When `.venv` is absent, continue under the current
+interpreter with `src/` on `sys.path` so `gf` can run without `uv sync`
+when its runtime dependency is already available.
 
 The installed console script (`gf` from pyproject.toml) is the preferred
 entry point for packaged releases.

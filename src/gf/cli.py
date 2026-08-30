@@ -13,7 +13,7 @@ from pathlib import Path
 import tomli_w
 
 from .backends import GitBackend, GitCliBackend
-from . import manifest, runner, shelf
+from . import manifest, platform, runner, shelf
 from .exceptions import DirtyError, GitError, GitFoldersError, ValidationError
 
 
@@ -48,23 +48,7 @@ def _get_version() -> str:
 
 
 def _logical_cwd() -> Path:
-    """Return the current directory, preferring the logical PWD path.
-
-    Shells set `PWD` to the path the user chdir'd into, which preserves
-    symlinks. This is important inside `gf` worktrees: a path like
-    `.worktrees/test1/lib` may be a symlink to `main/lib`, but git and the
-    shell should treat it as `.worktrees/test1/lib`.
-    """
-    pwd = os.environ.get("PWD")
-    if pwd:
-        logical = Path(pwd)
-        if logical.is_absolute():
-            try:
-                if logical.resolve() == Path.cwd():
-                    return logical
-            except (OSError, RuntimeError):
-                pass
-    return Path.cwd()
+    return platform.logical_cwd()
 
 
 def _apply_chdir(argv: list[str]) -> list[str]:
@@ -216,11 +200,11 @@ def cmd_pull(args, backend: GitBackend) -> int:
         child = (parent / folder["path"]).resolve()
 
         if not _looks_remote(url):
-            resolved = (parent / url).resolve()
-            if resolved == child:
+            resolved = parent / url
+            if platform.same_path(resolved, child):
                 # Local placeholder from `gf init`; nothing to pull yet.
                 continue
-            url = str(resolved)
+            url = str(resolved.resolve())
 
         try:
             shelf.update_child(

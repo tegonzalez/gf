@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import platform
+
 
 @dataclass
 class RunResult:
@@ -66,10 +68,8 @@ def run_command(
     - `stream`: echo stdout/stderr as it arrives while still collecting it.
     """
     if mode == "exec":
-        if cwd is not None:
-            os.chdir(cwd)
         try:
-            os.execvpe(cmd[0], cmd, env)
+            platform.exec_or_run(cmd, env, cwd=cwd)
         except FileNotFoundError:
             return RunResult(127, "", f"{cmd[0]}: command not found")
         except OSError as e:

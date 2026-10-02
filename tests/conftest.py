@@ -36,7 +36,14 @@ def _git_env(tmp_path, monkeypatch):
     for key in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
         monkeypatch.setenv(key, "test@git-folders")
     gitconfig = tmp_path / "gitconfig"
-    gitconfig.write_text("[init]\n\tdefaultBranch = master\n")
+    # Belt-and-braces: git itself refuses every non-local transport
+    # (verified on git 2.47.3 — https/ssh/git:// exit 128 "transport not
+    # allowed"); local paths and user-invoked file:// stay allowed.
+    gitconfig.write_text(
+        "[init]\n\tdefaultBranch = master\n"
+        "[protocol]\n\tallow = never\n"
+        '[protocol "file"]\n\tallow = user\n'
+    )
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
 

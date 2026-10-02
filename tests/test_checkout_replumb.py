@@ -1,14 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Tomas Gonzalez
 # SPDX-License-Identifier: MIT
 
-"""Receiving tests for slice P2R.S1 — checkout-resolver re-plumb.
+"""Whole-repo `gf` behavior pins written from the spec.
 
-Every git operation in `src/gf/` is being re-plumbed to consume a
-`layout.Checkout` resolved once, with whole-repo command behavior
-byte-identical. The 253 existing tests are the unedited receiver; this
-file adds only discriminating coverage for spec'd *whole-repo* behavior
-that no existing test pinned. All tests must pass at the
-`7174803`+`8ed4c4e` baseline and unchanged after the refactor.
+Every git operation in `src/gf/` consumes a `layout.Checkout` resolved
+once; whole-repo command behavior is byte-identical to the
+pre-subfolder contract. This file holds only discriminating coverage
+for spec'd *whole-repo* behavior that no other test pins.
 
 Expectations derive only from docs/gf-spec.md (not from the
 implementation):

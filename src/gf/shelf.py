@@ -16,6 +16,20 @@ def _default_backend() -> GitBackend:
     return GitCliBackend()
 
 
+def _is_bare_repo_dir(path: Path) -> bool:
+    """Whether `path` carries bare-repository structure.
+
+    Mirrors git's `is_git_directory`: a `HEAD` file plus `objects/` and
+    `refs/` directories. A directory merely containing a file named
+    `HEAD` (e.g. a file tracked in some worktree) is not a repository.
+    """
+    return (
+        (path / "HEAD").is_file()
+        and (path / "objects").is_dir()
+        and (path / "refs").is_dir()
+    )
+
+
 def _resolved_git_url(url: str) -> str:
     """Resolve a local filesystem url to the gitdir git can fetch from.
 
@@ -27,7 +41,7 @@ def _resolved_git_url(url: str) -> str:
     p = Path(url).resolve()
     if not p.is_dir():
         return url
-    if (p / ".git").is_dir() or (p / "HEAD").is_file():
+    if (p / ".git").is_dir() or _is_bare_repo_dir(p):
         return url
     gitdir = layout.whole_repo_checkout(p).gitdir
     if (gitdir / "HEAD").is_file():
@@ -44,12 +58,13 @@ def _is_repo_dir(path: Path) -> bool:
     """Whether `path` is a repository boundary for the local URL walk-up.
 
     A directory is a repository when it carries a `.git` entry (directory,
-    gitfile, or symlink), looks like a bare repository (`HEAD` at the top
-    level), or is a `gf` child (`.gf/git` with a HEAD).
+    gitfile, or symlink), carries bare-repository structure (`HEAD`,
+    `objects/`, `refs/` at the top level), or is a `gf` child
+    (`.gf/git` with a HEAD).
     """
     if os.path.lexists(path / ".git"):
         return True
-    if (path / "HEAD").is_file():
+    if _is_bare_repo_dir(path):
         return True
     return (layout.whole_repo_checkout(path).gitdir / "HEAD").is_file()
 
@@ -67,6 +82,15 @@ def _validate_url_subdir(url: str, subdir: str) -> None:
             )
 
 
+class _GfInteriorError(GitFoldersError):
+    """A local `url` resolved into `.gf` internals — a permanent refusal.
+
+    Still `GitFoldersError` (the resolver's clear-error family), but a
+    distinct type so the `resolve_repo_url` carves never downgrade it to
+    the fetch-failure surface kept for ordinary unresolvable local paths.
+    """
+
+
 def _resolve_local_url(url: str, parent_root: Path | None) -> tuple[str, str]:
     """Resolve a local `url` by walking up to the nearest repository.
 
@@ -77,6 +101,21 @@ def _resolve_local_url(url: str, parent_root: Path | None) -> tuple[str, str]:
     if not leaf.is_absolute():
         leaf = (Path(parent_root) if parent_root is not None else Path.cwd()) / leaf
     leaf = leaf.resolve()
+    # `.gf` is gf's private layout, never a repository or its content. A
+    # leaf inside `.gf/wt` names a managed checkout — a `.git` entry
+    # there is the removed gitfile's position, not a boundary (GF-D8).
+    # Any other leaf at-or-inside a `.gf` subtree resolves only when the
+    # leaf itself is the repository boundary: `.gf/git` and
+    # `.gf/repos/<key>/git` still self-resolve as fetch sources (the
+    # `_resolved_git_url` precedent); deeper interior spellings refuse
+    # rather than mis-bind a bogus subdir into gf storage.
+    if layout.in_gf_wt(leaf) or (
+        layout.in_gf_tree(leaf) and not _is_repo_dir(leaf)
+    ):
+        raise _GfInteriorError(
+            f"could not resolve '{url}': '{leaf}' is inside a '.gf' "
+            "directory — gf's private layout, not a repository"
+        )
     candidate = leaf
     while True:
         if _is_repo_dir(candidate):
@@ -325,10 +364,22 @@ def _set_child_origin(
             git_dir=gitdir,
         )
 
-    backend.git(
-        "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*",
-        git_dir=gitdir,
-    )
+    # The wildcard line is coverage, append-only like a store's: write it
+    # plainly only onto an empty key, and `--add` it when live lines lack
+    # it — a bare `config` write would rewrite a `--single-branch`-
+    # narrowed line, and fails outright once `_ensure_pinned_ref` made
+    # the key multi-valued.
+    lines = _live_refspec_lines(gitdir, backend)
+    if not lines:
+        backend.git(
+            "config", "remote.origin.fetch", _WILDCARD_FETCH_REFSPEC,
+            git_dir=gitdir,
+        )
+    elif _WILDCARD_FETCH_REFSPEC not in lines:
+        backend.git(
+            "config", "--add", "remote.origin.fetch",
+            _WILDCARD_FETCH_REFSPEC, git_dir=gitdir,
+        )
 
 
 def _init_child_gitdir(
@@ -365,6 +416,78 @@ def _resolve_remote_branch(co: layout.Checkout, branch: str, backend: GitBackend
         raise ValidationError(f"could not resolve remote branch 'origin/{branch}' in {co.work_tree}") from e
 
 
+def _apply_ref(
+    co: layout.Checkout,
+    ref: str,
+    branch: str | None,
+    backend: GitBackend,
+    *,
+    rebase: bool = False,
+    force: bool = False,
+) -> str:
+    """Apply a resolved ref to an existing checkout once. Return the resolved SHA.
+
+    The single ref-application step both pull flows share (GF-D15
+    composition): `_fetch_and_checkout` and `_fetch_and_rebase` call it
+    after their own `fetch origin`, and `pull_shared_bindings` calls it
+    after the grouped store's one fetch — the two update algorithms
+    differ in step order, not in the operation. `branch` is the
+    caller-resolved effective branch (`None` for a tag/commit ref).
+
+    A branch ref resolves `origin/<branch>` and checks out
+    `checkout -B <branch> origin/<branch>`; under `rebase` the local
+    branch is instead recreated at the current HEAD
+    (`checkout -B <branch> HEAD`) and rebased onto `origin/<branch>`,
+    and the returned SHA stays the pre-rebase remote tip. A non-branch
+    ref resolves `ref` locally and checks out the detached SHA. `force`
+    adds `-f` to the checkout call.
+    """
+    if branch:
+        sha = _resolve_remote_branch(co, branch, backend)
+        if rebase:
+            # Ensure HEAD is on the local branch before rebasing. Using
+            # `-B <branch> HEAD` recreates the branch at the current HEAD
+            # without moving the worktree.
+            checkout_args = ["checkout"]
+            if force:
+                checkout_args.append("-f")
+            checkout_args.extend(["-B", branch, "HEAD"])
+            backend.git(
+                *checkout_args, git_dir=co.gitdir, work_tree=co.work_tree,
+                stream=True,
+            )
+            try:
+                backend.git(
+                    "rebase", f"origin/{branch}",
+                    git_dir=co.gitdir, work_tree=co.work_tree, stream=True,
+                )
+            except GitError as e:
+                raise GitError(
+                    f"rebase of {co.work_tree} onto origin/{branch} "
+                    f"failed; resolve or abort the rebase and try again"
+                ) from e
+            return sha
+        checkout_args = ["checkout"]
+        if force:
+            checkout_args.append("-f")
+        checkout_args.extend(["-B", branch, f"origin/{branch}"])
+        backend.git(
+            *checkout_args, git_dir=co.gitdir, work_tree=co.work_tree,
+            stream=True,
+        )
+        return sha
+    sha = resolve_ref(co, ref, backend)
+    checkout_args = ["checkout"]
+    if force:
+        checkout_args.append("-f")
+    checkout_args.append(sha)
+    backend.git(
+        *checkout_args, git_dir=co.gitdir, work_tree=co.work_tree,
+        stream=True,
+    )
+    return sha
+
+
 def _fetch_and_checkout(
     co: layout.Checkout,
     url: str,
@@ -384,9 +507,20 @@ def _fetch_and_checkout(
 
     If `single_branch` is True, `remote.origin.fetch` is narrowed to the
     resolved branch after the initial fetch so subsequent fetches only
-    fetch that branch's history. It is ignored for tag/commit refs.
+    fetch that branch's history; the narrowed line replaces the wildcard
+    only while it is the key's single value, and is `--add`ed alongside
+    any other live coverage lines (a pinned tag's). It is ignored for
+    tag/commit refs.
     """
     backend = backend or _default_backend()
+
+    # A narrowed child gitdir has the same non-branch coverage hole as a
+    # narrowed repo store: cover a tag/commit `ref` before the fetch so
+    # it lands the ref (the tag's appended line rides this fetch; a
+    # missing commit gets its own one-shot `fetch origin <sha>`).
+    # `_fetch_and_rebase` delegates non-branch refs here, so both
+    # whole-repo seams share the coverage.
+    _ensure_pinned_ref(co.common_dir, url, ref, backend)
 
     fetch_args = ["fetch"]
     if depth is not None:
@@ -398,33 +532,27 @@ def _fetch_and_checkout(
     branch = _effective_branch(co, ref, backend)
     if branch and single_branch:
         # Narrow the fetch refspec to the resolved branch so subsequent
-        # fetches only fetch that branch's history.
-        backend.git(
-            "config", "remote.origin.fetch",
-            f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
-            git_dir=co.common_dir,
-        )
+        # fetches only fetch that branch's history. Coverage-aware like
+        # `_set_child_origin`: a plain write when the key is absent or
+        # still holds only the `remote add` wildcard — the one case where
+        # narrowing actually shrinks coverage — and `config --add` when
+        # other live lines (a pin's tag line, hand-added coverage) would
+        # be clobbered; no write at all when the line is already there.
+        narrowed = _branch_refspec(branch)
+        lines = _live_refspec_lines(co.common_dir, backend)
+        if narrowed not in lines:
+            if not lines or lines == [_WILDCARD_FETCH_REFSPEC]:
+                backend.git(
+                    "config", "remote.origin.fetch", narrowed,
+                    git_dir=co.common_dir,
+                )
+            else:
+                backend.git(
+                    "config", "--add", "remote.origin.fetch", narrowed,
+                    git_dir=co.common_dir,
+                )
 
-    if branch:
-        sha = _resolve_remote_branch(co, branch, backend)
-        checkout_args = ["checkout"]
-        if force:
-            checkout_args.append("-f")
-        checkout_args.extend(["-B", branch, f"origin/{branch}"])
-        backend.git(
-            *checkout_args, git_dir=co.gitdir, work_tree=co.work_tree, stream=True,
-        )
-    else:
-        sha = resolve_ref(co, ref, backend)
-        checkout_args = ["checkout"]
-        if force:
-            checkout_args.append("-f")
-        checkout_args.append(sha)
-        backend.git(
-            *checkout_args, git_dir=co.gitdir, work_tree=co.work_tree, stream=True,
-        )
-
-    return sha
+    return _apply_ref(co, ref, branch, backend, force=force)
 
 
 def _fetch_and_rebase(
@@ -448,20 +576,7 @@ def _fetch_and_rebase(
 
     backend.git("fetch", "origin", git_dir=co.common_dir, stream=True)
 
-    sha = _resolve_remote_branch(co, branch, backend)
-    try:
-        # Ensure HEAD is on the local branch before rebasing. Using `-B <branch> HEAD`
-        # recreates the branch at the current HEAD without moving the worktree.
-        checkout_args = ["checkout"]
-        if force:
-            checkout_args.append("-f")
-        checkout_args.extend(["-B", branch, "HEAD"])
-        backend.git(*checkout_args, git_dir=co.gitdir, work_tree=co.work_tree, stream=True)
-        backend.git("rebase", f"origin/{branch}", git_dir=co.gitdir, work_tree=co.work_tree, stream=True)
-    except GitError as e:
-        raise GitError(f"rebase of {co.work_tree} onto origin/{branch} failed; resolve or abort the rebase and try again") from e
-
-    return sha
+    return _apply_ref(co, ref, branch, backend, rebase=True, force=force)
 
 
 def _print_gitignore_recommendation(parent_root: Path, child: Path) -> None:
@@ -470,13 +585,25 @@ def _print_gitignore_recommendation(parent_root: Path, child: Path) -> None:
     print(f'add "{rel}" to .gitignore')
 
 
-def _cleanup_new_child(child: Path, existed_before: bool, was_git_folder_before: bool) -> None:
+def _cleanup_new_child(
+    child: Path,
+    existed_before: bool,
+    was_git_folder_before: bool,
+    parent_root: Path,
+) -> None:
     """Undo the filesystem side effects of a failed child creation.
 
     If the child directory did not exist before we started, remove it entirely.
     If the child directory existed but was not yet a git-folder, remove only the
     `.gf` directory we created, leaving the original directory in place.
+
+    Belt only: a spelling that resolves to the parent root itself (for
+    example a `..`-suffixed leaf a caller failed to normalize) is never
+    removed — cleanup must not rmtree the parent worktree or its own
+    `.gf` storage.
     """
+    if os.path.realpath(child) == os.path.realpath(parent_root):
+        return
     if not existed_before:
         if child.exists():
             shutil.rmtree(child, ignore_errors=True)
@@ -495,6 +622,7 @@ def init_child(
     backend: GitBackend | None = None,
     depth: int | None = None,
     single_branch: bool = False,
+    binding_path: str | None = None,
 ) -> None:
     backend = backend or _default_backend()
     child = co.work_tree
@@ -502,23 +630,40 @@ def init_child(
         return  # already a git-folder; clone is just an add to the manifest
 
     effective_ref = ref or "latest"
-    resolved_url = _resolved_git_url(url)
+    if child.exists() and any(child.iterdir()):
+        raise ValidationError(f"child path {child} already exists and is not empty")
+
+    # clone/init is spec L140's unambiguous domain for the remote-probe
+    # class: an all-probes-fail `ls-remote` walk propagates the resolver's
+    # `.git`-boundary hint to the command envelope rather than degrading
+    # to a fetch failure. A local path that simply contains no repository
+    # keeps the fetch-failure surface (rc=2) and its cleanup semantics.
     try:
         repo_url, subdir = resolve_repo_url(url, parent_root, backend)
+    except _GfInteriorError:
+        # `.gf` interiors are refused outright: the clear refusal must
+        # reach the user, not degrade to a fetch failure.
+        raise
     except GitFoldersError:
-        # Unresolvable URLs keep the whole-repo failure surface: the fetch
-        # below reports them with the usual failure exit code.
-        repo_url, subdir = resolved_url, ""
+        if _is_remote_url(url):
+            raise
+        # Unresolvable local path keeps the fetch-failure surface —
+        # anchored at parent_root like the resolver's own anchor.
+        repo_url, subdir = str((Path(parent_root) / url).resolve()), ""
     if subdir:
         ensure_shared_binding(
             child, parent_root, repo_url, subdir, url, effective_ref,
             override=override, backend=backend, single_branch=single_branch,
+            depth=depth, binding_path=binding_path,
         )
         return
 
-    if child.exists() and any(child.iterdir()):
-        raise ValidationError(f"child path {child} already exists and is not empty")
-
+    # Origin and the fetch consume the anchored resolution `repo_url`,
+    # never the spelled `url`: `_resolved_git_url` resolves a relative
+    # path at the process cwd, which need not be the parent root (a
+    # clone invoked from a subdirectory would anchor at the cwd and
+    # fetch the wrong — or a decoy — repository).
+    resolved_url = _resolved_git_url(repo_url)
     existed_before = child.exists()
     was_git_folder_before = False
 
@@ -542,7 +687,8 @@ def init_child(
 
         _print_gitignore_recommendation(parent_root, child)
     except Exception:
-        _cleanup_new_child(child, existed_before, was_git_folder_before)
+        _cleanup_new_child(
+            child, existed_before, was_git_folder_before, parent_root)
         raise
 
 
@@ -573,6 +719,55 @@ def init_git_folder(co: layout.Checkout, backend: GitBackend | None = None) -> N
     exclude.write_text("\n".join(sorted(patterns)) + "\n")
 
 
+def recorded_url(co: layout.Checkout):
+    """The checkout record's scalar `url`, when one is recorded.
+
+    On a whole-repo child this is the binding's recorded resolution; on
+    a shared checkout it is the last-served binding's spelling — kept
+    for compatibility, with the authoritative per-binding resolutions in
+    the `binding_urls` map (see `recorded_binding_url`).
+    """
+    return state.load_checkout(co).get("url")
+
+
+def recorded_binding_url(co: layout.Checkout, binding_path: str):
+    """This binding's recorded effective url, or None when unrecorded.
+
+    Shared-checkout records key each served binding's effective `url` by
+    its manifest `path` in the `binding_urls` map (spec L181). A
+    checkout recorded before the map existed has no entry — its binding
+    resolves like an unrecorded one.
+    """
+    urls = state.load_checkout(co).get("binding_urls")
+    if isinstance(urls, dict):
+        return urls.get(binding_path)
+    return None
+
+
+def recorded_url_matches(
+    recorded,
+    url: str,
+    parent_root: Path,
+) -> bool:
+    """Whether a recorded resolution `recorded` is the effective `url`.
+
+    `recorded` is the looked-up record — the scalar `url` field or this
+    binding's `binding_urls` entry — so the same comparison serves a
+    whole-repo child and a shared-checkout binding (spec URL
+    resolution): an existing child whose recorded url matches is never
+    re-resolved; an unrecorded or changed url still resolves. A local
+    recorded spelling compares by resolved path identity so a relative
+    `url` recorded by `gf clone` still matches its absolute form on pull.
+    """
+    if not isinstance(recorded, str):
+        return False
+    if recorded == url:
+        return True
+    if _is_remote_url(recorded) or _is_remote_url(url):
+        return False
+    return (parent_root / recorded).resolve() == Path(url).resolve()
+
+
 def update_child(
     co: layout.Checkout,
     url: str,
@@ -583,17 +778,40 @@ def update_child(
     force: bool = False,
     autostash: bool = False,
     backend: GitBackend | None = None,
+    binding_path: str | None = None,
 ) -> None:
     backend = backend or _default_backend()
     child = co.work_tree
     effective_ref = ref or "latest"
     resolved_url = _resolved_git_url(url)
-    try:
-        repo_url, subdir = resolve_repo_url(url, parent_root, backend)
-    except GitFoldersError:
-        # Unresolvable URLs keep the whole-repo failure surface: the fetch
-        # below reports them with the usual failure exit code.
+    if recorded_url_matches(recorded_url(co), url, parent_root):
+        # The recorded `.gf/state` url IS this binding's resolution —
+        # an existing whole-repo child is never re-resolved (spec URL
+        # resolution).
         repo_url, subdir = resolved_url, ""
+    else:
+        try:
+            repo_url, subdir = resolve_repo_url(url, parent_root, backend)
+        except _GfInteriorError:
+            # A `.gf` interior refusal is permanent, not undecidable:
+            # pull surfaces the resolver's clear message rather than a
+            # fetch failure on gf's private path.
+            raise
+        except GitFoldersError:
+            # First resolution of a remote URL — an `init` placeholder or
+            # any binding whose checkout was never established (no
+            # resolvable HEAD) — propagates the resolver's `.git`-
+            # boundary hint (spec L140 governs exactly this undecidable
+            # case). Everything else keeps the fetch-failure surface: a
+            # local path that contains no repository, and an established
+            # whole-repo binding whose transient ls-remote failure should
+            # report a fetch failure.
+            if _is_remote_url(url) and backend.git(
+                "rev-parse", "--verify", "HEAD",
+                git_dir=co.gitdir, check=False,
+            ).returncode != 0:
+                raise
+            repo_url, subdir = resolved_url, ""
 
     if subdir and not co.subdir:
         # The binding's consumer path is not yet a link: convert an
@@ -604,7 +822,7 @@ def update_child(
         strip_placeholder_child(child, backend)
         ensure_shared_binding(
             child, parent_root, repo_url, subdir, url, effective_ref,
-            override=override, backend=backend,
+            override=override, backend=backend, binding_path=binding_path,
         )
         return
     if subdir:
@@ -634,7 +852,8 @@ def update_child(
             _print_gitignore_recommendation(parent_root, child)
             return
         except Exception:
-            _cleanup_new_child(child, existed_before, was_git_folder_before)
+            _cleanup_new_child(
+                child, existed_before, was_git_folder_before, parent_root)
             raise
 
     gitdir = co.gitdir
@@ -761,11 +980,68 @@ def _resolve_effective_sha_local(
     return resolve_ref(co, effective_ref, backend)
 
 
+def binding_scope(
+    parent_root: Path,
+    folder: dict,
+    co: layout.Checkout,
+) -> list[str] | None:
+    """Repo-relative pathspecs scoping a store-linked binding's porcelain.
+
+    The binding's RECORDED consumer path resolved through the checkout:
+    the link realpath position relative to `co.work_tree` — never
+    positional `co.subdir`, which is "" when the link lands at the
+    checkout root and over-narrow when `co` was resolved from a cwd deeper
+    than the link root. A checkout-level or dangling link falls back to
+    the recorded `bindings` union in the checkout's state. Returns None
+    for whole-repo checkouts and when no recorded scope exists.
+    """
+    if not co.is_store_checkout:
+        return None
+    rp = Path(os.path.realpath(parent_root / folder["path"]))
+    if rp != co.work_tree and rp.is_relative_to(co.work_tree):
+        return [rp.relative_to(co.work_tree).as_posix()]
+    rec = state.load_checkout(co)
+    subs = [b for b in rec.get("bindings", []) if isinstance(b, str) and b]
+    return subs or None
+
+
+def scoped_porcelain(
+    co: layout.Checkout,
+    paths: list[str],
+    backend: GitBackend | None = None,
+) -> str:
+    """`git status --porcelain -- <paths>` anchored at `co.work_tree`.
+
+    Running the status with `cwd` at the worktree root pins the pathspec
+    prefix — a cwd deeper than the link root cannot narrow or relocate it
+    — and yields worktree-relative output spellings (`docs/api/x.txt`).
+    When the worktree directory is gone, git cannot run status on it at
+    all; the empty string stands in for "no recorded dirt" — `drift`
+    reports the checkout itself as `missing`.
+
+    `GIT_LITERAL_PATHSPECS=1` takes every operand after `--` literally:
+    recorded subdirs are pathspec input, so a directory spelled
+    `:(literal)foo` or `app/[id]` would otherwise parse as magic/glob
+    and silently un-scope the run. Equivalent to a `:(literal)<path>`
+    prefix per operand (every operand here is a recorded subdir) while
+    leaving argv untouched for backends that match the
+    `("status", "--porcelain")` head.
+    """
+    backend = backend or _default_backend()
+    if not co.work_tree.is_dir():
+        return ""
+    return backend.git_capture(
+        "status", "--porcelain", "--", *paths,
+        git_dir=co.gitdir, work_tree=co.work_tree, cwd=co.work_tree,
+        env={"GIT_LITERAL_PATHSPECS": "1"},
+    )
+
+
 def drift(
     co: layout.Checkout,
     ref: str,
-    remote: bool = False,
     backend: GitBackend | None = None,
+    paths: list[str] | None = None,
 ) -> str:
     """Classify the drift state of the checkout against its effective ref.
 
@@ -779,10 +1055,18 @@ def drift(
     compares against after a `git fetch`. Run `gf pull` or `gf git fetch`
     first to refresh those refs.
 
-    - `missing`: the checkout has no `HEAD` in its gitdir.
+    - `missing`: the checkout has no `HEAD` in its gitdir, its worktree
+      directory is gone, or — for a store checkout resolved through a
+      binding's consumer path — the mapped subdirectory
+      `co.work_tree/co.subdir` no longer exists (e.g. upstream removed
+      the mapped directory and `pull` checked out the removal, leaving
+      the consumer link dangling).
     - The effective ref is resolved to the SHA `pull` would check out
       (the remote tracking branch tip for branch/latest refs).
-    - The checkout `HEAD` SHA and `git status --porcelain` are read.
+    - The checkout `HEAD` SHA and `git status --porcelain` are read. An
+      unborn HEAD (a child with no commits yet) has no SHA; it never
+      matches the resolved SHA, so it reports `behind` or `both` rather
+      than raising a git error.
     - `clean`: HEAD matches the resolved SHA and the worktree is clean.
     - `behind`: HEAD does not match and the worktree is clean.
     - `local-dirty`: HEAD matches and the worktree is dirty.
@@ -794,18 +1078,40 @@ def drift(
     """
     backend = backend or _default_backend()
     gitdir = co.gitdir
-    if not (gitdir / "HEAD").is_file():
+    if not (gitdir / "HEAD").is_file() or not co.work_tree.is_dir():
+        return "missing"
+    # A subfolder binding's mapped directory is part of the checkout
+    # root's worktree: upstream can remove it (e.g. `git rm -r` of the
+    # mapped dir) while the shared checkout root itself stays alive.
+    # The binding's content is then gone — the consumer link dangles —
+    # so the binding is `missing`, not `clean`. Whole-repo checkouts and
+    # checkout-root maps (`co.subdir == ""`) are already covered by the
+    # worktree check above.
+    if (
+        co.is_store_checkout
+        and co.subdir
+        and not (co.work_tree / co.subdir).is_dir()
+    ):
         return "missing"
 
     resolved_sha = _resolve_effective_sha_local(co, ref, backend)
 
-    head_sha = backend.git_capture(
+    # An unborn HEAD does not resolve to a commit; per the drift
+    # algorithm it cannot match the resolved ref.
+    head = backend.git(
         "rev-parse", "HEAD", git_dir=gitdir, work_tree=co.work_tree,
-    ).strip()
+        check=False,
+    )
+    head_sha = head.stdout.strip() if head.returncode == 0 else ""
 
-    porcelain = backend.git_capture(
-        "status", "--porcelain", git_dir=gitdir, work_tree=co.work_tree,
-    ).strip()
+    if paths is None:
+        porcelain = backend.git_capture(
+            "status", "--porcelain", git_dir=gitdir, work_tree=co.work_tree,
+        ).strip()
+    else:
+        # Per-binding scope: dirt elsewhere in a shared checkout must not
+        # mark a clean sibling `local-dirty`.
+        porcelain = scoped_porcelain(co, paths, backend).strip()
     dirty = bool(porcelain)
     behind = head_sha != resolved_sha
 
@@ -930,6 +1236,20 @@ def remove_child(child: Path, parent_root: Path) -> None:
     and the repo store are untouched (GF-D9, GF-D14). A whole-repo child
     keeps its files: `.gf/git` moves to `.git`.
     """
+    # `<root>/.gf` is gf's own storage — never a removable child: a
+    # corrupted or hand-edited manifest path must not let `gf rm` modify
+    # it. Test the `..`-normalized spelling and the resolved parent chain
+    # (a leaf link inside `.gf` is still `.gf` content either way).
+    gf_root = parent_root / layout.GF_DIR
+    if Path(os.path.normpath(child)).is_relative_to(
+        Path(os.path.normpath(gf_root))
+    ) or (Path(os.path.realpath(child.parent)) / child.name).is_relative_to(
+        Path(os.path.realpath(gf_root))
+    ):
+        raise ValidationError(
+            f"{child} names a path inside {gf_root}; gf storage is not a "
+            f"removable child"
+        )
     if child.is_symlink():
         if layout.owns_consumer_link(parent_root, child):
             child.unlink()
@@ -975,14 +1295,93 @@ def _live_refspec_lines(store: Path, backend: GitBackend) -> list[str]:
     return [ln for ln in result.stdout.splitlines() if ln.strip()]
 
 
-def _fetch_store(store: Path, backend: GitBackend) -> None:
+def _ensure_branch_coverage(
+    store: Path, branch: str, backend: GitBackend
+) -> None:
+    """Append `branch`'s fetch refspec line when no live line covers it.
+
+    Refspec lines are append-only (spec Fetch refspecs): existing lines
+    are never rewritten or removed, and the wildcard already covers every
+    branch, so a covered branch records nothing.
+    """
+    line = _branch_refspec(branch)
+    lines = _live_refspec_lines(store, backend)
+    if _WILDCARD_FETCH_REFSPEC not in lines and line not in lines:
+        backend.git(
+            "config", "--add", "remote.origin.fetch", line,
+            git_dir=store,
+        )
+
+
+def _ensure_pinned_ref(
+    store: Path, repo_url: str, ref: str, backend: GitBackend
+) -> None:
+    """Cover a non-branch `ref` the store's fetch refspecs may not reach.
+
+    A tag or bare commit never matches a `refs/heads/*` refspec line, and
+    git's tag auto-follow only lands tags pointing into fetched history —
+    so a store narrowed by `--single-branch` (or a whole-repo child gitdir
+    narrowed the same way) cannot reach a tag whose commit lives on an
+    unfetched branch, or a commit no advertised ref names. Two mechanisms,
+    run before the caller's store fetch so coverage lands with it:
+
+    - a 40-hex commit: `cat-file -e` probes the store; on a miss one
+      `git fetch origin <sha>` pulls it — no refspec names a bare sha,
+      and a server without allow-reachable-sha1-in-want may refuse (that
+      limit is git's own; local upstreams always allow).
+    - a tag: `rev-parse refs/tags/<ref>^{}` verifies the store's copy;
+      on a miss one `ls-remote` probes `refs/tags/<ref>` upstream and,
+      when advertised, `config --add` appends the tag's refspec line —
+      append-only like every line — so the caller's fetch lands it. A
+      landed tag persists, so later bindings do not re-cover it.
+
+    `latest`/"" and refs the store already holds as branches stay with
+    the branch machinery (`_ensure_branch_coverage`, the wildcard); a
+    ref upstream advertises as neither branch nor tag is left for the
+    caller's `could not resolve ref` error — unchanged.
+    """
+    if ref in ("latest", ""):
+        return
+    if re.fullmatch(r"[0-9a-f]{40}", ref):
+        if backend.git(
+            "cat-file", "-e", ref, git_dir=store, check=False,
+        ).returncode != 0:
+            backend.git(
+                "fetch", "origin", ref, git_dir=store, stream=True,
+            )
+        return
+    if backend.git(
+        "rev-parse", f"refs/tags/{ref}^{{}}",
+        git_dir=store, check=False,
+    ).returncode == 0:
+        return
+    for candidate in (f"refs/heads/{ref}", f"refs/remotes/origin/{ref}"):
+        if backend.git(
+            "show-ref", "--verify", candidate,
+            git_dir=store, check=False,
+        ).returncode == 0:
+            return
+    if _upstream_has_tag(repo_url, ref, backend):
+        backend.git(
+            "config", "--add", "remote.origin.fetch",
+            f"+refs/tags/{ref}:refs/tags/{ref}",
+            git_dir=store,
+        )
+
+
+def _fetch_store(
+    store: Path, backend: GitBackend, depth: int | None = None
+) -> None:
     """Fetch `origin` into the repo store, blob-filtered with fallback.
 
     When the server refuses a filtered fetch, warn and retry unfiltered.
+    `depth` is the clone's `--depth=<n>` for the fetch that creates the
+    store; joins and pulls pass None and fetch normally.
     """
+    shallow = [f"--depth={depth}"] if depth else []
     try:
         backend.git(
-            "fetch", "--filter=blob:none", "origin",
+            "fetch", "--filter=blob:none", *shallow, "origin",
             git_dir=store, stream=True,
         )
         return
@@ -992,7 +1391,7 @@ def _fetch_store(store: Path, backend: GitBackend) -> None:
             "falling back to a full fetch",
             file=sys.stderr,
         )
-    backend.git("fetch", "origin", git_dir=store, stream=True)
+    backend.git("fetch", *shallow, "origin", git_dir=store, stream=True)
 
 
 def ensure_repo_store(
@@ -1000,32 +1399,56 @@ def ensure_repo_store(
     url: str,
     *,
     branch: str | None = None,
+    ref: str | None = None,
     single_branch: bool = False,
+    depth: int | None = None,
     backend: GitBackend | None = None,
 ) -> None:
     """Ensure the bare repo store for `url` exists at `store` with coverage.
 
     On first creation this runs `git init --bare`, records
-    `remote.origin.url` verbatim (URL resolution and normalization are the
-    caller's job), writes the first fetch refspec — the branch's line for
-    `--single-branch`, else the wildcard — fetches blob-filtered with a
-    full-fetch fallback, and repoints the store's `HEAD` at
-    `refs/remotes/origin/HEAD` so the bare default symref cannot claim a
-    branch a linked checkout wants to attach.
+    `remote.origin.url` as the fetchable URL (a local `gf`-child
+    boundary resolves to its inner gitdir via `_resolved_git_url`;
+    other URL resolution and keying normalization stay the caller's
+    job), writes the first fetch refspec — the branch's line for
+    `--single-branch`, else the wildcard — covers a pinned non-branch
+    `ref` via `_ensure_pinned_ref` when no branch was resolved (a tag's
+    refspec line is `--add`ed so the creating fetch lands it, a missing
+    commit pulls its own one-shot `fetch origin <sha>`), fetches
+    blob-filtered with a full-fetch fallback (`depth` applies only to
+    this creating fetch), and
+    repoints the store's `HEAD` at `refs/remotes/origin/HEAD` so the bare
+    default symref cannot claim a branch a linked checkout wants to
+    attach.
 
     Joining an existing store appends the requested branch's refspec line
     via `config --add` only when no live `remote.origin.fetch` line covers
-    it — lines are append-only, never rewritten or removed.
+    it — lines are append-only, never rewritten or removed — and covers a
+    non-branch `ref` (tag/commit) via `_ensure_pinned_ref`, then runs
+    one `git fetch --filter=blob:none origin` (full-fetch fallback) before
+    the caller resolves the effective ref; a join never skips the fetch.
     """
     backend = backend or _default_backend()
     if not (store / "HEAD").is_file():
         store.mkdir(parents=True, exist_ok=True)
         backend.git("init", "--bare", git_dir=store)
-        backend.git("config", "remote.origin.url", url, git_dir=store)
+        backend.git(
+            "config", "remote.origin.url", _resolved_git_url(url),
+            git_dir=store,
+        )
         line = _branch_refspec(branch) if single_branch and branch \
             else _WILDCARD_FETCH_REFSPEC
         backend.git("config", "remote.origin.fetch", line, git_dir=store)
-        _fetch_store(store, backend)
+        # A pinned tag/commit ref is outside every branch refspec line:
+        # cover it before the creating fetch so the tag's `--add`ed line
+        # lands with it (a missing commit pulls its own one-shot
+        # `fetch origin <sha>`). The helper must run after the plain
+        # write above: on the still-absent key its `--add` would leave
+        # the tag's line single-valued, and the plain write would then
+        # silently replace it.
+        if not branch and ref:
+            _ensure_pinned_ref(store, url, ref, backend)
+        _fetch_store(store, backend, depth=depth)
         try:
             backend.git(
                 "remote", "set-head", "origin", "-a", git_dir=store,
@@ -1040,14 +1463,10 @@ def ensure_repo_store(
             pass
         return
     if branch:
-        line = _branch_refspec(branch)
-        lines = _live_refspec_lines(store, backend)
-        if _WILDCARD_FETCH_REFSPEC not in lines and line not in lines:
-            backend.git(
-                "config", "--add", "remote.origin.fetch", line,
-                git_dir=store,
-            )
-            _fetch_store(store, backend)
+        _ensure_branch_coverage(store, branch, backend)
+    elif ref is not None:
+        _ensure_pinned_ref(store, url, ref, backend)
+    _fetch_store(store, backend)
 
 
 def _checkout_record_valid(co: layout.Checkout) -> bool:
@@ -1058,6 +1477,38 @@ def _checkout_record_valid(co: layout.Checkout) -> bool:
     return gitdir_file.is_file() and Path(
         gitdir_file.read_text().strip()
     ) == co.work_tree / ".git"
+
+
+def _checkout_record_dir(co: layout.Checkout) -> Path | None:
+    """The worktree record `co`'s own `git worktree add` created.
+
+    The created record is not always `co.gitdir`: when that name is
+    already taken under the store's worktree records (e.g. by a foreign
+    worktree), `worktree add` picks a suffixed name like `<key>1` and
+    writes it into the checkout's `.git` gitfile. Resolve the gitfile's
+    `gitdir:` line first; once the gitfile is gone, `co.gitdir` counts
+    only while its own `gitdir` file names this work tree. Returns None
+    when no created record is identifiable — a record naming a different
+    work tree is never resolved, so callers can never rmtree a foreign
+    record or the repo store itself.
+    """
+    gitfile = co.work_tree / ".git"
+    try:
+        text = gitfile.read_text()
+    except (OSError, ValueError):
+        text = ""
+    for line in text.splitlines():
+        if line.startswith("gitdir:"):
+            record = Path(line[len("gitdir:"):].strip())
+            if not record.is_absolute():
+                record = gitfile.parent / record
+            record = Path(os.path.realpath(record))
+            if record.parent == Path(os.path.realpath(co.gitdir.parent)):
+                return record
+            break
+    if _checkout_record_valid(co):
+        return co.gitdir
+    return None
 
 
 def _sparse_union(co: layout.Checkout, backend: GitBackend) -> list[str]:
@@ -1077,10 +1528,44 @@ def _sparse_union(co: layout.Checkout, backend: GitBackend) -> list[str]:
     if co.subdir:
         bindings.add(co.subdir)
     union = sorted(bindings)
-    backend.git(
-        "sparse-checkout", "set", "--cone", *union,
-        git_dir=co.gitdir, work_tree=co.work_tree, stream=True,
+    # `--` ends option parsing so a directory spelled like an option is
+    # taken literally. `--skip-checks` (git >= 2.36) admits verbatim a
+    # member with glob characters (`app/[id]`) or a leading `!` (`!foo`
+    # — git rejects such operands as patterns). Flagging any `!`-leading
+    # `/`-segment (`app/!foo`) is a harmless superset: git's check is
+    # operand-leading only, and the flag merely relaxes validation. The
+    # spec floor is git 2.35, which rejects the flag — pass it only when
+    # a member needs it and, when git reports the option unknown, retry
+    # the identical call without it (2.35 accepts those spellings
+    # verbatim anyway).
+    args = ["sparse-checkout", "set", "--cone"]
+    if any(
+        set(d) & set("*?[]\\") or d.startswith("!") or "/!" in d
+        for d in union
+    ):
+        args.append("--skip-checks")
+    args += ["--", *union]
+    # `sparse-checkout set` resolves its dir operands against the process
+    # cwd's worktree prefix — pin cwd to the checkout root so a caller
+    # physically inside a mapped subdir (`cd -P` into `.gf/wt`) cannot
+    # re-anchor `docs/api` to `docs/docs/api` (mirrors `scoped_porcelain`).
+    result = backend.git(
+        *args, git_dir=co.gitdir, work_tree=co.work_tree,
+        cwd=co.work_tree, stream=True, check=False,
     )
+    if result.returncode != 0:
+        if "--skip-checks" in args and re.search(
+            r"unknown option|unrecognized option", result.stderr,
+            re.IGNORECASE,
+        ):
+            backend.git(
+                *(a for a in args if a != "--skip-checks"),
+                git_dir=co.gitdir, work_tree=co.work_tree,
+                cwd=co.work_tree, stream=True,
+            )
+        else:
+            msg = result.stderr.strip() or result.stdout.strip()
+            raise GitError(f"git {' '.join(args)} failed: {msg}")
     return union
 
 
@@ -1100,11 +1585,17 @@ def _lock_worktree(co: layout.Checkout, backend: GitBackend) -> None:
 def _save_checkout_state(
     co: layout.Checkout, ref: str, sha: str, bindings: list[str]
 ) -> None:
-    state.save_checkout(co, {
+    """Merge the recomputed record: `bindings` is the union of the
+    checkout's served subdirs (additive — it only grows until a binding
+    vacates), so the preserved `url`/`override`/`binding_urls` fields
+    stay consistent with it; `_vacate_checkout` owns the pruning."""
+    rec = state.load_checkout(co)
+    rec.update({
         "resolved": sha,
         "ref": ref,
         "bindings": bindings,
     })
+    state.save_checkout(co, rec)
 
 
 def ensure_checkout(
@@ -1196,9 +1687,14 @@ def ensure_checkout(
         _lock_worktree(co, backend)
     except Exception:
         if created:
-            # Undo only what this call created — the worktree record and
-            # the checkout dir. The shared repo store stays.
-            shutil.rmtree(admin, ignore_errors=True)
+            # Undo only what this call created — the worktree record the
+            # add actually created (not necessarily `admin`: a taken
+            # record name makes git pick a suffixed one, and `admin` may
+            # hold a foreign record) and the checkout dir. The shared
+            # repo store and any foreign record stay.
+            record = _checkout_record_dir(co)
+            if record is not None:
+                shutil.rmtree(record, ignore_errors=True)
             shutil.rmtree(wt, ignore_errors=True)
         raise
     _save_checkout_state(co, ref, sha, bindings)
@@ -1271,7 +1767,8 @@ def rollback_consumer_link(
 def _remote_default_branch(url: str, backend: GitBackend) -> str | None:
     """The remote's default branch from `git ls-remote --symref`, or None."""
     result = backend.git(
-        "ls-remote", "--symref", url, "HEAD", check=False,
+        "ls-remote", "--symref", _resolved_git_url(url), "HEAD",
+        check=False,
     )
     if result.returncode != 0:
         return None
@@ -1285,7 +1782,17 @@ def _remote_default_branch(url: str, backend: GitBackend) -> str | None:
 def _upstream_has_branch(url: str, branch: str, backend: GitBackend) -> bool:
     """True when `url` advertises `refs/heads/<branch>` (one `ls-remote`)."""
     result = backend.git(
-        "ls-remote", url, f"refs/heads/{branch}", check=False,
+        "ls-remote", _resolved_git_url(url), f"refs/heads/{branch}",
+        check=False,
+    )
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def _upstream_has_tag(url: str, tag: str, backend: GitBackend) -> bool:
+    """True when `url` advertises `refs/tags/<tag>` (one `ls-remote`)."""
+    result = backend.git(
+        "ls-remote", _resolved_git_url(url), f"refs/tags/{tag}",
+        check=False,
     )
     return result.returncode == 0 and bool(result.stdout.strip())
 
@@ -1335,14 +1842,21 @@ def _binding_branch(
 def _remove_checkout(co: layout.Checkout, backend: GitBackend) -> None:
     """Tear down a checkout and worktree record this call created.
 
-    Removes the linked worktree, its `<store>/worktrees/<key>` admin dir,
-    and the `<key>.state` file — never the repo store itself.
+    Removes the linked worktree, the worktree record that checkout's own
+    `worktree add` created (not necessarily `co.gitdir`: a taken record
+    name makes git pick a suffixed one), and the `.<key>.state` file —
+    never the repo store itself or a record naming another work tree.
+    `git worktree remove --force` already deletes the record the
+    checkout's `.git` gitfile names; the conditional rmtree covers what
+    git refuses (a locked record) or never made.
     """
     backend.git(
         "worktree", "remove", "--force", str(co.work_tree),
         git_dir=co.common_dir, check=False,
     )
-    shutil.rmtree(co.gitdir, ignore_errors=True)
+    record = _checkout_record_dir(co)
+    if record is not None:
+        shutil.rmtree(record, ignore_errors=True)
     shutil.rmtree(co.work_tree, ignore_errors=True)
     try:
         co.state.unlink()
@@ -1350,10 +1864,31 @@ def _remove_checkout(co: layout.Checkout, backend: GitBackend) -> None:
         pass
 
 
+def _remove_repo_store(store: Path) -> None:
+    """Remove a repo store the failing command itself created.
+
+    `store` is `<root>/.gf/repos/<repo-key>/git`; the store tree — with
+    any worktree records and state this call left under it — is removed
+    and the `<repo-key>` ancestry dir pruned when empty. Never call this
+    for a pre-existing or serving store; the caller's `store_created`
+    flag is the discriminator.
+    """
+    shutil.rmtree(store, ignore_errors=True)
+    try:
+        store.parent.rmdir()
+    except OSError:
+        pass
+
+
+def _binding_gitignore_line(parent_root: Path, child: Path) -> str:
+    """The .gitignore recommendation line for the binding's consumer path."""
+    rel = child.relative_to(parent_root).as_posix()
+    return f'add "{rel}" to .gitignore'
+
+
 def _print_binding_gitignore(parent_root: Path, child: Path) -> None:
     """Recommend the binding's consumer path for the parent .gitignore."""
-    rel = child.relative_to(parent_root).as_posix()
-    print(f'add "{rel}" to .gitignore')
+    print(_binding_gitignore_line(parent_root, child))
 
 
 def ensure_shared_binding(
@@ -1367,44 +1902,62 @@ def ensure_shared_binding(
     override: bool,
     backend: GitBackend,
     single_branch: bool = False,
+    depth: int | None = None,
+    binding_path: str | None = None,
 ) -> None:
     """Create or join the shared-store binding whose consumer link is `child`.
 
     Ensures the repo store (`--single-branch` narrows the first refspec
-    line only when this call creates the store; joins never re-narrow),
+    line only when this call creates the store; joins never re-narrow;
+    `depth` applies only to the fetch that creates the store — a join
+    ignores it),
     derives the checkout key from the resolved branch — `latest` resolves
     to the effective branch first, tags/commits key as `ref=<ref>` —
     ensures the shared sparse checkout, places the relative consumer link
     at `child` pointing into `<checkout>/<subdir>`, and records the
-    binding's state. On a later-step failure the link is rolled back and
-    only the checkout this call created is torn down; the store and other
-    bindings' checkouts stay.
+    binding's state — including its effective `url` in the per-binding
+    `binding_urls` map keyed by `binding_path` (the manifest consumer
+    `path`). On a later-step failure the link is rolled back and
+    only the checkout this call created is torn down; a repo store this
+    call itself created is removed too, while pre-existing stores and
+    other bindings' checkouts always stay.
     """
     store = layout.repo_store(parent_root, repo_url)
     branch = _binding_branch(store, repo_url, ref, backend)
     store_created = not (store / "HEAD").is_file()
-    ensure_repo_store(
-        store, repo_url, branch=branch, single_branch=single_branch,
-        backend=backend,
-    )
-    key = (
-        layout.checkout_key_for_branch(branch)
-        if branch else layout.checkout_key_for_ref(ref)
-    )
-    co = layout.subfolder_checkout(parent_root, repo_url, key, subdir)
-    checkout_existed = _checkout_record_valid(co)
-    ensure_checkout(co, branch or ref, backend=backend)
-
-    action = None
     try:
-        action = ensure_consumer_link(child, co.work_tree / co.subdir)
-        rec = state.load_checkout(co)
-        rec.update({"url": url, "override": override})
-        state.save_checkout(co, rec)
+        ensure_repo_store(
+            store, repo_url, branch=branch, ref=ref,
+            single_branch=single_branch, depth=depth, backend=backend,
+        )
+        key = (
+            layout.checkout_key_for_branch(branch)
+            if branch else layout.checkout_key_for_ref(ref)
+        )
+        co = layout.subfolder_checkout(parent_root, repo_url, key, subdir)
+        checkout_existed = _checkout_record_valid(co)
+        ensure_checkout(co, branch or ref, backend=backend)
+
+        action = None
+        try:
+            action = ensure_consumer_link(child, co.work_tree / co.subdir)
+            rec = state.load_checkout(co)
+            rec.update({"url": url, "override": override})
+            if binding_path is not None:
+                urls = rec.get("binding_urls")
+                if not isinstance(urls, dict):
+                    urls = {}
+                urls[binding_path] = url
+                rec["binding_urls"] = urls
+            state.save_checkout(co, rec)
+        except Exception:
+            rollback_consumer_link(child, action)
+            if not checkout_existed:
+                _remove_checkout(co, backend)
+            raise
     except Exception:
-        rollback_consumer_link(child, action)
-        if not checkout_existed:
-            _remove_checkout(co, backend)
+        if store_created:
+            _remove_repo_store(store)
         raise
 
     if store_created:
@@ -1435,92 +1988,56 @@ def strip_placeholder_child(child: Path, backend: GitBackend | None = None) -> b
     return False
 
 
-def _apply_shared_checkout(
-    co: layout.Checkout,
-    ref: str,
-    branch: str | None,
-    backend: GitBackend,
-    *,
-    rebase: bool = False,
-    force: bool = False,
-) -> str:
-    """Apply the resolved ref to an existing shared checkout once.
-
-    Mirrors `_fetch_and_checkout`/`_fetch_and_rebase` minus the fetch —
-    a grouped pull already fetched the repo store once.
-    """
-    if branch:
-        sha = _resolve_remote_branch(co, branch, backend)
-        if rebase:
-            checkout_args = ["checkout"]
-            if force:
-                checkout_args.append("-f")
-            checkout_args.extend(["-B", branch, "HEAD"])
-            backend.git(
-                *checkout_args, git_dir=co.gitdir, work_tree=co.work_tree,
-                stream=True,
-            )
-            try:
-                backend.git(
-                    "rebase", f"origin/{branch}",
-                    git_dir=co.gitdir, work_tree=co.work_tree, stream=True,
-                )
-            except GitError as e:
-                raise GitError(
-                    f"rebase of {co.work_tree} onto origin/{branch} "
-                    f"failed; resolve or abort the rebase and try again"
-                ) from e
-            return sha
-        checkout_args = ["checkout"]
-        if force:
-            checkout_args.append("-f")
-        checkout_args.extend(["-B", branch, f"origin/{branch}"])
-        backend.git(
-            *checkout_args, git_dir=co.gitdir, work_tree=co.work_tree,
-            stream=True,
-        )
-        return sha
-    sha = resolve_ref(co, ref, backend)
-    checkout_args = ["checkout"]
-    if force:
-        checkout_args.append("-f")
-    checkout_args.append(sha)
-    backend.git(
-        *checkout_args, git_dir=co.gitdir, work_tree=co.work_tree,
-        stream=True,
-    )
-    return sha
-
-
 def _vacate_checkout(
     old_co: layout.Checkout,
-    folders: list[dict],
     parent_root: Path,
 ) -> None:
     """Drop moved bindings from a vacated shared checkout's record.
 
-    The recorded `bindings` are recomputed from the manifest: a subdir
+    The recorded `bindings` are recomputed from the manifest of the
+    checkout's OWNING root (`parent_root`) — never from the invoking
+    worktree's copied `folders`, which can lag the source manifest when
+    a binding is cloned in after `worktree add` snapshotted it: a subdir
     stays only while some consumer link still resolves into this
-    checkout's mapped directory. The worktree's files — tracked and
+    checkout's mapped directory, and a `binding_urls` entry stays only
+    while its consumer path still resolves here — a vacated binding's
+    recorded url does not linger. The worktree's files — tracked and
     uncommitted — are never touched.
     """
     if not _checkout_record_valid(old_co):
         return
+    mf = {}
+    if (parent_root / _manifest.MANIFEST).is_file():
+        mf = _manifest.read_manifest(parent_root)
+    folders = mf.get("git_folder", [])
     live = set()
+    live_paths = set()
     for folder in folders:
         child = parent_root / folder["path"]
         if not child.is_symlink():
             continue
         fco = layout.resolve_checkout(child.resolve())
-        if fco.gitdir != fco.common_dir and fco.gitdir == old_co.gitdir:
+        if fco.is_store_checkout and fco.gitdir == old_co.gitdir:
             live.add(fco.subdir)
+            live_paths.add(folder["path"])
     rec = state.load_checkout(old_co)
     bindings = [
         b for b in rec.get("bindings", [])
         if isinstance(b, str) and b in live
     ]
+    urls = rec.get("binding_urls")
+    pruned_urls = (
+        {k: v for k, v in urls.items() if k in live_paths}
+        if isinstance(urls, dict) else None
+    )
+    changed = False
     if bindings != rec.get("bindings"):
         rec["bindings"] = bindings
+        changed = True
+    if pruned_urls is not None and pruned_urls != urls:
+        rec["binding_urls"] = pruned_urls
+        changed = True
+    if changed:
         state.save_checkout(old_co, rec)
 
 
@@ -1532,7 +2049,11 @@ def _siblings_served(
     key: str,
 ) -> list[dict]:
     """Manifest bindings outside `excluded_names` whose consumer link
-    currently resolves into the shared checkout (`store`, `key`)."""
+    currently resolves into the shared checkout (`store`, `key`).
+
+    `folders` must be the OWNING root's manifest (`parent_root`), not
+    the invoking worktree's copy — the same skew `_vacate_checkout`
+    guards against."""
     served = []
     for folder in folders:
         if folder.get("name") in excluded_names:
@@ -1542,7 +2063,7 @@ def _siblings_served(
             continue
         co = layout.resolve_checkout(child.resolve())
         if (
-            co.gitdir != co.common_dir
+            co.is_store_checkout
             and co.common_dir == store
             and co.gitdir.name == key
         ):
@@ -1560,66 +2081,156 @@ def pull_shared_bindings(
     autostash: bool = False,
     backend: GitBackend | None = None,
 ) -> list[str]:
-    """Pull resolved subfolder-binding `items`, grouped by store+checkout.
+    """Pull resolved subfolder-binding `items`, grouped by owning root +
+    store + checkout.
 
-    Per repo store: `ensure_repo_store` coverage (creating the store with
+    Each item's owning root derives from its resolved checkout: a store
+    checkout lives under `<root>/.gf/wt/...`, so a pull invoked through a
+    `gf worktree add` link chain operates on the SOURCE worktree's store,
+    checkout and consumer link; an unresolved binding materializes under
+    `parent_root`. Per repo store: `ensure_repo_store` coverage (creating
+    the store with
     wildcard refspec + fetch when missing; an uncovered explicit branch
-    gets one fetch-probe that records its refspec line only when it lands)
-    followed by exactly one store fetch. Resolution is recorded/local —
-    never an `ls-remote`/`remote set-head` re-probe. Per checkout key:
+    that upstream advertises gets its refspec line appended — append-only,
+    probed by one `ls-remote`; a `latest` whose store origin/HEAD is
+    missing or dangles probes the remote's default the same way and
+    repoints the symref; a tag/commit ref gets `_ensure_pinned_ref`
+    coverage — a tag's refspec line when upstream advertises it, or a
+    one-shot `fetch origin <sha>` for a missing commit) followed by
+    exactly one store fetch.
+    Resolution is otherwise recorded/local — no other `ls-remote`/
+    `remote set-head` re-probe. Per checkout key:
     `ensure_checkout` per binding (record check + cone-union widening +
-    gitfile/lock), one dirty check over the union cone — `--force` /
-    `--autostash` apply to the whole checkout and a dirty shared checkout
-    blocks every binding it serves — then a single ref apply. Per binding:
+    gitfile/lock), one unscoped dirty check over the materialized
+    checkout — `--force` / `--autostash` apply to the whole checkout
+    and a dirty shared checkout blocks every binding it serves — then
+    a single ref apply. Per binding:
     `ensure_consumer_link` create/retarget to `<checkout>/<subdir>` plus a
-    merged `save_checkout`; a retarget away from another checkout drops
-    the binding from the vacated checkout's recorded bindings. Returns one
+    merged `save_checkout` that also records the binding's effective `url`
+    in the `binding_urls` map keyed by its manifest `path`; a retarget
+    away from another checkout drops the binding from the vacated
+    checkout's recorded bindings and url map. Returns one
     output line per binding served; unselected siblings whose shared
-    checkout moved are marked `(moved with <leader>)`.
+    checkout moved are marked `(moved with <leader>)`. `.gitignore`
+    recommendation lines precede the served lines: one for a store this
+    pull created, one for each consumer link it created or placed over an
+    empty directory.
     """
     backend = backend or _default_backend()
     lines: list[str] = []
     excluded = {it["folder"]["name"] for it in items}
 
-    by_store: dict[Path, list[dict]] = {}
+    # Each item is served by the root that OWNS its checkout: a resolved
+    # store checkout lives under `<root>/.gf/wt/...`, so a pull invoked
+    # through a `gf worktree add` link chain fetches the source
+    # worktree's store and retargets ITS consumer link — never a second
+    # `.gf` under the invoking worktree. A binding without a store
+    # checkout (a missing or never-placed link) is materialized under
+    # this pull's `parent_root`.
+    by_store: dict[tuple[Path, Path], list[dict]] = {}
     for it in items:
-        it["store"] = layout.repo_store(parent_root, it["repo_url"])
-        by_store.setdefault(it["store"], []).append(it)
+        owner = (
+            layout.owning_root(it["co"])
+            if it["co"].is_store_checkout else None)
+        it["owning_root"] = owner if owner is not None else parent_root
+        it["store"] = layout.repo_store(it["owning_root"], it["repo_url"])
+        by_store.setdefault((it["owning_root"], it["store"]), []).append(it)
 
-    for store, sitems in by_store.items():
+    for (owning_root, store), sitems in by_store.items():
         repo_url = sitems[0]["repo_url"]
-        fetched = False
-        if not (store / "HEAD").is_file():
-            ensure_repo_store(store, repo_url, backend=backend)
-            fetched = True
-        for it in sitems:
-            ref = it["ref"]
-            if ref in ("latest", ""):
-                branch = _store_default_branch(store, backend)
-            elif re.fullmatch(r"[0-9a-f]{40}", ref):
-                branch = None
-            elif _store_has_branch(store, ref, backend):
-                branch = ref
-            elif backend.git(
-                "fetch", "origin", _branch_refspec(ref),
-                git_dir=store, check=False,
-            ).returncode == 0:
-                # An uncovered branch on a narrow store: the fetch-probe
-                # landed it, so append its refspec line for future pulls.
-                backend.git(
-                    "config", "--add", "remote.origin.fetch",
-                    _branch_refspec(ref), git_dir=store,
+        store_existed = (store / "HEAD").is_file()
+        try:
+            if not store_existed:
+                # A store created here already fetched inside
+                # ensure_repo_store — it gets no second fetch below.
+                ensure_repo_store(store, repo_url, backend=backend)
+                lines.append(f'add "{layout.GF_DIR}/" to .gitignore')
+            for it in sitems:
+                ref = it["ref"]
+                try:
+                    if ref in ("latest", ""):
+                        branch = _store_default_branch(store, backend)
+                        if branch is None or not _store_has_branch(
+                            store, branch, backend
+                        ):
+                            # The store's origin/HEAD is missing or dangles
+                            # over a branch a narrow store never fetched:
+                            # probe the remote's default once (the same
+                            # ls-remote carve as an uncovered explicit
+                            # branch), record coverage so the store fetch
+                            # below lands it, and repoint origin/HEAD so
+                            # later `latest` resolutions stay local.
+                            remote = _remote_default_branch(repo_url, backend)
+                            if remote is not None:
+                                _ensure_branch_coverage(store, remote, backend)
+                                backend.git(
+                                    "symbolic-ref",
+                                    "refs/remotes/origin/HEAD",
+                                    f"refs/remotes/origin/{remote}",
+                                    git_dir=store,
+                                )
+                                branch = remote
+                    elif re.fullmatch(r"[0-9a-f]{40}", ref):
+                        # A pinned commit no refspec names: pull it with
+                        # a one-shot `fetch origin <sha>` when the store
+                        # lacks it (local upstreams always allow it).
+                        _ensure_pinned_ref(store, repo_url, ref, backend)
+                        branch = None
+                    elif _store_has_branch(store, ref, backend):
+                        branch = ref
+                    elif _upstream_has_branch(repo_url, ref, backend):
+                        # An uncovered branch a narrow store lacks but
+                        # upstream has: append its refspec line
+                        # (append-only) so the store fetch below lands it.
+                        _ensure_branch_coverage(store, ref, backend)
+                        branch = ref
+                    else:
+                        # A tag-ish ref the branch refspecs cannot cover:
+                        # append the tag's line when upstream advertises
+                        # it so the store fetch below lands it; anything
+                        # else falls through to `could not resolve ref`.
+                        _ensure_pinned_ref(store, repo_url, ref, backend)
+                        branch = None
+                except GitFoldersError as e:
+                    e.folder = it["folder"]
+                    raise
+                it["branch"] = branch
+                it["key"] = (
+                    layout.checkout_key_for_branch(branch)
+                    if branch
+                    else layout.checkout_key_for_ref(ref or "latest")
                 )
-                branch, fetched = ref, True
-            else:
-                branch = None
-            it["branch"] = branch
-            it["key"] = (
-                layout.checkout_key_for_branch(branch)
-                if branch else layout.checkout_key_for_ref(ref or "latest")
-            )
-        if not fetched:
-            _fetch_store(store, backend)
+            if store_existed:
+                # Exactly one store fetch per pull, after all refspec
+                # appends.
+                _fetch_store(store, backend)
+        except Exception as e:
+            # A bare store-phase failure (store create, the single
+            # fetch) is attributed to a binding OF THIS STORE; the
+            # coverage loop already named its own item. `lines` lets
+            # the caller print the lines of bindings already served.
+            if getattr(e, "folder", None) is None:
+                e.folder = sitems[0]["folder"]
+            e.lines = lines
+            if not store_existed:
+                # A store this pull created is removed so a retry
+                # starts from a clean slate: a leaked half-made store
+                # keeps HEAD on refs/heads/master, which the join's
+                # `worktree add` then reports as already used. A
+                # pre-existing store is never removed — even when the
+                # coverage loop appended refspec lines first.
+                _remove_repo_store(store)
+            raise
+
+        # The manifest that decides which bindings this root serves is
+        # the OWNING root's own — the invoking worktree's copied
+        # `folders` can lag it (a binding cloned in after `worktree add`
+        # snapshotted the copy), and `_vacate_checkout`/`_siblings_served`
+        # must not miss a link that still resolves here.
+        mf = {}
+        if (owning_root / _manifest.MANIFEST).is_file():
+            mf = _manifest.read_manifest(owning_root)
+        owning_folders = mf.get("git_folder", [])
 
         by_key: dict[str, list[dict]] = {}
         for it in sitems:
@@ -1630,21 +2241,23 @@ def pull_shared_bindings(
             ref, branch = lead["ref"], lead["branch"]
             try:
                 co = layout.subfolder_checkout(
-                    parent_root, repo_url, key, lead["subdir"])
+                    owning_root, repo_url, key, lead["subdir"])
                 existed = _checkout_record_valid(co)
                 for it in kitems:
                     ensure_checkout(
                         layout.subfolder_checkout(
-                            parent_root, repo_url, key, it["subdir"]),
+                            owning_root, repo_url, key, it["subdir"]),
                         branch or ref, backend=backend)
 
-                rec = state.load_checkout(co)
-                cone = sorted(
-                    {b for b in rec.get("bindings", [])
-                     if isinstance(b, str) and b}
-                    | {it["subdir"] for it in kitems})
+                # The dirty check covers the whole materialized
+                # checkout, exactly as `drift` and `update_child`
+                # observe it: skip-worktree bits already confine
+                # git's report to materialized paths, so an
+                # unscoped status sees dirt the subdir union would
+                # miss (e.g. a root-level file cone mode
+                # materializes).
                 dirty = backend.git_capture(
-                    "status", "--porcelain", "--", *cone,
+                    "status", "--porcelain",
                     git_dir=co.gitdir, work_tree=co.work_tree,
                 ).strip()
                 if dirty and not (force or autostash):
@@ -1662,7 +2275,7 @@ def pull_shared_bindings(
                     stashed = True
                 try:
                     if existed:
-                        sha = _apply_shared_checkout(
+                        sha = _apply_ref(
                             co, ref, branch, backend,
                             rebase=rebase, force=force)
                     else:
@@ -1690,21 +2303,23 @@ def pull_shared_bindings(
                             f"run `git stash pop` manually. {e}") from e
             except GitFoldersError as e:
                 e.folder = lead["folder"]
+                e.lines = lines
                 raise
 
             for it in kitems:
                 it_co = layout.subfolder_checkout(
-                    parent_root, repo_url, key, it["subdir"])
+                    owning_root, repo_url, key, it["subdir"])
+                link = owning_root / it["folder"]["path"]
                 try:
-                    ensure_consumer_link(
-                        it["child"], it_co.work_tree / it_co.subdir)
+                    action = ensure_consumer_link(
+                        link, it_co.work_tree / it_co.subdir)
                     old_co = it["co"]
-                    if old_co.gitdir != old_co.common_dir and (
+                    if old_co.is_store_checkout and (
                         old_co.common_dir != store
                         or old_co.gitdir != it_co.gitdir
                         or old_co.subdir != it["subdir"]
                     ):
-                        _vacate_checkout(old_co, folders, parent_root)
+                        _vacate_checkout(old_co, owning_root)
                     rec = state.load_checkout(it_co)
                     rec.update({
                         "resolved": sha,
@@ -1712,13 +2327,26 @@ def pull_shared_bindings(
                         "url": it["url"],
                         "override": it["override"],
                     })
+                    urls = rec.get("binding_urls")
+                    if not isinstance(urls, dict):
+                        urls = {}
+                    urls[it["folder"]["path"]] = it["url"]
+                    rec["binding_urls"] = urls
                     state.save_checkout(it_co, rec)
                 except GitFoldersError as e:
                     e.folder = it["folder"]
+                    e.lines = lines
                     raise
+                if action and action[0] in ("created", "replaced-dir"):
+                    # A link this pull placed at the consumer path gets
+                    # the same .gitignore recommendation
+                    # `ensure_shared_binding` prints; retargeted links
+                    # already had one when they were created.
+                    lines.append(
+                        _binding_gitignore_line(owning_root, link))
                 lines.append(f"Pulled {it['folder']['name']}")
             for sib in _siblings_served(
-                    folders, excluded, parent_root, store, key):
+                    owning_folders, excluded, owning_root, store, key):
                 lines.append(
                     f"Pulled {sib['name']} "
                     f"(moved with {lead['folder']['name']})")
@@ -1731,6 +2359,8 @@ def select_children(parent_root: Path, cwd: Path, args: list[str], manifest: dic
     Matching is realpath-aware (spec "Target selection rules"): a target
     that resolves inside a binding's map selects the innermost such
     binding; otherwise the target selects every binding at or below it.
+    A spelled operand names its binding lexically too, so siblings that
+    alias one map stay distinct under selection.
     """
     folders = manifest.get("git_folder", [])
     if not folders:
@@ -1752,13 +2382,47 @@ def select_children(parent_root: Path, cwd: Path, args: list[str], manifest: dic
 
 def _select_for_path(parent_root: Path, folders: list[dict], target: Path) -> list[dict]:
     """Match one path against bindings: the innermost binding whose map
-    contains `target`, else every binding at or below `target`."""
+    contains `target`, else every binding at or below `target`.
+
+    A spelled consumer path disambiguates in two places. Inside the
+    realpath-inside set it breaks equal-depth ties — sibling links onto
+    one map collapse to a single realpath depth, so `one`/`two` operands
+    onto the same checkout subdir select only the spelled binding — and,
+    when no map contains `target` at all, the lexically innermost binding
+    containing the spelled target answers before `_below`. A spelled path
+    traversing a link INTO a deeper binding's map still resolves by
+    realpath: the deeper map is innermost regardless of the spelling.
+    """
+    spelled = [s for s in folders
+               if _lexical_match(parent_root, s["path"], target)]
     inside = [s for s in folders if _path_matches(parent_root, s["path"], target)]
     if inside:
         deepest = max(len(_map_root(parent_root, s["path"]).parts) for s in inside)
-        return [s for s in inside
-                if len(_map_root(parent_root, s["path"]).parts) == deepest]
+        innermost = [s for s in inside
+                     if len(_map_root(parent_root, s["path"]).parts) == deepest]
+        named = [s for s in innermost if s in spelled]
+        return named or innermost
+    if spelled:
+        deepest = max(len(_lexical_root(parent_root, s["path"]).parts)
+                      for s in spelled)
+        return [s for s in spelled
+                if len(_lexical_root(parent_root, s["path"]).parts) == deepest]
     return [s for s in folders if _below(parent_root, s["path"], target)]
+
+
+def _lexical_root(parent_root: Path, folder_path: str) -> Path:
+    """The binding's consumer path normalized lexically: `.`/`..` segments
+    resolved without following links, so sibling links onto one map stay
+    distinct."""
+    return Path(os.path.normpath(parent_root / folder_path))
+
+
+def _lexical_match(parent_root: Path, folder_path: str, target: Path) -> bool:
+    """True when the spelled `target` names the binding's consumer path or a
+    path inside it, comparing path segments only (no link following)."""
+    return Path(os.path.normpath(target)).is_relative_to(
+        _lexical_root(parent_root, folder_path)
+    )
 
 
 def _map_root(parent_root: Path, folder_path: str) -> Path:
@@ -1766,6 +2430,23 @@ def _map_root(parent_root: Path, folder_path: str) -> Path:
     for a whole-repo binding, the mapped checkout subdir for a subfolder
     binding."""
     return Path(os.path.realpath(parent_root / folder_path))
+
+
+def folder_containing(parent_root: Path, path: Path, manifest: dict) -> dict | None:
+    """The manifest binding whose map contains `path` (innermost), if any.
+
+    Unlike `_select_for_path`'s `_below` fallback, a path merely ABOVE a
+    binding's consumer dir does not identify it — used by the passthrough
+    envelope where only an inside-the-map cwd pins a folder.
+    """
+    folders = manifest.get("git_folder", [])
+    inside = [s for s in folders if _path_matches(parent_root, s["path"], path)]
+    if not inside:
+        return None
+    deepest = max(len(_map_root(parent_root, s["path"]).parts) for s in inside)
+    return next(
+        s for s in inside
+        if len(_map_root(parent_root, s["path"]).parts) == deepest)
 
 
 def _path_matches(parent_root: Path, folder_path: str, target: Path) -> bool:
@@ -1781,8 +2462,15 @@ def _path_matches(parent_root: Path, folder_path: str, target: Path) -> bool:
 
 
 def _below(parent_root: Path, folder_path: str, target: Path) -> bool:
-    """True when the binding's consumer path or its map is at-or-below `target`."""
+    """True when the binding's consumer path or its map is at-or-below `target`.
+
+    The lexical arm normalizes `..`/`.` segments (mirroring
+    `_lexical_match`): `sub/../vendor` names `vendor`, so a spelled
+    parent still reaches the bindings below it. The map arm keeps the
+    raw operand — realpath must traverse mid-path links so `..` after a
+    consumer link pops inside the link target's tree, not lexically."""
     unresolved = parent_root / folder_path
-    return unresolved.is_relative_to(target) or _map_root(
+    return unresolved.is_relative_to(
+        Path(os.path.normpath(target))) or _map_root(
         parent_root, folder_path
     ).is_relative_to(Path(os.path.realpath(target)))

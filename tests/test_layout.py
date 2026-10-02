@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Tomas Gonzalez
 # SPDX-License-Identifier: MIT
 
-"""Receiving tests for slice P2.W1.2 — the checkout resolver in `src/gf/layout.py`.
+"""The checkout resolver in `src/gf/layout.py`.
 
 Written from the governing documents only: docs/gf-spec.md ("Physical layout",
 "Subfolder-binding layout", "Reference model", "`.gf` directory", "Target
@@ -10,9 +10,6 @@ Layout contract, Store and checkout contract, GF-D5/D7/D8/D13), and
 docs/gf-constraints.md ("Do not construct `.gf` layout paths outside the
 checkout resolver"). No expectation below is derived from implementation
 output.
-
-`src/gf/layout.py` does not exist yet: this file is expected to fail at
-collection with a module-import error until the implementation lands.
 
 The public surface these tests pin (each name cited to its source):
 
@@ -116,7 +113,7 @@ def _assert_subfolder_checkout(c: Checkout, root: Path, key: str, subdir: str) -
     # the record at <store>/worktrees/<checkout-key> (GF-D13).
     assert Path(c.gitdir) == store / "worktrees" / key
     assert Path(c.work_tree) == _realpath(root) / ".gf" / "wt" / K / key
-    assert Path(c.state) == _realpath(root) / ".gf" / "wt" / K / (key + ".state")
+    assert Path(c.state) == _realpath(root) / ".gf" / "wt" / K / ("." + key + ".state")
     assert str(c.subdir) == subdir
 
 
@@ -177,7 +174,7 @@ def test_repo_key_differs_for_different_repos():
 
 # --- checkout_key -------------------------------------------------------
 #
-# S2 contract (spec "Reference model", arch GF-D7):
+# The checkout-key contract (spec "Reference model", arch GF-D7):
 #   floating checkout (branch/`latest`) -> checkout_key_for_branch:
 #                                          quote(resolved_branch, safe='')
 #   pinned checkout (tag/commit)        -> checkout_key_for_ref:
@@ -188,7 +185,7 @@ def test_repo_key_differs_for_different_repos():
 
 
 def _checkout_key(ref: str, *, resolved_branch: str | None = None) -> str:
-    """Evaluate the S2 key contract for one binding ref.
+    """Evaluate the checkout-key contract for one binding ref.
 
     `resolved_branch` is the branch a floating `branch`/`latest` checkout
     resolved to; pass None for a pinned tag/commit ref. The contract's
@@ -362,7 +359,7 @@ def test_resolve_checkout_from_consumer_link_realpath(tmp_path):
     assert isinstance(c, Checkout)
     _assert_subfolder_checkout(c, root, "master", "docs/api")
     # No state file exists, yet resolution succeeded.
-    assert not (_realpath(root) / ".gf" / "wt" / K / "master.state").exists()
+    assert not (_realpath(root) / ".gf" / "wt" / K / ".master.state").exists()
     assert Path(c.work_tree) == _realpath(checkout)
 
 

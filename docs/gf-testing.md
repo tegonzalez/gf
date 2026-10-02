@@ -51,6 +51,23 @@ A host whose git defaults to `main`, with the default-branch pin absent or overr
 | `tests/test_platform.py`         | Tests for `logical_cwd`, `same_path`, and `exec_or_run`                                                                                                                   |
 | `tests/test_host_inputs.py`      | Real-Git proof that the configured initial branch is `master`                                                                                                             |
 | `tests/test_subfolder.py`        | Real-git subfolder-binding scenarios: URL resolution, shared stores and checkouts, consumer links, scoped status, `rm`, worktree commands, `init` conversion      |
+| `tests/test_url_resolution.py`   | URL resolution unit tests: local walk-up, `.git` boundary, longest-prefix probe, unresolvable URL                                                                          |
+| `tests/test_layout.py`           | The checkout resolver in `src/gf/layout.py`: `Checkout` derivation for both binding forms                                                                                 |
+| `tests/test_checkout_replumb.py` | Checkout-resolver re-plumb: every consumer reaches git state through the `Checkout` seam                                                                                  |
+| `tests/test_checkout_key.py`     | The `ref=` checkout-key contract: collision-free pinned keys                                                                                                              |
+| `tests/test_store_checkout.py`   | Shared store, checkout, and consumer-link creation primitives                                                                                                             |
+| `tests/test_clone_subfolder.py`  | `gf clone` and `gf init` creating subfolder bindings through the seam                                                                                                     |
+| `tests/test_pull_grouped.py`     | `gf pull` grouped composition and init-child first-pull conversion                                                                                                        |
+| `tests/test_status_scoping.py`   | `gf status`/`gf ls` and drift scoped per binding, local-only                                                                                                              |
+| `tests/test_rm_subfolder.py`     | `gf rm` subfolder semantics                                                                                                                                                |
+| `tests/test_passthrough.py`      | `gf sh`/`git`/`diff`/`log` passthrough on resolved checkouts                                                                                                              |
+| `tests/test_worktree.py`         | `gf worktree add` integration                                                                                                                                              |
+| `tests/test_worktree_links.py`   | `gf worktree` consumer-link semantics                                                                                                                                     |
+| `tests/test_realpath_discovery.py` | Realpath-aware discovery and binding selection                                                                                                                          |
+| `tests/test_error_fields.py`     | The error-message contract: name, path, and operation fields                                                                                                              |
+| `tests/test_env_guard.py`        | Environment guard: git itself refuses non-local transports in the suite                                                                                                   |
+| `tests/test_mock_git.py`         | Self-tests for the in-memory git model in `tests/mock_git.py`                                                                                                             |
+| `tests/test_hardening_regressions.py` | Regression pins for confirmed defects, strict-xfail until each fix lands                                                                                               |
 
 ## Mock backend contract
 

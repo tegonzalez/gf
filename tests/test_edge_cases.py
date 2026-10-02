@@ -552,3 +552,58 @@ def test_status_without_remote_does_not_fetch(tmp_path):
     assert re.search(r"lib\s+" + re.escape(str(upstream)) + r"\s+\[master\]\s*$", result.stdout, re.MULTILINE)
     assert "clean" not in result.stdout
     assert "behind" not in result.stdout
+
+
+def test_c_option_unusable_path_reports_error_not_traceback(tmp_path):
+    """Ruling R4: `gf -C <path>` that cannot be entered exits 1 with
+    `gf: cannot change to '<operand>': <reason>` — the operand path and
+    the failed operation named, no Python traceback. Covers a plain
+    nonexistent path and a dangling consumer-link spelling (a real `gf`
+    consumer symlink whose checkout has been removed)."""
+    # Plain nonexistent operand.
+    missing = tmp_path / "no" / "such" / "dir"
+    r = gf("-C", str(missing), "ls", check=False)
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    err = r.stderr + r.stdout
+    assert re.search(
+        rf"cannot change to '{re.escape(str(missing))}': .+", err), err
+    assert "Traceback" not in err, err
+
+    # Dangling consumer-link spelling: a real `gf` consumer symlink whose
+    # checkout target has been removed.
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    git("init", "--bare", cwd=upstream)
+    work = tmp_path / "_seed"
+    git("clone", str(upstream), str(work), cwd=tmp_path)
+    (work / "docs" / "api").mkdir(parents=True)
+    (work / "docs" / "api" / "x.txt").write_text("api")
+    git("add", "docs/api/x.txt", cwd=work)
+    git("commit", "-m", "init", cwd=work)
+    git("push", "origin", "master", cwd=work)
+
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    git("init", cwd=parent)
+    (parent / "README").write_text("root")
+    git("add", "README", cwd=parent)
+    git("commit", "-m", "root", cwd=parent)
+    gf("-C", str(parent), "clone", str(upstream / "docs" / "api"),
+       "vendor/api")
+
+    link = parent / "vendor" / "api"
+    if not link.is_symlink():
+        pytest.fail("setup: subfolder consumer path is not a symlink")
+    checkout = Path(os.path.realpath(link))
+    for _ in Path("docs/api").parts:
+        checkout = checkout.parent
+    shutil.rmtree(checkout)
+    if not link.is_symlink() or link.exists():
+        pytest.fail("setup: consumer link did not end up dangling")
+
+    r = gf("-C", str(link), "ls", check=False)
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    err = r.stderr + r.stdout
+    assert re.search(
+        rf"cannot change to '{re.escape(str(link))}': .+", err), err
+    assert "Traceback" not in err, err

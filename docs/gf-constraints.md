@@ -106,6 +106,14 @@ Instead: key checkouts by `(repo store, checkout key)` — branch name for branc
 
 Both binding forms resolve their `gitdir`, `work_tree`, `common_dir`, `subdir`, and state path through one checkout-resolver function. A second place that spells `".gf" / "git"` or walks `.gf/wt` structure gives the layout two owners, and the owners diverge exactly where whole-repo and subfolder bindings differ.
 
-Detection signal: a `".gf"` or `"git"` layout literal, or a `worktrees/` path join, in `src/gf/` outside the resolver module; `grep -n '"\.gf"' src/gf/` must match only the resolver module.
+Detection signal: a `".gf"` or `"git"` layout literal, or a `worktrees/` path join, in `src/gf/` outside the resolver module; `grep -rn '"\.gf"' src/gf/` must match only the resolver module.
 
-Instead: put the literal layout in the resolver module (planned as `src/gf/layout.py`) and call it everywhere a path under `.gf` is needed.
+Instead: put the literal layout in the resolver module, `src/gf/layout.py`, and call it everywhere a path under `.gf` is needed.
+
+## Do not duplicate a git operation per binding form
+
+Every git operation exists once and works on the `Checkout` the resolver returns; `GF-D15` in [gf-arch.md](gf-arch.md#decision-register) fixes the only places where the whole-repo and subfolder forms may differ. A second implementation of an operation for one form, such as an `_at`-suffixed twin, or a form test outside those places builds a parallel subsystem: each fix and each test reaches only one form's copy, and the copies drift apart exactly where the forms meet.
+
+Detection signal: two functions that perform the same git operation, one per binding form; or, outside `src/gf/layout.py` and the places `GF-D15` lists, a conditional that chooses behavior by binding form, however it is spelled — for example reading `Checkout.is_store_checkout` or comparing `gitdir` with `common_dir`. A secondary text signal is a match for `grep -rn 'def .*subfolder\|_at(' src/gf/` other than the resolver's `subfolder_checkout` constructor.
+
+Instead: write the operation once against the `Checkout` fields — `common_dir` for plumbing and for `worktree add`/`lock`, `gitdir` and `work_tree` for worktree operations — and read the form only through `Checkout.is_store_checkout` at a place `GF-D15` lists. If a needed difference fits none of those places, stop and ask.

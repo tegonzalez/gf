@@ -34,6 +34,19 @@ class Checkout:
     subdir: str
     state: Path
 
+    @property
+    def is_store_checkout(self) -> bool:
+        """True when this checkout is a linked checkout of a repo store.
+
+        THE single named discriminator per the architecture standing
+        rule: consumers read this property and never re-compare
+        `gitdir`/`common_dir` themselves. A whole-repo child keeps
+        `common_dir == gitdir`; a subfolder binding's linked worktree has
+        `gitdir` under the store's `worktrees/` while `common_dir` is the
+        store itself.
+        """
+        return self.gitdir != self.common_dir
+
 
 def _normalize_url(url: str) -> str:
     """Expand a bare host/path URL; mirrors `cli._normalize_url`."""
@@ -87,7 +100,7 @@ def subfolder_checkout(root: Path, repo_url: str, key: str, subdir: str) -> Chec
         work_tree=wt,
         common_dir=store,
         subdir=subdir,
-        state=wt.parent / f"{key}.state",
+        state=wt.parent / f".{key}.state",
     )
 
 
@@ -121,6 +134,21 @@ def in_gf_wt(path: Path) -> bool:
     return any(a.name == "wt" and a.parent.name == GF_DIR for a in rp.parents)
 
 
+def in_gf_tree(path: Path) -> bool:
+    """True when `path`'s realpath is a `.gf` dir or lies inside one.
+
+    `.gf` roots gf's private layout — a child's `git`/`state`, or a
+    parent's `repos` stores and `wt` checkout trees — never repository
+    content a consumer spelling may resolve into. `in_gf_wt` is the
+    narrower checkout-tree guard; this one also covers the `.gf` dir
+    itself and every other subtree, including the `.gf` interior's own
+    repository boundaries (`.gf/git`, `.gf/repos/<key>/git`) — exempting
+    those stays the caller's decision.
+    """
+    rp = Path(os.path.realpath(path))
+    return any(a.name == GF_DIR for a in (rp, *rp.parents))
+
+
 def owns_consumer_link(root: Path, link: Path) -> bool:
     """True when `link`'s realpath lands under `<root>/.gf/wt` (GF-D14).
 
@@ -151,6 +179,22 @@ def resolve_checkout(path: Path) -> Checkout:
             work_tree=anc,
             common_dir=store,
             subdir="" if anc == rp else rp.relative_to(anc).as_posix(),
-            state=anc.parent / f"{anc.name}.state",
+            state=anc.parent / f".{anc.name}.state",
         )
     return whole_repo_checkout(Path(path))
+
+
+def owning_root(co: Checkout) -> Path | None:
+    """The `<root>` whose `.gf/wt` holds `co`'s work tree, else None.
+
+    A store checkout's work tree is `<root>/.gf/wt/<repo-key>/<key>`; that
+    root owns the checkout's repo store, record and consumer links — the
+    root a command entered through a `gf worktree add` link chain must
+    operate on (commands through symlinked children resolve to the
+    source). A whole-repo checkout has no `.gf/wt` ancestor and returns
+    None: the binding belongs to whichever root is operating on it.
+    """
+    anc = _gf_wt_root(Path(os.path.realpath(co.work_tree)))
+    if anc is None:
+        return None
+    return anc.parent.parent.parent.parent

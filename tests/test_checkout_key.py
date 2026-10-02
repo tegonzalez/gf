@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: 2026 Tomas Gonzalez
 # SPDX-License-Identifier: MIT
 
-"""Receiving tests for slice P2R.S2 — the `ref=` checkout-key contract.
+"""The `ref=` checkout-key contract for subfolder bindings.
 
 These tests pin the spec-visible checkout-key behavior of subfolder
 bindings: the directory names under `<root>/.gf/wt/<repo-key>/`, the
-`<checkout-key>.state` file, the consumer-link targets, and the branch a
+`.<checkout-key>.state` file, the consumer-link targets, and the branch a
 shared checkout stays attached to. Expectations derive only from
 docs/gf-spec.md and docs/gf-arch.md:
 
@@ -13,7 +13,7 @@ docs/gf-spec.md and docs/gf-arch.md:
   (`branch`/`latest`) checkout keys by `quote(resolved branch,
   safe='')`; a pinned (tag/commit) checkout keys by `'ref=' +
   quote(ref, safe='')`. Checkouts live at `wt/<repo-key>/<checkout-key>/`
-  with per-checkout state at `wt/<repo-key>/<checkout-key>.state`; the
+  with per-checkout state at `wt/<repo-key>/.<checkout-key>.state`; the
   consumer path is a relative symlink to `<checkout>/<subdir>`.
 - spec "Reference model" + arch GF-D7: `=` never appears in a
   percent-encoded branch key, so a `ref=` pinned key cannot collide with
@@ -21,27 +21,21 @@ docs/gf-spec.md and docs/gf-arch.md:
   scheme (branch `ref-v0.1` vs pinned `v0.1`) are distinct checkouts.
 - spec "Reference model": bindings sharing a repo URL and resolving to
   the same checkout key share one checkout, sparse cone unioned.
-- spec "Reference model" wave-2 regression: `gf init --ref dev` keeps its
-  checkout on `dev` after a later `gf clone --latest` on the same repo
-  (the documented flag for the binding's ref is `-b`; `latest` is the
-  default when `-b` is omitted).
+- spec "Reference model": `gf init -b dev` keeps its checkout on `dev`
+  after a later `gf clone` (implicit `latest`) on the same repo —
+  `latest` is the default when `-b` is omitted.
 - spec "gf rm": a subfolder binding's consumer link and manifest entry
   are removed; the checkout — including uncommitted work — the sparse
   cone, and the repo store are not touched.
 - spec "gf status" / "gf ls": `branch` is the branch of the shared
   checkout serving the binding, `[]` for a detached HEAD.
 
-This file is authored before the P2R.S2 implementation lands: every test
-here is expected RED at the `7174803`+`8ed4c4e` baseline (the subfolder
-flow does not exist yet) and green under the landed contract.
-
-Re-landed for P2R.S5 (commands now route through the landed S3/S4 seam):
-one adaptation — the in-link `git rev-parse --abbrev-ref HEAD` check was
-replaced by reading git's own worktree record at
-`<store>/worktrees/<key>/HEAD`, because under GF-D8 plain git inside a
-consumer link resolves to the PARENT repository, not the checkout.
-Everything else is verbatim: the pins are spec-anchored and validate
-whichever slice wires `gf rm`/`status` for subfolder bindings.
+Adapted to the landed command path: the in-link `git rev-parse
+--abbrev-ref HEAD` check was replaced by reading git's own worktree
+record at `<store>/worktrees/<key>/HEAD`, because under GF-D8 plain git
+inside a consumer link resolves to the PARENT repository, not the
+checkout. Everything else is verbatim: the pins are spec-anchored and
+validate the `gf rm`/`status` behavior they assert.
 """
 
 import re
@@ -72,6 +66,8 @@ def _subfolder_upstream(tmp_path: Path) -> Path:
     ref-v0.1:   adds docs/api/branch-marker.txt  (named like an
                 old-scheme pinned key — the collision case)
     feature/x:  adds docs/api/feature-x.txt      (slash branch name)
+    master.state: adds docs/api/master-state.txt (a branch whose key is
+                spelled exactly like master's pre-migration state file)
     v1.2, v0.1: lightweight tags on master
     """
     upstream = tmp_path / "upstream"
@@ -92,6 +88,7 @@ def _subfolder_upstream(tmp_path: Path) -> Path:
         ("dev", "dev.txt", "api on dev"),
         ("ref-v0.1", "branch-marker.txt", "api on ref-v0.1 branch"),
         ("feature/x", "feature-x.txt", "api on feature/x branch"),
+        ("master.state", "master-state.txt", "api on master.state branch"),
     ):
         git("checkout", "-q", "-b", branch, "master", cwd=work)
         (work / "docs" / "api" / marker).write_text(content)
@@ -133,6 +130,36 @@ def _status_row(stdout: str, name: str, url: Path) -> str | None:
     return None
 
 
+def _assert_master_and_dotted_state_coexist(parent: Path) -> None:
+    """The `master`/`master.state` coexistence claim, both orders.
+
+    `master.state` is a checkout DIR (the dotted branch's key); the state
+    records are the dotfiles `.<key>.state` beside the checkout keys.
+    """
+    rk = _repo_key_dir(parent)
+    assert _checkout_dirs(rk) == ["master", "master.state"]
+    # wt/<rk>/.<key>.state — state lives outside the checkout-key
+    # namespace, so `master.state` stays a usable checkout dir.
+    assert (rk / ".master.state").is_file()
+    assert (rk / ".master.state.state").is_file()
+
+    api = parent / "vendor" / "api"
+    api_state = parent / "vendor" / "api-state"
+    assert api.resolve() == (rk / "master" / "docs" / "api").resolve()
+    assert api_state.resolve() == (
+        rk / "master.state" / "docs" / "api"
+    ).resolve()
+
+    # Each consumer link serves its own branch: the `master.state`
+    # marker exists only through the dotted branch's checkout.
+    assert (api / "api.txt").read_text() == "api on master"
+    assert not (api / "master-state.txt").exists()
+    assert (api_state / "api.txt").read_text() == "api on master"
+    assert (api_state / "master-state.txt").read_text() == (
+        "api on master.state branch"
+    )
+
+
 # --- pinned-ref checkouts -----------------------------------------------
 
 
@@ -152,8 +179,8 @@ def test_clone_tag_ref_creates_ref_equals_checkout(tmp_path):
     rk = _repo_key_dir(parent)
     checkout = rk / "ref=v1.2"
     assert checkout.is_dir()
-    # Per-checkout state file is named <checkout-key>.state.
-    assert (rk / "ref=v1.2.state").is_file()
+    # Per-checkout state file is named .<checkout-key>.state.
+    assert (rk / ".ref=v1.2.state").is_file()
 
     # The consumer path is a symlink into the checkout's mapped subdir.
     link = parent / "vendor" / "api"
@@ -175,7 +202,7 @@ def test_clone_tag_ref_creates_ref_equals_checkout(tmp_path):
     assert 'name = "api"' not in manifest
     assert 'path = "vendor/api"' not in manifest
     assert checkout.is_dir()
-    assert (rk / "ref=v1.2.state").is_file()
+    assert (rk / ".ref=v1.2.state").is_file()
 
 
 def test_ref_equals_separates_old_scheme_collision_pair(tmp_path):
@@ -213,6 +240,51 @@ def test_ref_equals_separates_old_scheme_collision_pair(tmp_path):
     assert (api_tag / "tool.txt").read_text() == "tool on master"
 
 
+def test_dotted_branch_key_coexists_with_state_records(tmp_path):
+    """spec 'Subfolder-binding layout': per-checkout state lives at
+    `wt/<repo-key>/.<checkout-key>.state` — outside the checkout-key
+    namespace — so a branch literally named `master.state` gets checkout
+    dir `master.state/` next to `master/` while each checkout's record
+    is a separate dotfile. Here `master` is cloned first."""
+    upstream = _subfolder_upstream(tmp_path)
+    parent = _real_parent(tmp_path)
+
+    gf(
+        "-C", str(parent), "clone",
+        str(upstream / "docs" / "api"), "vendor/api",
+        "-b", "master",
+    )
+    gf(
+        "-C", str(parent), "clone",
+        str(upstream / "docs" / "api"), "vendor/api-state",
+        "-b", "master.state",
+    )
+
+    _assert_master_and_dotted_state_coexist(parent)
+
+
+def test_dotted_branch_key_coexists_with_state_records_reversed(tmp_path):
+    """Same coexistence in the other creation order: `master.state`
+    first, then `master` — the dotted checkout (and its
+    `.master.state.state` record) precede the `master` checkout and its
+    `.master.state` record."""
+    upstream = _subfolder_upstream(tmp_path)
+    parent = _real_parent(tmp_path)
+
+    gf(
+        "-C", str(parent), "clone",
+        str(upstream / "docs" / "api"), "vendor/api-state",
+        "-b", "master.state",
+    )
+    gf(
+        "-C", str(parent), "clone",
+        str(upstream / "docs" / "api"), "vendor/api",
+        "-b", "master",
+    )
+
+    _assert_master_and_dotted_state_coexist(parent)
+
+
 def test_clone_branch_ref_creates_quoted_branch_checkout(tmp_path):
     """A `branch` ref keys the checkout by `quote(branch, safe='')` — a
     slash encodes into one path component, never a nested directory."""
@@ -228,7 +300,7 @@ def test_clone_branch_ref_creates_quoted_branch_checkout(tmp_path):
     rk = _repo_key_dir(parent)
     checkout = rk / "feature%2Fx"
     assert checkout.is_dir()
-    assert (rk / "feature%2Fx.state").is_file()
+    assert (rk / ".feature%2Fx.state").is_file()
     assert not (rk / "feature").exists()  # no extra path level
     assert (parent / "vendor" / "api" / "feature-x.txt").read_text() == (
         "api on feature/x branch"
@@ -263,10 +335,9 @@ def test_latest_and_named_branch_share_one_checkout(tmp_path):
 
 
 def test_init_ref_keeps_checkout_on_dev_after_clone_latest(tmp_path):
-    """spec 'Reference model' wave-2 regression: `gf init --ref dev`
-    keeps its checkout on `dev` after a later `gf clone --latest` of the
-    same repository (the documented ref flag is `-b`; `latest` is the
-    default when `-b` is omitted)."""
+    """spec 'Reference model': `gf init -b dev` keeps its checkout on
+    `dev` after a later `gf clone` (implicit `latest`) of the same
+    repository — `latest` is the default when `-b` is omitted."""
     upstream = _subfolder_upstream(tmp_path)
     parent = _real_parent(tmp_path)
 

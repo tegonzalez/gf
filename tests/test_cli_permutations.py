@@ -208,7 +208,7 @@ class TestClone:
 
         r = gf_inproc("-C", str(parent), "ls", backend=mock_backend)
         assert r.returncode == 0
-        assert re.search(r"lib\s+lib\s+\[master\]", r.stdout)
+        assert re.search(r"lib\s+lib\s+\[\]\s+\?", r.stdout)
 
         _upstream(mock_backend, files={"a.txt": "hello"})
         gf_inproc("-C", str(parent), "clone", "/upstream", "lib2", backend=mock_backend)
@@ -556,7 +556,7 @@ class TestStatus:
 
         r = gf_inproc("-C", str(parent), "status", backend=mock_backend)
         assert r.returncode == 0
-        assert re.search(r"lib\s+lib\s+\[master\]", r.stdout)
+        assert re.search(r"lib\s+lib\s+\[\]", r.stdout)
 
     def test_status_remote_clean(self, fs, gf_inproc, mock_backend):
         parent = _parent(fs)

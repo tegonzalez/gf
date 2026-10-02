@@ -21,6 +21,9 @@ def is_git_folder_child(path: Path) -> bool:
 def find_parent_root(start: Path) -> Optional[Path]:
     """Walk up from start looking for a parent repo that contains .git.
 
+    Context discovery, not binding ownership — `binding_root` owns the
+    anchor side of a declared binding path.
+
     A `.git` inside `<root>/.gf/wt` belongs to a gf-managed checkout — the
     gitfile's canonical position before removal — and never marks a parent
     repo, so discovery walks past it (plan D4 / arch GF-D8).
@@ -28,6 +31,24 @@ def find_parent_root(start: Path) -> Optional[Path]:
     for path in [start, *start.parents]:
         if (path / ".git").exists() and not layout.in_gf_wt(path):
             return path.resolve()
+    return None
+
+
+def binding_root(child: Path, path: str) -> Optional[Path]:
+    """The ancestor of resolved `child` under which a manifest `path` spells it.
+
+    Owning root for source-relative url anchoring: the root where the
+    binding's declared consumer path is real. A foreign repository nested
+    between the child and the declaring root cannot claim the anchor —
+    `root / path` resolves elsewhere there.
+    """
+    if Path(path).is_absolute():
+        return None
+    for anc in child.parents:
+        if (anc / path).resolve() == child and (
+            (anc / ".git").exists() or (anc / MANIFEST).is_file()
+        ):
+            return anc
     return None
 
 
@@ -50,8 +71,13 @@ def resolve_context(start: Path) -> tuple[Optional[Path], Optional[Path]]:
 
     When `start` passes through a symlink into another repo, the unresolved
     child path may not be a subpath of the resolved parent. In that case we
-    resolve `start` and look for the child under the resolved parent so the
-    caller can safely call `child.relative_to(parent)`.
+    resolve `start` and look for the child under the resolved parent.
+
+    Callers must consume `child` in a spelling whose resolution does not
+    depend on `cwd` — pass the absolute `child` itself (a `cwd / <abs>`
+    join collapses to `<abs>`), never `child.relative_to(parent)`, which a
+    `cwd / arg` re-anchoring in `select_children` would double onto a cwd
+    inside the physical `.gf/wt` checkout.
     """
     start = Path(start)
     parent = find_parent_root(start)

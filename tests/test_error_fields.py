@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Tomas Gonzalez
 # SPDX-License-Identifier: MIT
 
-"""Receiving tests for slice P2R.E1 — the error-message contract.
+"""The error-message contract for identified git-folders.
 
 Spec §Error handling (docs/gf-spec.md):
 
@@ -19,7 +19,7 @@ and are deliberately NOT pinned here: "not inside a git repo",
 errors, and `gf sh`/`gf git` passthrough stderr (the command's own
 output, not a gf message).
 
-Baseline offenders these pins expose (locate by content, pre-E1):
+Message shapes these pins exist to forbid (locate by content):
 
   - `child <path> is dirty; commit or stash before pulling`
     (pull, rc 3 — path+operation, no name)
@@ -55,9 +55,14 @@ Baseline offenders these pins expose (locate by content, pre-E1):
     origin/HEAD symref on a dev-only upstream so `latest` has no
     local fallback)
 
-Deferred: the worktree-add `child path already exists` die
-(cli.py:542) is in the seam's fix scope but its receiving pin is
-deferred to S10 per the arch ruling.
+The worktree-add `child path already exists` pin lives in
+test_worktree_links.py, not here.
+
+Error-envelope gaps also swept here (same class as the `_porcelain`
+gap): `_branch`/`_head` `rev-parse` calls in `cmd_status` and `cmd_ls`
+that would swallow a failure into ''/'?' fallbacks — a genuine failure
+on an identified folder must not exit 0 with a degraded row instead of
+the envelope + rc=2.
 
 Field assertions are spec-visible only: the folder NAME must appear,
 the manifest-relative PATH spelling must appear (absolute renderings
@@ -68,21 +73,22 @@ internals are pinned.
 Mock-backend cases run in-process via `gf_inproc`/`mock_backend`
 (pyfakefs); failures that need real git semantics (rebase conflict,
 stash-pop conflict, worktree-symlinked child) run through the real
-`gf` subprocess. Every test here is expected RED at the pre-E1
-baseline and green under the landed seam.
+`gf` subprocess.
 """
 
 import re
 from pathlib import Path
 
 from conftest import gf, git, push_branch, push_commit
+from gf.exceptions import GitError
 
 
 # --- shared field assertion -----------------------------------------------
 
 
 def _assert_error_fields(result, *, name, path, operation, rc):
-    """Assert the E1 clause on a failed command result.
+    """Assert the §Error handling name/path/operation clause on a failed
+    command result.
 
     `name` is the git-folder name; `path` is its manifest-relative
     spelling ("vendor/lib" — an absolute rendering contains it);
@@ -358,6 +364,31 @@ def _real_repo(tmp_path: Path):
     return upstream, parent
 
 
+def _real_parent(tmp_path: Path) -> Path:
+    """A real parent repo without an upstream."""
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    git("init", cwd=parent)
+    (parent / "README").write_text("root")
+    git("add", "README", cwd=parent)
+    git("commit", "-m", "root", cwd=parent)
+    return parent
+
+
+def _subfolder_upstream(tmp_path: Path, name: str) -> Path:
+    """Bare upstream whose master tree carries a `docs/api` subfolder."""
+    up = tmp_path / name
+    git("init", "--bare", str(up), cwd=tmp_path)
+    work = tmp_path / f"_seed_{name}"
+    git("clone", str(up), str(work), cwd=tmp_path)
+    (work / "docs" / "api").mkdir(parents=True)
+    (work / "docs" / "api" / "x.txt").write_text(f"api in {name}")
+    git("add", "-A", cwd=work)
+    git("commit", "-m", "init", cwd=work)
+    git("push", "origin", "master", cwd=work)
+    return up
+
+
 def _run_real(scenario, tmp_path: Path):
     upstream, parent = _real_repo(tmp_path)
     argv, fields = scenario(upstream, parent)
@@ -560,6 +591,54 @@ class TestRmErrorFields:
             gf_inproc(*argv, backend=mock_backend, check=False), **fields)
 
 
+class _FailPorcelain:
+    """Wrap a backend so `status --porcelain` raises GitError — the
+    failure the `_porcelain()` call in `cmd_status` hits outside the
+    drift try-block (cli.py ~L426)."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def git(self, *args, **kwargs):
+        if args[:2] == ("status", "--porcelain"):
+            raise GitError("git status --porcelain failed: exploded")
+        return self._inner.git(*args, **kwargs)
+
+    def git_capture(self, *args, **kwargs):
+        if args[:2] == ("status", "--porcelain"):
+            raise GitError("git status --porcelain failed: exploded")
+        return self._inner.git_capture(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class _FailRevParse:
+    """Wrap a backend so `git rev-parse <fail_args...>` raises GitError —
+    the failure the `_branch()`/`_head()` calls hit in `cmd_status`
+    (cli.py ~L413) and `cmd_ls` (~L457/L458). Those helpers swallow
+    GitFoldersError into ''/'?' fallbacks, so a genuine rev-parse
+    failure on an identified folder exits 0 with a degraded row instead
+    of carrying the envelope — the same gap class as `_porcelain`."""
+
+    def __init__(self, inner, *fail_args):
+        self._inner = inner
+        self._fail = fail_args
+
+    def git(self, *args, **kwargs):
+        if args[: len(self._fail)] == self._fail:
+            raise GitError("git rev-parse failed: exploded")
+        return self._inner.git(*args, **kwargs)
+
+    def git_capture(self, *args, **kwargs):
+        if args[: len(self._fail)] == self._fail:
+            raise GitError("git rev-parse failed: exploded")
+        return self._inner.git_capture(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 class TestStatusErrorFields:
     """spec 'gf status --remote': unresolvable ref → clear error,
     deterministic non-zero exit (§status, §Error handling)."""
@@ -570,6 +649,75 @@ class TestStatusErrorFields:
             fs, gf_inproc, mock_backend)
         _assert_error_fields(
             gf_inproc(*argv, backend=mock_backend, check=False), **fields)
+
+    def test_status_porcelain_failure_error_carries_fields(
+            self, fs, gf_inproc, mock_backend):
+        """A `status --porcelain` failure on an identified git-folder
+        surfaces name+path+operation through the `folder_error` envelope —
+        the `_porcelain` call in `cmd_status` sits outside the drift
+        try-block, so a GitError escaping without it would violate the
+        envelope (spec §Error handling: git-error class rc=2)."""
+        parent = _mock_clone(fs, gf_inproc, mock_backend)
+        result = gf_inproc(
+            "-C", str(parent), "status",
+            backend=_FailPorcelain(mock_backend), check=False)
+        _assert_error_fields(
+            result, name="widgets", path="vendor/lib",
+            operation=r"status|porcelain", rc=2)
+
+    def test_status_revparse_branch_failure_error_carries_fields(
+            self, fs, gf_inproc, mock_backend):
+        """A `rev-parse --abbrev-ref HEAD` failure inside `_branch` on an
+        identified git-folder surfaces name+path+operation through the
+        `folder_error` envelope (spec §Error handling git-error class
+        rc=2): the `_branch` call in `cmd_status` must not swallow a
+        failure to '' and exit 0 with a degraded row."""
+        parent = _mock_clone(fs, gf_inproc, mock_backend)
+        result = gf_inproc(
+            "-C", str(parent), "status",
+            backend=_FailRevParse(mock_backend, "rev-parse",
+                                  "--abbrev-ref"),
+            check=False)
+        _assert_error_fields(
+            result, name="widgets", path="vendor/lib",
+            operation=r"status", rc=2)
+
+
+class TestLsErrorFields:
+    """spec 'gf ls' failures on an identified (manifest) git-folder —
+    `_branch`/`_head` rev-parse calls in `cmd_ls` sit outside the
+    envelope (cli.py ~L457/L458), same gap class as `_porcelain`."""
+
+    def test_ls_revparse_branch_failure_error_carries_fields(
+            self, fs, gf_inproc, mock_backend):
+        """`rev-parse --abbrev-ref` failure inside `_branch` during
+        `gf ls` → folder_error fields + rc=2 (spec §Error handling).
+        Designed-red: swallowed to '' today."""
+        parent = _mock_clone(fs, gf_inproc, mock_backend)
+        result = gf_inproc(
+            "-C", str(parent), "ls",
+            backend=_FailRevParse(mock_backend, "rev-parse",
+                                  "--abbrev-ref"),
+            check=False)
+        _assert_error_fields(
+            result, name="widgets", path="vendor/lib",
+            operation=r"ls", rc=2)
+
+    def test_ls_revparse_head_failure_error_carries_fields(
+            self, fs, gf_inproc, mock_backend):
+        """`rev-parse --short HEAD` failure inside `_head` during
+        `gf ls` → folder_error fields + rc=2 — isolates the `_head`
+        gap (`--abbrev-ref` still succeeds, so `_branch` resolves and
+        the failure is attributable to the `_head` call alone).
+        Designed-red: swallowed to '?' today."""
+        parent = _mock_clone(fs, gf_inproc, mock_backend)
+        result = gf_inproc(
+            "-C", str(parent), "ls",
+            backend=_FailRevParse(mock_backend, "rev-parse", "--short"),
+            check=False)
+        _assert_error_fields(
+            result, name="widgets", path="vendor/lib",
+            operation=r"ls", rc=2)
 
 
 class TestRealGitErrorFields:
@@ -592,6 +740,30 @@ class TestRealGitErrorFields:
         resolve (the `could not resolve 'latest'` offender site);
         spec 'gf status --remote' — deterministic non-zero exit."""
         _run_real(_sc_real_status_remote_latest_unresolvable, tmp_path)
+
+    def test_pull_failed_store_names_its_own_binding(self, tmp_path):
+        """Two bindings served by DIFFERENT repo stores: when the second
+        store's fetch fails (upstream path removed), the `gf pull` error
+        identifies a binding of THAT store — folder name + manifest path
+        + the pull/fetch operation — never the first selected binding
+        (spec §Error handling fields on the grouped update algorithm's
+        per-store failure; ruling F6)."""
+        up_a = _subfolder_upstream(tmp_path, "up-a")
+        up_b = _subfolder_upstream(tmp_path, "up-b")
+        parent = _real_parent(tmp_path)
+        gf("-C", str(parent), "clone", str(up_a / "docs" / "api"),
+           "vendor/alfa")
+        gf("-C", str(parent), "clone", str(up_b / "docs" / "api"),
+           "vendor/bravo")
+
+        up_b.rename(tmp_path / "up-b-gone")   # second store unreachable
+
+        result = gf("-C", str(parent), "pull", check=False)
+        _assert_error_fields(
+            result, name="bravo", path="vendor/bravo",
+            operation=r"pull|fetch", rc=2)
+        # the failure must not be attributed to the first selected binding
+        assert "alfa" not in result.stderr
 
 
 # --- message-shape sweeps ----------------------------------------------------

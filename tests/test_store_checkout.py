@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Tomas Gonzalez
 # SPDX-License-Identifier: MIT
 
-"""P2R.S4 — shared store/checkout/consumer-link creation primitives.
+"""Shared store/checkout/consumer-link creation primitives.
 
 Real-git pins for the machinery layer (no new command behavior):
 
@@ -21,8 +21,7 @@ Real-git pins for the machinery layer (no new command behavior):
   (append-only; no state-file record).
 * per-checkout state record incl. bindings list.
 
-Assumed signature surface (best reading of the S4 row loci — pins stand as
-designed-red AttributeError/TypeError until impl-1 lands):
+Signature surface exercised:
 
     layout.repo_store(root, repo_url) -> Path
     shelf.ensure_repo_store(store, url, *, branch=None, single_branch=False,
@@ -332,7 +331,7 @@ def test_ensure_checkout_cone_union_on_join_and_state(root, store,
     assert "tools/x" in sparse2
     assert (co_docs.work_tree / "tools/x/y.txt").is_file()
 
-    # per-checkout state record at wt/<rk>/<key>.state incl. bindings list
+    # per-checkout state record at wt/<rk>/.<key>.state incl. bindings list
     data = tomllib.loads(co_docs.state.read_text())
     assert "bindings" in data
     blob = str(data["bindings"])
@@ -341,7 +340,7 @@ def test_ensure_checkout_cone_union_on_join_and_state(root, store,
 
 def test_ensure_checkout_detached_for_tag_ref(root, upstream, store):
     """Tag/commit refs check out detached; the record lands under the ref
-    checkout key (spec clone mechanics; S2 ref= keys)."""
+    checkout key (spec clone mechanics; `ref=` checkout keys)."""
     key = layout.checkout_key_for_ref("v1")
     co = layout.subfolder_checkout(root, upstream, key, "docs/api")
     shelf.ensure_checkout(co, "v1")

@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Tomas Gonzalez
 # SPDX-License-Identifier: MIT
 
-"""Receiving tests for slice P2.W1.1 — URL resolution.
+"""URL resolution pins derived from the governing documents.
 
-Derived from the governing documents (plan DC-DOC-PLAN-005, P2.W1.1 row);
-expectations come from the docs, not from any implementation:
+Derived from the governing documents; expectations come from the docs,
+not from any implementation:
 
 - docs/gf-spec.md "URL resolution": a `url` is a plain path. A local path
   walks up to the nearest directory that is a repository (a `.git` entry,
@@ -28,8 +28,8 @@ expectations come from the docs, not from any implementation:
 - docs/gf-constraints.md ("Do not fetch the network in `ls` or
   `status`"): `ls-remote` runs only inside resolution; local-path and
   `.git`-boundary resolution are local-only and never probe.
-- Plan row P2.W1.1: `GitBackend.git` gains an `env` override so probes
-  set `GIT_TERMINAL_PROMPT=0`; the mock mirrors it.
+- Pinned surface below: probes set the prompt-disabling environment
+  through an `env` override on `GitBackend.git`; the mock mirrors it.
 
 Pinned surface (the docs name no function; this is the contract these
 tests define and the implementation owner must satisfy):
@@ -94,6 +94,17 @@ def _mk_gf_child(path: Path) -> Path:
     gitdir = path / ".gf" / "git"
     gitdir.mkdir(parents=True)
     (gitdir / "HEAD").write_text("ref: refs/heads/master\n")
+    return path
+
+
+def _mk_gitdir(path: Path) -> Path:
+    """A gitdir-shaped directory: `HEAD` plus `objects/` and `refs/` —
+    the bare-repository structure a child's `.gf/git` or a parent's
+    `.gf/repos/<key>/git` store carries (same shape as the
+    bare-repository fixture below)."""
+    (path / "objects").mkdir(parents=True)
+    (path / "refs").mkdir()
+    (path / "HEAD").write_text("ref: refs/heads/master\n")
     return path
 
 
@@ -327,7 +338,12 @@ class TestLocalPaths:
     def test_bare_repository_marks_the_boundary(self, tmp_path, mock_backend):
         repo = tmp_path / "bare-repo"
         (repo / "sub").mkdir(parents=True)
+        # A faithful bare-repository shape: `HEAD` plus `objects/` and
+        # `refs/` (git's is_git_directory) — a lone file named HEAD is
+        # ordinary content, not a boundary.
         (repo / "HEAD").write_text("ref: refs/heads/master\n")
+        (repo / "objects").mkdir()
+        (repo / "refs").mkdir()
         repo_url, subdir = shelf.resolve_repo_url(
             str(repo / "sub"), parent_root=tmp_path, backend=mock_backend,
         )
@@ -399,6 +415,147 @@ class TestLocalPaths:
         assert _probed_urls(mock_backend) == []
 
 
+class TestGfInteriorUrls:
+    """R6-B (round-6 ruling): a local `url` whose resolved leaf sits
+    at-or-inside a `.gf` subtree is refused outright.
+
+    `.gf` roots gf's private layout — a child's `git`/`state`, a parent's
+    `repos` stores and `wt` checkout trees — never a repository nor
+    repository content a consumer spelling may resolve into (gf-spec.md
+    "URL resolution" rule 1: the walk-up terminates at the nearest
+    *repository* directory; gf-arch.md GF-D8: a `.git` entry inside
+    `.gf/wt` is the removed gitfile's position or upstream content, not
+    a boundary). The single exception keeps the `_resolved_git_url`
+    precedent: a leaf that is ITSELF the repository boundary (`.gf/git`,
+    `.gf/repos/<key>/git`) still self-resolves as a fetch source. The
+    reading is lexical — "at-or-inside a `.gf` subtree" refuses even
+    when `.gf` is ordinary committed repo content.
+    """
+
+    def test_leaf_inside_gf_wt_is_refused_even_when_repo_shaped(
+        self, tmp_path, mock_backend
+    ):
+        """`.gf/wt/<repo-key>/<checkout>` is managed checkout storage:
+        a `.git` entry there is the removed gitfile's position or
+        upstream content, never a repository boundary — the refusal is
+        unconditional, even when the leaf is repo-shaped."""
+        ck = (
+            tmp_path / "root" / ".gf" / "wt"
+            / "upstream-01234567" / "master"
+        )
+        (ck / "docs" / "api").mkdir(parents=True)
+        (ck / ".git").write_text("gitdir: /elsewhere/gitdir\n")
+        for leaf in (ck, ck / "docs" / "api"):
+            with pytest.raises(GitFoldersError) as excinfo:
+                shelf.resolve_repo_url(
+                    str(leaf), parent_root=tmp_path,
+                    backend=mock_backend,
+                )
+            assert "inside a '.gf' directory" in str(excinfo.value)
+        assert _probed_urls(mock_backend) == []
+
+    def test_leaf_under_a_child_gf_tree_is_refused(
+        self, tmp_path, mock_backend
+    ):
+        """A leaf below `<child>/.gf` names gf interior, not repo
+        content: it refuses rather than binding `child` with a bogus
+        `.gf/...` subdir."""
+        child = _mk_gf_child(tmp_path / "child")
+        leaf = child / ".gf" / "git" / "objects"
+        leaf.mkdir()
+        with pytest.raises(GitFoldersError) as excinfo:
+            shelf.resolve_repo_url(
+                str(leaf), parent_root=tmp_path, backend=mock_backend,
+            )
+        assert "inside a '.gf' directory" in str(excinfo.value)
+        assert _probed_urls(mock_backend) == []
+
+    def test_the_gf_dir_itself_is_refused(self, tmp_path, mock_backend):
+        """The `.gf` directory itself is AT the subtree, not only inside
+        it — `<child>/.gf` refuses the same way."""
+        child = _mk_gf_child(tmp_path / "child")
+        with pytest.raises(GitFoldersError) as excinfo:
+            shelf.resolve_repo_url(
+                str(child / ".gf"), parent_root=tmp_path,
+                backend=mock_backend,
+            )
+        assert "inside a '.gf' directory" in str(excinfo.value)
+        assert _probed_urls(mock_backend) == []
+
+    def test_gf_git_gitdir_leaf_is_a_repository_boundary(
+        self, tmp_path, mock_backend
+    ):
+        """Exception per the ruling: `<child>/.gf/git` is ITSELF the
+        repository boundary — it self-resolves as a whole-repo fetch
+        source (the `_resolved_git_url` precedent: the child's inner
+        gitdir is what a fetch targets)."""
+        gitdir = _mk_gitdir(tmp_path / "child" / ".gf" / "git")
+        repo_url, subdir = shelf.resolve_repo_url(
+            str(gitdir), parent_root=tmp_path, backend=mock_backend,
+        )
+        assert _same_dir(repo_url, gitdir)
+        assert subdir == ""
+        assert _probed_urls(mock_backend) == []
+
+    def test_repo_store_gitdir_leaf_is_a_repository_boundary(
+        self, tmp_path, mock_backend
+    ):
+        """`<root>/.gf/repos/<key>/git` self-resolves the same way; the
+        non-gitdir `.gf` interior around it still refuses."""
+        root = tmp_path / "root"
+        store = _mk_gitdir(
+            root / ".gf" / "repos" / "upstream-01234567" / "git")
+        repo_url, subdir = shelf.resolve_repo_url(
+            str(store), parent_root=tmp_path, backend=mock_backend,
+        )
+        assert _same_dir(repo_url, store)
+        assert subdir == ""
+        for interior in (
+            root / ".gf" / "repos" / "upstream-01234567",
+            root / ".gf" / "repos",
+            root / ".gf",
+        ):
+            with pytest.raises(GitFoldersError) as excinfo:
+                shelf.resolve_repo_url(
+                    str(interior), parent_root=tmp_path,
+                    backend=mock_backend,
+                )
+            assert "inside a '.gf' directory" in str(excinfo.value)
+        assert _probed_urls(mock_backend) == []
+
+    def test_leaf_inside_committed_gf_content_is_refused(
+        self, tmp_path, mock_backend
+    ):
+        """The ruling is lexical: at-or-inside a `.gf` subtree refuses
+        even when `.gf` is ordinary committed repo content — the walk-up
+        never binds `repo` with a `.gf/...` subdir."""
+        repo = _mk_git_repo(tmp_path / "repo")
+        (repo / ".gf" / "notes").mkdir(parents=True)
+        with pytest.raises(GitFoldersError) as excinfo:
+            shelf.resolve_repo_url(
+                str(repo / ".gf" / "notes"), parent_root=tmp_path,
+                backend=mock_backend,
+            )
+        assert "inside a '.gf' directory" in str(excinfo.value)
+
+    def test_repo_containing_committed_gf_content_resolves_normally(
+        self, tmp_path, mock_backend
+    ):
+        """The refusal keys on the leaf's own `.gf` path segment, not on
+        what the repository carries: a repo CONTAINING committed `.gf`
+        content still resolves ordinary leaves normally."""
+        repo = _mk_git_repo(tmp_path / "repo")
+        (repo / ".gf" / "notes").mkdir(parents=True)
+        (repo / "sub").mkdir()
+        repo_url, subdir = shelf.resolve_repo_url(
+            str(repo / "sub"), parent_root=tmp_path,
+            backend=mock_backend,
+        )
+        assert _same_dir(repo_url, repo)
+        assert subdir == "sub"
+        assert _probed_urls(mock_backend) == []
+
+
 class TestSubdirValidation:
     """gf-spec.md: "The subdir is a nonempty repository-relative path in
     POSIX form; `.`, `..`, and empty segments are rejected."""
@@ -441,8 +598,8 @@ class TestUnresolvableUrl:
 
 class TestProbeEnvironment:
     """gf-spec.md: "Probes run with terminal prompts disabled
-    (`GIT_TERMINAL_PROMPT=0`)". Plan row P2.W1.1: `GitBackend.git` gains an
-    `env` override, merged over `os.environ`; the mock mirrors it."""
+    (`GIT_TERMINAL_PROMPT=0`)". Pinned surface: `GitBackend.git` accepts
+    an `env` override merged over `os.environ`; the mock mirrors it."""
 
     def test_every_ls_remote_probe_carries_terminal_prompt_0(self):
         remote = _RecordingRemote({"https://host/org/repo"})

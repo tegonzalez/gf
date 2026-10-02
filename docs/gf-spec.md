@@ -12,7 +12,7 @@ This document specifies the `gf` command-line tool and the `git-folders` manifes
 
 `git-folders` is a git-folder repository manager for git. A parent git repository declares git-folders in a manifest (`gf.toml`). Each git-folder is cloned into a user-defined child directory inside the parent workspace. The child is a real git worktree with its own history; its git metadata lives in `.gf/` instead of `.git/`, so agentic tools that scan for `.git` do not treat the child as a nested repository. The child gitdir at `child/.gf/git` is a full, self-contained gitdir that uses the actual git-folder URL as its `origin`.
 
-A binding has one of two forms. A **whole-repo binding** maps a complete repository to a consumer path, as described above. A **subfolder binding** maps one subdirectory of a repository to a consumer path: the `url` field is a plain path to a folder inside a repository, and `gf` finds where the repository ends (see [URL resolution](#url-resolution)). Several subfolder bindings of one repository share a single bare repo store and, when their refs resolve to the same branch, a single sparse linked worktree under `<root>/.gf`; a relative symlink at the consumer path exposes only the mapped subdirectory. Both forms are first-class: every command in this specification applies to both, and whole-repo behavior is unchanged.
+A binding has one of two forms. A **whole-repo binding** maps a complete repository to a consumer path, as described above. A **subfolder binding** maps one subdirectory of a repository to a consumer path: the `url` field is a plain path to a folder inside a repository, and `gf` finds where the repository ends (see [URL resolution](#url-resolution)). Several subfolder bindings of one repository share a single bare repo store and, when their refs resolve to the same branch, a single sparse linked worktree under `<root>/.gf`; a relative symlink at the consumer path exposes only the mapped subdirectory. Both forms are first-class: every command in this specification applies to both.
 
 ## Terminology
 
@@ -90,11 +90,13 @@ parent/
 
 The repo store is created with `git init --bare` and carries `remote.origin.url` and its fetch refspec lines (see [Fetch refspecs](#fetch-refspecs)); fetches use `--filter=blob:none` so objects arrive once per repository. Each checkout is a linked worktree (`git worktree add --no-checkout --detach`), sparse-checked-out in cone mode to the union of its bindings' subdirs. After creation `gf` removes the checkout's `.git` gitfile and runs `git worktree lock`, so plain `git` and `.git`-scanning tools inside a consumer link resolve to the parent repository and `git worktree prune` leaves the checkout alone. `gf` addresses the checkout only through `GIT_DIR`/`GIT_WORK_TREE`.
 
+Through each consumer link the user sees exactly the contents of the mapped folder. A checkout contains every folder its bindings map, in full, and no other folder trees; in particular it never contains a same-named folder at another depth, such as `lib/src` when `src` is mapped or `vendor/docs/api` when `docs/api` is mapped. Cone-mode sparse checkout also materializes, by design, the files at the repository root and the files directly inside each parent folder of a mapped folder, such as `docs/top.md` when `docs/api` is mapped. A checkout may hold these files; one that lies outside every mapped folder is never visible through a consumer link.
+
 A whole-repo binding and subfolder bindings of the same repository do not share object storage.
 
 #### Fetch refspecs
 
-A repo store created without `--single-branch` gets the wildcard refspec `+refs/heads/*:refs/remotes/origin/*`. A store created with `--single-branch` gets only `+refs/heads/<branch>:refs/remotes/origin/<branch>` for the resolved branch. When a later binding needs a branch that no existing line covers, `gf` appends that branch's line with `git config --add remote.origin.fetch`. `gf` never removes or rewrites an existing refspec line, so every checkout of the store keeps fetching what it needs.
+A repo store created without `--single-branch` gets the wildcard refspec `+refs/heads/*:refs/remotes/origin/*`. A store created with `--single-branch` gets only `+refs/heads/<branch>:refs/remotes/origin/<branch>` for the resolved branch. When a later binding needs a branch that no existing line covers, `gf` appends that branch's line with `git config --add remote.origin.fetch`. A needed tag that no line covers gets the same treatment — `gf` probes upstream with `git ls-remote` and appends `+refs/tags/<ref>:refs/tags/<ref>` so the same fetch lands it — while a needed commit sha, which no refspec line can name, is fetched directly with `git fetch origin <sha>` (the probe covers a whole-repo child's `remote.origin.fetch` the same way). The same coverage runs for the fetch that creates the store — a pinned ref the fresh wildcard or `--depth` window would miss is covered before that initial fetch, so a needed tag's line lands in the one fetch and a needed sha is fetched directly (`git fetch origin <sha>` ignores `--depth`, a git limitation). `gf` never removes or rewrites an existing refspec line, so every checkout of the store keeps fetching what it needs.
 
 #### Checkout integrity
 
@@ -133,15 +135,15 @@ At runtime the effective URL and ref for a git-folder are the manifest values un
 
 A `url` is a plain path: to a repository, or to a folder inside one. There is no separator syntax; `https://github.com/org/repo/docs/api`, `git@github.com:org/repo/docs/api`, and `../other/docs/api` are all valid. `gf` finds where the repository ends:
 
-1. **Local path.** Walk up from the path to the nearest directory that is a repository (a `.git` entry, a bare repository, or a `gf` child with `.gf/git`). That directory is the repo URL; the rest is the subdir.
+1. **Local path.** Walk up from the path to the nearest directory that is a repository (a `.git` entry, a bare repository, or a `gf` child with `.gf/git`). That directory is the repo URL; the rest is the subdir. A local path that resolves inside a `.gf` directory — a repo store or hidden checkout, `gf`'s private storage layout — has no repository boundary above it: the walk never treats `.gf`-interior directories as repositories and never climbs out of `.gf`, so unless the path itself is a repository boundary outside `.gf/wt` — `.gf/repos/<repo-key>/git` or a child's `.gf/git` still resolve to themselves, while nothing under `.gf/wt` resolves — resolution fails with a clear error naming the private layout. Remote URLs containing `.gf/` are unaffected — they resolve against the remote tree, not the local filesystem.
 1. **Remote URL with a segment ending in `.git`.** The repository ends after the first such segment, e.g. `https://host/org/repo.git/docs/api`. No network is used.
 1. **Other remote URL.** Probe with `git ls-remote`: first the full URL, then each shorter prefix, one path segment at a time. The longest prefix that answers is the repo URL; the rest is the subdir. Probes run with terminal prompts disabled (`GIT_TERMINAL_PROMPT=0`), so a wrong prefix never stops to ask for a password; credential helpers and SSH keys still apply.
 
-If the full `url` is itself the repository, the binding is a whole-repo binding and behaves exactly as before. If no prefix resolves — for example a private remote that needs an interactive login — `gf` stops with an error that tells the user to mark the boundary by writing `.git` after the repository name.
+If the full `url` is itself the repository, the binding is a whole-repo binding. If no remote prefix resolves — for example a private remote that needs an interactive login — `gf` stops with an error that tells the user to mark the boundary by writing `.git` after the repository name. The `.git` hint applies to the remote-probe class; an unresolvable local path reports its own error without it.
 
 Resolution runs only in `gf clone` and in `gf pull` for a binding that has no recorded resolution or whose effective `url` changed since it was recorded. The result is recorded in the per-checkout state. `gf status`, `gf ls`, and the passthrough commands never resolve a URL. A whole-repo child that already exists is never re-resolved.
 
-The subdir is a nonempty repository-relative path in POSIX form; `.`, `..`, and empty segments are rejected. An override may change `url` or `ref`; a changed `url` is re-resolved on the next `gf pull`, and a changed repo URL selects a different repo store.
+The subdir is a nonempty repository-relative path in POSIX form; `.`, `..`, and empty segments are rejected. An override may change `url` or `ref`; a changed `url` is re-resolved on the next `gf pull`, and a changed repo URL selects a different repo store. A changed `url` that makes a subfolder binding resolve to a whole repository is refused (see [`gf pull`](#gf-pull---rebase---force---autostash-path)).
 
 ## Reference model
 
@@ -156,7 +158,7 @@ A binding `ref` may be one of:
 
 For subfolder bindings, the ref determines the checkout key:
 
-- checkout key — `latest`/`branch` checkouts: `urllib.parse.quote(resolved branch, safe='')` (one path component by construction); `pinned` checkouts: `'ref=' + quote(ref, safe='')` — `=` never appears in a percent-encoded branch key, so no branch name collides with a pinned key; pinned names previously colliding under the old `ref-<slug>` scheme (e.g. `ref-v0.1` vs `v0.1` pins) are distinguished and pinned branch-linking regression tests are added (`gf init --ref dev` keeps its checkout on `dev` after a later `gf clone --latest`)
+- checkout key — `latest`/`branch` checkouts: `urllib.parse.quote(resolved branch, safe='')` (one path component by construction); `pinned` checkouts: `'ref=' + quote(ref, safe='')` — `=` never appears in a percent-encoded branch key, so no branch name collides with a pinned key: a pin of `v0.1` keys as `ref=v0.1` while a branch named `ref-v0.1` keys as `ref-v0.1`. A recorded branch ref survives another binding's pin (`gf init -b dev` keeps its checkout on `dev` after a later `gf clone`, which tracks `latest` by default)
 - `branch` and `latest` checkouts are attached to their local branch; `tag` and `commit` checkouts are detached.
 
 Bindings that share a repo URL and resolve to the same checkout key share one checkout, and its sparse cone is the union of their subdirs. A second checkout of one branch in one store is never created; `gf` widens the existing checkout instead.
@@ -176,7 +178,7 @@ At the parent root, `<root>/.gf/` hosts subfolder-binding storage:
 
 - `repos/<repo-key>/git/` — the bare repo store for one repo URL, where `<repo-key>` is `<basename>-<first 8 hex of sha1(normalized repo URL)>`.
 - `wt/<repo-key>/<checkout-key>/` — the sparse linked worktrees of that store.
-- `wt/<repo-key>/<checkout-key>.state` — per-checkout metadata: the resolved SHA, requested ref, repo URL, the bindings served with each binding's effective `url` and subdir (the recorded URL resolution), and whether a local override is active.
+- `wt/<repo-key>/.<checkout-key>.state` — per-checkout metadata: the resolved SHA, requested ref, repo URL, the bindings served with each binding's effective `url` and subdir (the recorded URL resolution), and whether a local override is active.
 
 An existing subfolder binding's checkout is resolved from the realpath of its consumer link, walking up to the `<root>/.gf/wt/<repo-key>/<checkout-key>` ancestor. This needs no network and no state lookup, and it follows `gf worktree add` symlinks into the source parent's store.
 
@@ -194,7 +196,7 @@ For a subfolder binding, the consumer path is a symlink, and a trailing-slash pa
 
 ### Command reference
 
-All commands support a global `-C <path>` option, just like `git -C`. It changes to `<path>` before resolving context and interpreting path arguments.
+All commands support a global `-C <path>` option, just like `git -C`. It changes to `<path>` before resolving context and interpreting path arguments. An unusable `<path>` — for example a dangling consumer link — fails deterministically: the command prints `gf: cannot change to '<path>': <reason>` and exits `1`, naming the operand path and the failed operation.
 
 `gf --version` (or `gf -v`) prints the `git-folders` package version (sourced from `pyproject.toml` via `importlib.metadata`, with a `pyproject.toml` fallback when running from source) and exits 0. It is handled before subcommand dispatch, so it works without a parent repo.
 
@@ -211,15 +213,17 @@ Add a git-folder to `gf.toml` and create its child worktree. This is the "add" o
 
 - `<url>` is the repository to clone (remote, local, or bare host/path like `github.com/cursor/plugins`, which is expanded to `https://...`). A path to a folder inside a repository creates a subfolder binding; `gf` finds the repository boundary by [URL resolution](#url-resolution).
 - `<path>` is the optional consumer path. If omitted, it defaults to the last path component of `<url>`: the repository name, or the folder name for a subfolder URL.
+- A `<path>` leaf of `.` or `..` resolves to the real directory before the containment and occupancy checks — `missing/..` names the parent repository itself and is refused as already occupied — and the recorded `path` and derived `name` use the resolved spelling.
 - The git-folder `name` is derived from the basename of `<path>` if given, otherwise from the basename of `<url>` (`.git` stripped). Use `-n <name>` to override it.
 - `-b <ref>` sets the branch, tag, or commit to check out, like `git clone -b`. If omitted, it defaults to `latest`.
 - `--depth <n>` is passed through to the child fetch as `git fetch --depth=<n> origin`, creating a shallow clone. It only affects the initial fetch; subsequent `gf pull` operations fetch normally. For a subfolder binding it applies only when this clone creates the repo store; bindings joining an existing store ignore it.
 - `--single-branch` narrows `remote.origin.fetch` to the resolved branch after the initial fetch, so subsequent fetches only fetch that branch's history. With `latest`, the remote default branch is used. It is ignored for tag/commit refs (which fetch the single ref needed for the checkout). For a subfolder binding it narrows only a repo store that this clone creates; joining an existing store follows [Fetch refspecs](#fetch-refspecs).
 - If the path is already a git-folder (a whole-repo child contains `<dir>/.gf/git/`; a subfolder binding path is a consumer link into `<root>/.gf`), the command succeeds after adding the manifest entry; it does not re-clone or overwrite the existing worktree.
 - Fail if the path exists, is not empty, and is not a git-folder or a consumer link.
+- Fail if `<path>` lands inside the parent's `.gf` storage — spelled there physically or resolved there through a consumer link (`<consumer-link>/<dir>`) — with a clear error; a `<path>` that is itself the consumer link still binds by the already-a-git-folder rule above.
 - For a whole-repo URL, create `<dir>/.gf/git/` as a full self-contained gitdir, add `origin` pointing to the actual effective URL, and `git fetch origin`.
-- For a subfolder URL, create or reuse the repo store for the repo URL (`git init --bare`, `remote.origin.url`, fetch refspec lines per [Fetch refspecs](#fetch-refspecs), `git fetch --filter=blob:none origin`; if the server refuses filtered fetch, fall back to a full fetch with a warning), ensure the checkout for the resolved key (`git worktree add --no-checkout --detach`, `sparse-checkout set --cone` with the union of its bindings' subdirs, `checkout -B` for a branch or detached checkout for a tag/commit, remove the `.git` gitfile, `git worktree lock`), and create the relative consumer link at `<path>` targeting `<checkout>/<subdir>`. Joining an existing checkout re-links only: it never checks anything out, so a binding removed with `gf rm` and added back finds its uncommitted work in place.
-- If any step from `git init` through `git checkout` fails, remove the child directory (if it did not exist before the command) or remove the `.gf/` directory (if the child existed but was not yet a git-folder), so no partial state is left behind. For a subfolder binding, remove the consumer link and any checkout this command created; a repo store or checkout that already served other bindings is retained.
+- For a subfolder URL, create or reuse the repo store for the repo URL (`git init --bare`, `remote.origin.url`, fetch refspec lines per [Fetch refspecs](#fetch-refspecs), `git fetch --filter=blob:none origin`; if the server refuses filtered fetch, fall back to a full fetch with a warning), ensure the checkout for the resolved key (`git worktree add --no-checkout --detach`, `sparse-checkout set --cone` with the union of its bindings' subdirs, `checkout -B` for a branch or detached checkout for a tag/commit, remove the `.git` gitfile, `git worktree lock`), and create the relative consumer link at `<path>` targeting `<checkout>/<subdir>`. A clone that joins an existing repo store fetches it first — one `git fetch --filter=blob:none origin` (or the full-fetch fallback), plus a targeted `git fetch origin <sha>` when a pinned commit is not yet in the store — before the effective ref is resolved; joining does not skip the fetch. Joining an existing checkout re-links only: it never checks anything out, so a binding removed with `gf rm` and added back finds its uncommitted work in place.
+- If any step from `git init` through `git checkout` fails, remove the child directory (if it did not exist before the command) or remove the `.gf/` directory (if the child existed but was not yet a git-folder), so no partial state is left behind. For a subfolder binding, remove the consumer link, any checkout this command created, and a repo store this command itself created; a repo store or checkout that was pre-existing or already serving other bindings is always retained.
 - Resolve the effective ref in the child gitdir or repo store.
 - If the effective ref is a branch (or `latest` resolves to the remote default branch), create a local tracking branch and check it out with `git checkout -B <branch> origin/<branch>`.
 - If the effective ref is a tag or commit, check it out in a detached `HEAD`.
@@ -235,13 +239,14 @@ Update or initialize selected children to their effective refs.
   - If `cwd` is inside a child, update that child.
   - Otherwise, update all children whose paths are at or below `cwd`.
 - With path arguments, each argument selects the git-folder whose consumer path matches or contains the argument.
-- A binding with no recorded URL resolution, or whose effective `url` changed, is resolved first ([URL resolution](#url-resolution)); local and relative paths resolve against the parent repo root, and a local `gf` child resolves to its inner gitdir.
-- Selected subfolder bindings are grouped and applied per the update algorithm below: one fetch per repo store, one dirty check and one checkout per shared checkout, sparse-cone union when a binding joins a checkout, and consumer links created or retargeted when an override changes the effective repo URL, subdir, or checkout key.
+- A binding with no recorded URL resolution, or whose effective `url` changed, is resolved first ([URL resolution](#url-resolution)); local and relative paths resolve against the root that owns the binding's links and `.gf` storage (the root under which the binding's consumer `path` resolves to its checkout) — the source root for `worktree add` link chains — not the invoking root, and a local `gf` child resolves to its inner gitdir; `gf clone` applies the same anchor discipline to its local fetch — a relative local `url` resolves at the parent repo root receiving the manifest, and the anchored repo URL feeds the child's `origin` and fetch — while the manifest records the spelled `url`.
+- Selected subfolder bindings are grouped and applied per the update algorithm below: one fetch per repo store (plus a targeted `git fetch origin <sha>` when a pinned commit is not yet in the store — [Fetch refspecs](#fetch-refspecs)), one dirty check and one checkout per shared checkout, sparse-cone union when a binding joins a checkout, and consumer links created or retargeted when an override changes the effective repo URL, subdir, or checkout key. If store creation or the initial fetch fails, `gf` removes only a store it just created — a pre-existing store, and any store already serving other bindings, is retained.
 - A shared checkout serves every binding linked into it, so updating it moves all of them. `gf` prints one `Pulled <name>` line per binding the updated checkout serves and marks a binding that was not selected as `(moved with <selected name>)`. `--autostash` and `--force` act on the whole checkout, and the output lists every binding whose files they affected.
 - A binding created by `gf init` whose `url` resolves to a subfolder is converted on its first pull: if the child directory has no commits and no files other than `.gf`, `gf` removes it and creates the consumer link; otherwise it stops with an error and deletes nothing.
+- A subfolder binding whose effective `url` changes — for example through `gf.local.toml` — so that it resolves to a whole repository is refused. `gf pull` stops with a clear error that names the binding and says that switching a subfolder binding to a whole repository is not supported. It changes nothing: not the shared repo store, its checkout, the binding's consumer link, or the sibling bindings that share the store. `gf` does not convert an established subfolder binding into a whole-repo binding. `gf pull` checks every selected binding for this refusal before it changes anything: when any selected binding is refused, no selected binding is updated, and the command exits with the validation-error code `1`.
 - For each selected whole-repo child:
   - If the effective URL is a local path that resolves to the child path itself (the placeholder written by `gf init`), the child is skipped until a real upstream is configured, even if the child does not exist yet.
-  - Resolve relative local URLs against the parent repo root.
+  - Resolve relative local URLs against the root that owns the binding's links and `.gf` storage (the root under which the binding's consumer `path` resolves to its checkout) — the source root for `worktree add` link chains — not the invoking root.
   - If the child path does not exist or has no `.gf/git/`, create a full gitdir, set `origin` to the actual URL, `git fetch origin`, resolve the ref, and check it out.
   - If the child worktree is dirty:
     - Without `--force` or `--autostash`, abort with a clear message.
@@ -281,9 +286,10 @@ Show the git porcelain status for selected children. By default this command doe
   - Otherwise, show all children whose paths are at or below `cwd`.
 - With path arguments, each argument selects the git-folder whose consumer path matches or contains the argument.
 - Prints one header line per child: `name url [branch]`. For a subfolder binding, `url` is the effective manifest URL (the full path to the folder), and `branch` is the branch of the shared checkout serving the binding.
-- `branch` is the current local branch, or empty brackets for a detached `HEAD`.
+- `branch` is the current local branch, or empty brackets for a detached `HEAD` or a child with no commits yet.
 - Followed by `git status --porcelain` output for any dirty files in that child. For a subfolder binding, the porcelain run is scoped to the binding's subdir (`status --porcelain -- <subdir>` against the checkout), so only paths inside the mapping are reported.
-- With `--remote`, append the drift state to the header line: `name url [branch] state`. `state` is one of `clean`, `behind`, `local-dirty`, `both`, or `missing` per the drift algorithm below. `--remote` does **not** access the network; drift is computed from the local remote-tracking refs already present in the child gitdir or repo store (the same refs `git status` compares against after a `git fetch`). Run `gf pull` or `gf git fetch` first to refresh those refs. The non-`--remote` output format is unchanged when `--remote` is not given. If the effective ref cannot be resolved locally, `gf status --remote` exits with a deterministic non-zero code instead of printing a drift state.
+- A child with no commits yet, for example one just created by `gf init`, is a normal state: its header shows empty brackets and is followed by its porcelain lines. It does not make the command fail, and every other selected git-folder is still listed.
+- With `--remote`, append the drift state to the header line: `name url [branch] state`. `state` is one of `clean`, `behind`, `local-dirty`, `both`, or `missing` per the drift algorithm below. `--remote` does **not** access the network; drift is computed from the local remote-tracking refs already present in the child gitdir or repo store (the same refs `git status` compares against after a `git fetch`). Run `gf pull` or `gf git fetch` first to refresh those refs. Without `--remote`, the output is the header and porcelain lines alone. If the effective ref cannot be resolved locally, `gf status --remote` exits with a deterministic non-zero code instead of printing a drift state. A child with no commits yet whose ref cannot be resolved locally gets this same clear unresolvable-ref error and exit code, not a raw git error.
 
 ### `gf ls [<path>...]`
 
@@ -294,7 +300,8 @@ Quick list of git-folders. This command does not access the network.
 - One line per child: `name url [branch] short-hash`. For a subfolder binding, `url` is the full path to the folder and `branch`/`short-hash` describe the shared checkout serving it.
 - Columns are aligned using consistent spacing.
 - Appends a `*` to the hash when the child has uncommitted worktree changes. For a subfolder binding, only changes inside its subdir mark it dirty.
-- `branch` is the current local branch, or empty brackets for a detached `HEAD`.
+- `branch` is the current local branch, or empty brackets for a detached `HEAD` or a child with no commits yet.
+- A child with no commits yet, for example one just created by `gf init`, is a normal state: it is listed with empty brackets and `?` in the short-hash column, plus the usual `*` when it has uncommitted changes. It does not make the command fail, and every other selected git-folder is still listed.
 
 ### `gf init [<path>] [-b <ref>] [-n <name>] [--url <url>]`
 
@@ -303,12 +310,14 @@ Create an empty local child `.gf` gitdir and add it to `gf.toml`.
 - Like `git init [<directory>]`, the optional positional argument is the consumer directory.
 - If `<path>` is omitted, the current directory becomes the child.
 - If `<path>` is given, create the directory if it does not exist and initialize `.gf` inside it.
+- A `<path>` leaf of `.` or `..` resolves to the real directory before the refusal checks the same way, so `missing/..` names the parent repository; the recorded `path` and derived `name` use the resolved spelling.
 - Discovers the parent repo by walking from `cwd` up to the top-level `.git` (the first ancestor containing `.git`), then ensures `gf.toml` exists there.
 - Adds the git-folder to `gf.toml`.
 - The git-folder name is derived from the directory name. Use `-n <name>` to override it.
-- Sets the git-folder URL to the local child path; update `gf.toml` before `pull` if an upstream is needed. If `--url <url>` is given, store that URL in `gf.toml` instead of the local placeholder, so a later `gf pull` fetches from the real upstream.
+- `-b <ref>` records the git-folder's ref for later pulls, defaulting to `latest` when omitted.
+- Sets the git-folder URL to the local child path spelled relative to the parent repo root; update `gf.toml` before `pull` if an upstream is needed. If `--url <url>` is given, store that URL in `gf.toml` instead of the local placeholder, so a later `gf pull` fetches from the real upstream.
 - `init` never resolves the URL and has no special case for subfolder URLs. The binding form is decided on the first `gf pull`, which converts the child to a consumer link when the URL resolves to a subfolder (see `gf pull`).
-- Refuse to initialize a directory that already contains a `.git` or `.gf` directory.
+- Refuse to initialize a directory that already contains a `.git` or `.gf` directory, or a `<path>` that resolves inside the parent's `.gf` storage.
 - Print `add "<dir>/" to .gitignore` as a recommendation; do not modify the parent `.gitignore`.
 
 ### `gf sh [command...]`
@@ -333,7 +342,7 @@ gf sh -c "git diff"
 gf sh -C vendor/libfoo git log -p
 ```
 
-This is the supported way to run arbitrary git commands against a child. Direct `gf status/push` passthrough is still deferred.
+This is the supported way to run arbitrary git commands against a child. Direct `gf status`/`push` passthrough is not supported.
 
 ### `gf git [args...]`
 
@@ -358,7 +367,7 @@ gf git -C vendor/libfoo log --oneline
 Run `git diff` in a child with the correct git environment.
 
 - The child is selected by the global `-C` option or by the current working directory.
-- For a subfolder binding, `gf` appends `-- .` to the arguments when the user passes no pathspec (no `--` among the trailing args), so the default diff is scoped to the mapping. A user-supplied `--` passes through untouched.
+- For a subfolder binding, `gf` appends `-- .` to the arguments when the trailing args contain no `--` and no operand naming an existing path under the mapped directory or carrying pathspec magic (`*`, `?`, `[`, leading `:`), so the default diff is scoped to the mapping; an explicit `--` or such an operand disables the scope.
 - Trailing arguments are passed directly to `git diff`.
 - When stdout is a terminal, `gf` replaces itself with `git diff` so `less`/pagers work.
 - When stdout is not a terminal, the diff is streamed.
@@ -376,7 +385,7 @@ gf diff -C vendor/libfoo
 Run `git log` in a child with the correct git environment.
 
 - The child is selected by the global `-C` option or by the current working directory.
-- For a subfolder binding, `gf` appends `-- .` to the arguments when the user passes no pathspec (no `--` among the trailing args), so the default log follows the mapping; passing an explicit `--` or any pathspec disables the scope. Use `gf git log` for unscoped repository history.
+- For a subfolder binding, `gf` appends `-- .` to the arguments when the trailing args contain no `--` and no operand naming an existing path under the mapped directory or carrying pathspec magic (`*`, `?`, `[`, leading `:`), so the default log follows the mapping; an explicit `--` or such an operand disables the scope. Use `gf git log` for unscoped repository history.
 - Trailing arguments are passed directly to `git log`.
 - When stdout is a terminal, `gf` replaces itself with `git log` so `less`/pagers work.
 - When stdout is not a terminal, the log is streamed.
@@ -393,14 +402,16 @@ gf log -C vendor/libfoo -p
 
 Create a new git worktree of the parent repo and symlink each managed git-folder into it.
 
+- `gf` refuses a `<path>` that resolves inside the parent's `.gf` storage before git sees it.
 - `<path>` is passed to `git worktree add` (git itself decides if a path is valid).
 - Branch and commit options are passed to `git worktree add`.
-- After the parent worktree is created, the current `gf.toml` and `gf.local.toml` are copied to it so all `gf` commands work from the new worktree.
+- After the parent worktree is created, the current `gf.toml` and `gf.local.toml` are copied to it so all `gf` commands work from the new worktree; a manifest path the checkout materialized as a symlink is unlinked and replaced by a regular file, and a non-regular, non-symlink destination — such as a committed `gf.toml/` directory — is refused — the copy never writes through checked-out content.
 - `gf` places a relative symlink at `new-worktree/<git-folder-path>` for each git-folder that is a real child in the source worktree.
 - The symlink points to the corresponding consumer child in the source worktree. For a subfolder binding, the link targets the source worktree's consumer link (not the resolved checkout), so a later retarget in the source worktree propagates.
 - The new worktree shares the git-folder's working tree; uncommitted changes are visible in both worktrees.
 - `gf` commands run inside a symlinked child resolve to the source child or checkout and operate on it.
 - `gf rm` cannot be run from a symlinked child; remove the git-folder from the owning worktree. For a subfolder binding, the owning worktree is the parent root whose `.gf/wt` contains the link's realpath.
+- If a step after `git worktree add` fails — copying the manifests or placing a child link, including a child path that already exists — `gf` removes the worktree it just created (`git worktree remove --force`), so a failed add leaves no registered worktree behind and can be retried directly; when the removal itself fails — a locked worktree needs the force doubled — `gf` retries and, if it still fails, reports the orphaned worktree and the recovery command. `-f` replaces an existing link or file at a child path but never a real directory: a directory already occupying a child path — for example tracked content materialized at a `gf init` consumer path — is refused even under `-f`.
 
 Example:
 
@@ -462,7 +473,7 @@ gf worktree remove /tmp/hotfix --force
 | `gf <cmd>` with no args, `cwd` not a child    | Operate on all children whose paths are at or below `cwd`.                                                                                              |
 | `gf <cmd> <arg>...`                           | Each `arg` is a path. If it points at or into a child, operate on that child; if it is a parent of multiple children, operate on all children below it. |
 
-For subfolder bindings, "inside a child" is decided by realpath matching: a cwd or path argument inside a consumer link (or inside the physical `.gf/wt` checkout it resolves to) selects that binding. When cwd resolves inside more than one binding — for example nested `docs` and `docs/api` bindings sharing one checkout — no-argument selection chooses the innermost binding. A physical path under `<root>/.gf` still resolves through the consumer link's realpath, so operating from a `cd -P` physical cwd selects the owning binding rather than nothing. A consumer link is owned by the parent root whose `.gf/wt` contains its realpath; in any other parent worktree it is a linked child.
+For subfolder bindings, "inside a child" is decided by realpath matching: a cwd or path argument inside a consumer link (or inside the physical `.gf/wt` checkout it resolves to) selects that binding. When cwd resolves inside more than one binding — for example nested `docs` and `docs/api` bindings sharing one checkout — no-argument selection chooses the innermost binding. When several bindings share that innermost map — two consumer paths mapping the same directory — an argument spelling one of their consumer paths selects that binding. Every path argument identifies by spelled consumer-path identity only after lexical normalization — `.`/`..` segments resolve by directory identity. A physical path under `<root>/.gf` still resolves through the consumer link's realpath, so operating from a `cd -P` physical cwd selects the owning binding rather than nothing. A consumer link is owned by the parent root whose `.gf/wt` contains its realpath; in any other parent worktree it is a linked child.
 
 `rm` is the exception to the "all below cwd" default: no args in a non-child context is an error.
 
@@ -486,35 +497,35 @@ For a single whole-repo child during `gf pull`:
 
 For selected subfolder bindings during `gf pull`, the work is grouped so shared stores and checkouts are touched once:
 
-1. Take each binding's repo URL and subdir from its recorded URL resolution, or resolve the effective `url` when there is no record or the `url` changed ([URL resolution](#url-resolution)). Resolve the effective ref and its checkout key. An override that changes the repo URL moves the binding to another store; an override that changes the effective checkout key retargets the consumer link.
-1. Group the bindings by repo store; run exactly one `git fetch --filter=blob:none origin` per store (falling back to a full fetch with a warning when the server refuses filters). A store that needs creating gets `git init --bare`, `remote.origin.url`, and its first refspec line first; a binding whose branch no line covers appends one ([Fetch refspecs](#fetch-refspecs)).
+1. Take each binding's repo URL and subdir from its recorded URL resolution, or resolve the effective `url` when there is no record or the `url` changed ([URL resolution](#url-resolution)). Resolve the effective ref and its checkout key. An override that changes the repo URL moves the binding to another store; an override that changes the effective checkout key retargets the consumer link. A subfolder binding whose changed `url` resolves to a whole repository stops `gf pull` with the refusal described under `gf pull`, before any repo store, checkout, consumer link, or state is changed.
+1. Group the bindings by repo store; run exactly one `git fetch --filter=blob:none origin` per store (falling back to a full fetch with a warning when the server refuses filters). A store that needs creating gets `git init --bare`, `remote.origin.url`, and its first refspec line first; a binding whose branch or tag no line covers appends one, and a pinned commit the store lacks is fetched directly with `git fetch origin <sha>` ([Fetch refspecs](#fetch-refspecs)).
 1. Group the bindings by checkout key within each store. For each checkout:
    - Ensure the checkout exists (`git worktree add --no-checkout --detach`, then verify the worktree record per [Checkout integrity](#checkout-integrity)), widening its sparse cone (`sparse-checkout set --cone <union of subdirs>`) when a new binding joins it. A checkout directory without its worktree record stops this checkout with an error.
-   - Run one dirty check (`status --porcelain` over the union cone). If dirty, apply the same `--force`/`--autostash` rules as a whole-repo child to the whole checkout before continuing; without them, abort.
+   - Run one dirty check (`status --porcelain` over the whole materialized checkout — cone-materialized paths plus physically-present untracked files). If dirty, apply the same `--force`/`--autostash` rules as a whole-repo child to the whole checkout before continuing; without them, abort.
    - Apply the ref once: `checkout -B <branch> origin/<branch>` for branch/`latest`, `checkout <sha>` for tag/commit, `--rebase` honored for branch refs.
    - Remove the `.git` gitfile after creation, and lock the checkout with `git worktree lock` if it is not locked.
-1. Create or retarget each binding's consumer link to `<checkout>/<subdir>`, record per-checkout state at `<root>/.gf/wt/<repo-key>/<checkout-key>.state`, and print one line per binding the checkout serves, as described under `gf pull`.
+1. Create or retarget each binding's consumer link to `<checkout>/<subdir>`, record per-checkout state at `<root>/.gf/wt/<repo-key>/.<checkout-key>.state`, and print one line per binding the checkout serves, as described under `gf pull`.
 
 ## Drift algorithm
 
 For a single child during `gf status --remote`:
 
 1. `gf status --remote` is local-only. It does **not** call `git fetch`, `git remote`, `git ls-remote`, or any other network command. Drift is computed from the local refs already present in the child gitdir, exactly like `git status` compares `refs/heads/<branch>` to `refs/remotes/origin/<branch>` after a `git fetch`. Run `gf pull` or `gf git fetch` to refresh the remote-tracking refs first.
-1. If the child is missing (no `child/.gf/git/HEAD`), the state is `missing`.
+1. If the child is missing (no `child/.gf/git/HEAD`), the state is `missing`. For a subfolder binding, `missing` also covers a dangling consumer link — its mapped subdirectory absent from the checkout.
 1. Read the effective ref from `gf.toml` and `gf.local.toml`.
 1. Resolve the effective ref to a SHA in the child gitdir or repo store using only local refs:
    - For `branch` refs: `refs/remotes/origin/<branch>`.
    - For `latest`: `refs/remotes/origin/HEAD` if it is a valid symbolic ref, otherwise `refs/remotes/origin/main`, otherwise `refs/remotes/origin/master`. No `git remote set-head` or other network call is made.
    - For `tag` or `commit`: the peeled SHA from local refs.
-   - If the ref cannot be resolved locally, raise a clear error (do not report `clean`); `gf status --remote` exits with a deterministic non-zero code.
-1. Read the child `HEAD` SHA.
+   - If the ref cannot be resolved locally, raise a clear error (do not report `clean`); `gf status --remote` exits with a deterministic non-zero code. This holds for a child with no commits yet, for example one just created by `gf init`: it has a `HEAD`, so it is not `missing`, and when its ref cannot be resolved locally it gets this error, not a raw git error.
+1. Read the child `HEAD` SHA. A child with no commits yet has no `HEAD` SHA; it does not match the resolved SHA.
 1. Run `git status --porcelain` in the child. For a subfolder binding, the run is scoped to the binding's subdir (`status --porcelain -- <subdir>` against its checkout) and remains local-only.
 1. Classify:
    - `clean`: child `HEAD` matches the resolved SHA and the worktree is clean.
    - `behind`: child `HEAD` does not match the resolved SHA and the worktree is clean.
    - `local-dirty`: child `HEAD` matches the resolved SHA and the worktree has modifications.
    - `both`: child `HEAD` does not match the resolved SHA and the worktree has modifications.
-   - `missing`: the child has no `.gf/git/HEAD`. For a subfolder binding, `missing` means the consumer link or its checkout is absent, or the binding has no recorded URL resolution yet. Drift never resolves a URL.
+   - `missing`: the child has no `.gf/git/HEAD`. For a subfolder binding, `missing` means the consumer link is absent or dangling (its mapped subdirectory is absent from the checkout), the checkout itself is absent, or the binding has no recorded URL resolution yet. Drift never resolves a URL.
 
 ## Security and authority
 
@@ -541,7 +552,7 @@ For a single child during `gf status --remote`:
   - Edit a git-folder file; `gf status` shows `local-dirty`; `gf sh -c "git diff"` works.
   - Add a parent `git worktree`; `gf pull` in the new worktree; verify the new worktree uses a symlink to the source child and has an independent `HEAD`.
   - Switch a git-folder to a fork via `gf.local.toml`; `gf pull` updates without changing tracked parent files.
-  - Clone two subfolders of one repository: one repo store and one checkout exist, the consumer links list only mapped files, and plain `git` from a link resolves to the parent.
+  - Clone three subfolders of one repository: one repo store and one checkout exist, the consumer links list only mapped files, and plain `git` from a link resolves to the parent.
   - `gf pull` over several bindings of one repository performs one fetch per store; scoped `status` reports only each binding's subdir; `gf rm` leaves the checkout, its uncommitted work, and the store untouched, and adding the binding back restores the folder.
   - `gf init` then `gf pull` with a subfolder URL converts an empty child to a consumer link and refuses a child that gained files.
 

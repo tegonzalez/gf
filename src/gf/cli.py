@@ -65,7 +65,10 @@ def _apply_chdir(argv: list[str]) -> list[str]:
     while i < len(argv):
         if argv[i] == "-C" and i + 1 < len(argv):
             path = argv[i + 1]
-            os.chdir(path)
+            try:
+                os.chdir(path)
+            except OSError as e:
+                die(f"cannot change to '{path}': {e.strerror or e}")
             os.environ["PWD"] = os.path.abspath(os.path.expanduser(path))
             i += 2
         else:
@@ -113,18 +116,50 @@ def cmd_clone(args, backend: GitBackend) -> int:
     url = _normalize_url(args.url)
     path = args.path
     name = args.name
-    if name is None:
-        name = _name_from_url(path) if path else _name_from_url(url)
 
-    child_path = (
-        Path(path).resolve()
+    # Keep the leaf literal and resolve only the parent chain: a leaf
+    # that is already a consumer link must stay the spelled consumer
+    # path so `rel` records the lexical path, not the physical checkout
+    # the link resolves to (`resolve_checkout` does its own realpath).
+    raw = (
+        Path(path)
         if path
-        else (_logical_cwd() / Path(name).name).resolve()
+        else _logical_cwd() / Path(name or _name_from_url(url)).name
     )
-    if not child_path.is_relative_to(parent):
+    child_path = raw.parent.resolve() / raw.name
+    # A `.`/`..` leaf is never a consumer link: normalize it through
+    # realpath — never os.path.normpath, which pops the spelled parent
+    # even when a mid-path symlink redirects it — so containment,
+    # occupancy and `rel` all observe the true directory.
+    if raw.name in (".", ".."):
+        child_path = child_path.resolve()
+
+    if name is None:
+        # The default name derives from the normalized leaf so a
+        # dot-segment leaf names the true directory (`missing/..` names
+        # its resolved parent), never `.`/`..`.
+        name = _name_from_url(child_path.name) if path else _name_from_url(url)
+    # Containment still tests the resolved path — a mid-path or leaf
+    # link landing outside the parent repo is refused — and the lexical
+    # spelling, which `rel` must be able to express under the parent.
+    if not (
+        child_path.is_relative_to(parent)
+        and child_path.resolve().is_relative_to(parent)
+    ):
         die(folder_error(
             name, str(child_path), "clone",
             "child path must be inside the parent repo"))
+
+    # A spelled child path must never land inside the parent's own `.gf`
+    # storage — a `.gf/...` spelling or an ancestor consumer link that
+    # resolved into a shared checkout. The leaf stays lexical, so a leaf
+    # that is itself the existing consumer link is not caught here and
+    # keeps its idempotent re-add path.
+    if child_path.is_relative_to(parent / layout.GF_DIR):
+        die(folder_error(
+            name, str(child_path), "clone",
+            f"child path resolves inside gf-managed storage "
+            f"({layout.GF_DIR})"))
 
     rel = child_path.relative_to(parent).as_posix()
     for folder in manifest_data.get("git_folder", []):
@@ -143,6 +178,7 @@ def cmd_clone(args, backend: GitBackend) -> int:
             backend=backend,
             depth=args.depth,
             single_branch=args.single_branch,
+            binding_path=rel,
         )
     except GitFoldersError as e:
         die(folder_error(name, rel, "clone", str(e)), code=e.code)
@@ -196,7 +232,11 @@ def cmd_pull(args, backend: GitBackend) -> int:
     if not args.path:
         _, child = manifest.resolve_context(cwd)
         if child:
-            args.path = [child.relative_to(parent).as_posix()]
+            # Absolute operand: `cwd / <abs>` collapses to `<abs>`, so the
+            # selection target is `child` itself regardless of cwd — a
+            # parent-relative spelling would re-anchor at a cwd inside the
+            # physical `.gf/wt` checkout and select nothing.
+            args.path = [str(child)]
 
     overrides = manifest.read_local_overrides(parent)
     selected = shelf.select_children(parent, cwd, args.path, manifest_data)
@@ -204,79 +244,154 @@ def cmd_pull(args, backend: GitBackend) -> int:
         return 0
 
     folders = manifest_data.get("git_folder", [])
-    pending: list[dict] = []
+    planned: list[dict] = []
+    # Resolve every selected binding's routing before changing anything
+    # (spec `gf pull`): a refused url switch stops the pull with no
+    # selected binding updated.
     for folder in selected:
         url, ref = manifest.effective_url_ref(folder, overrides)
         url = _normalize_url(url)
         link_path = parent / folder["path"]
         child = link_path.resolve()
+        co = layout.resolve_checkout(child)
+        # A source-relative `url` anchors at the root that OWNS the
+        # binding: the root whose declared manifest `path` spells the
+        # resolved `child`, which is not necessarily the invoking root —
+        # a pull entered through a `gf worktree add` link chain resolves
+        # the consumer path into the source worktree's `.gf/wt` (a
+        # whole-repo child reached the same way resolves into a
+        # directory the source parent's `path` declaration owns).
+        # Ownership is declared-path identity, never `.git` probing:
+        # `binding_root` accepts only the ancestor where `root / path`
+        # resolves to `child`, so a foreign repository nested between
+        # the child and the declaring root cannot claim the anchor.
+        # `owning_root` stays the first arm — canonical for a store
+        # checkout — keeping `.gf/wt`-interior ancestors out of the
+        # identity walk.
+        anchor = (
+            layout.owning_root(co)
+            or manifest.binding_root(child, folder["path"])
+            or parent
+        )
 
         if not _looks_remote(url):
-            resolved = parent / url
+            resolved = anchor / url
             if platform.same_path(resolved, child):
                 # Local placeholder from `gf init`; nothing to pull yet.
                 continue
             url = str(resolved.resolve())
 
         try:
-            co = layout.resolve_checkout(child)
-            if co.gitdir != co.common_dir:
-                # Established shared-checkout binding: the recorded
-                # resolution lives in the checkout — read it rather than
-                # re-probing. An override/edit changing the URL resolves
-                # the new spelling.
-                repo_url = backend.git_capture(
-                    "config", "remote.origin.url", git_dir=co.common_dir,
-                ).strip()
-                subdir = co.subdir
-                if url != f"{repo_url}/{subdir}":
+            if co.is_store_checkout:
+                # Established shared-checkout binding: consult THIS
+                # binding's recorded effective url in the checkout
+                # state's `binding_urls` map (keyed by manifest `path`)
+                # rather than re-probing — a store's origin keeps only
+                # the creating spelling, so a differently-spelled sibling
+                # reconstructed from `remote.origin.url` + `co.subdir`
+                # always mismatched and re-resolved. An absent entry — a
+                # checkout recorded before the map existed, or a link
+                # whose `.gf` storage was removed — resolves like an
+                # unrecorded binding; an override/edit changing the
+                # effective url resolves the new spelling, and the
+                # grouped phase recreates what is missing.
+                repo_url = None
+                recorded = shelf.recorded_binding_url(co, folder["path"])
+                owner = layout.owning_root(co)
+                if (
+                    recorded is not None
+                    and owner is not None
+                    and (co.common_dir / "HEAD").is_file()
+                    and shelf.recorded_url_matches(recorded, url, anchor)
+                ):
+                    origin = backend.git_capture(
+                        "config", "remote.origin.url",
+                        git_dir=co.common_dir,
+                    ).strip()
+                    # The recorded origin is a valid fetch target but a
+                    # valid stand-in for the resolution only when it keys
+                    # THIS store — a local `gf`-child boundary records
+                    # its inner `.gf/git` gitdir, which keys elsewhere;
+                    # anything else resolves so the local walk-up
+                    # recovers the canonical repo path (no network).
+                    if layout.repo_store(owner, origin) == co.common_dir:
+                        repo_url, subdir = origin, co.subdir
+                if repo_url is None:
                     repo_url, subdir = shelf.resolve_repo_url(
-                        url, parent, backend)
+                        url, anchor, backend)
+                    if not subdir:
+                        # A lexical store checkout proves the binding was
+                        # subfolder-form; an effective url that resolves
+                        # to a whole repository is refused: nothing is
+                        # repointed or converted (spec `gf pull`).
+                        raise ValidationError(
+                            "switching a subfolder binding to a whole "
+                            f"repository is not supported: {url}")
+            elif shelf.recorded_url_matches(
+                    shelf.recorded_url(co), url, anchor):
+                # Recorded resolution (`child/.gf/state` url): an
+                # existing whole-repo child is never re-resolved.
+                repo_url, subdir = url, ""
             else:
                 try:
                     repo_url, subdir = shelf.resolve_repo_url(
-                        url, parent, backend)
+                        url, anchor, backend)
                 except GitFoldersError:
-                    # Unresolvable URLs keep the whole-repo failure
-                    # surface: the fetch reports them with the usual
-                    # failure exit code.
+                    # Routing only: treat as whole-repo and let
+                    # `update_child` decide the failure surface — it
+                    # re-resolves and propagates the `.git`-boundary hint
+                    # for first-resolution bindings, while established
+                    # whole-repo bindings keep the fetch-failure surface.
                     repo_url, subdir = url, ""
-            if not subdir:
+            planned.append({
+                "folder": folder,
+                "url": url,
+                "ref": ref,
+                "link_path": link_path,
+                "child": child,
+                "co": co,
+                "anchor": anchor,
+                "repo_url": repo_url,
+                "subdir": subdir,
+            })
+        except GitFoldersError as e:
+            die(folder_error(
+                folder["name"], folder["path"], "pull", str(e)),
+                code=e.code)
+
+    pending: list[dict] = []
+    for it in planned:
+        folder = it["folder"]
+        try:
+            if not it["subdir"]:
                 shelf.update_child(
-                    co, url, ref, parent,
+                    it["co"], it["url"], it["ref"], it["anchor"],
                     override=manifest.override_active(folder, overrides),
                     rebase=args.rebase,
                     force=args.force,
                     autostash=args.autostash,
                     backend=backend,
+                    binding_path=folder["path"],
                 )
             else:
-                effective_ref = ref or "latest"
-                if co.gitdir == co.common_dir:
+                if not it["co"].is_store_checkout:
                     # The consumer path is not a link yet: convert a
                     # `gf init` placeholder (only `.gf`, no commits) —
                     # anything else is refused by ensure_consumer_link
                     # without deleting it.
-                    shelf.strip_placeholder_child(child, backend)
-                    shelf.ensure_shared_binding(
-                        link_path, parent, repo_url, subdir, url,
-                        effective_ref,
-                        override=manifest.override_active(folder, overrides),
-                        backend=backend,
-                    )
-                else:
-                    pending.append({
-                        "folder": folder,
-                        "url": url,
-                        "ref": effective_ref,
-                        "child": link_path,
-                        "co": co,
-                        "repo_url": repo_url,
-                        "subdir": subdir,
-                        "override": manifest.override_active(
-                            folder, overrides),
-                    })
-                    continue
+                    shelf.strip_placeholder_child(it["child"], backend)
+                pending.append({
+                    "folder": folder,
+                    "url": it["url"],
+                    "ref": it["ref"] or "latest",
+                    "child": it["link_path"],
+                    "co": it["co"],
+                    "repo_url": it["repo_url"],
+                    "subdir": it["subdir"],
+                    "override": manifest.override_active(
+                        folder, overrides),
+                })
+                continue
             print(f"Pulled {folder['name']}")
         except GitFoldersError as e:
             die(folder_error(
@@ -293,6 +408,11 @@ def cmd_pull(args, backend: GitBackend) -> int:
         ):
             print(line)
     except GitFoldersError as e:
+        # Lines accumulated before the failure (`Pulled <name>` for
+        # bindings already served) are still real output — emit them
+        # before the error.
+        for line in getattr(e, "lines", ()):
+            print(line)
         failed = getattr(e, "folder", None)
         if failed is None and pending:
             failed = pending[0]["folder"]
@@ -322,7 +442,10 @@ def cmd_rm(args, backend: GitBackend) -> int:
         _, child = manifest.resolve_context(cwd)
         if child is None:
             die("rm requires an explicit path when not inside a child")
-        args.path = [child.relative_to(parent).as_posix()]
+        # Same cwd-independent operand as pull/status: `cwd / <abs>`
+        # collapses to `<abs>`, so a physical `.gf/wt` cwd still selects
+        # the binding rather than a doubled nonexistent path.
+        args.path = [str(child)]
         selected = shelf.select_children(parent, cwd, args.path, manifest_data)
     else:
         selected = shelf.select_children(parent, cwd, args.path, manifest_data)
@@ -361,27 +484,54 @@ def cmd_rm(args, backend: GitBackend) -> int:
 
 
 def _head(co: layout.Checkout, backend: GitBackend) -> str:
+    """Short HEAD SHA; "?" when the gitdir has no HEAD or HEAD is unborn.
+
+    The `is_file`/`--verify` early-outs are the legitimate missing-ref
+    fallbacks (pre-clone path); a `--short` failure after HEAD verifies
+    is a genuine git failure and propagates.
+    """
     if not (co.gitdir / "HEAD").is_file():
         return "?"
-    try:
-        return backend.git_capture("rev-parse", "--short", "HEAD", git_dir=co.gitdir, work_tree=co.work_tree).strip()
-    except GitFoldersError:
+    if backend.git(
+        "rev-parse", "--verify", "HEAD",
+        git_dir=co.gitdir, work_tree=co.work_tree, check=False,
+    ).returncode != 0:
         return "?"
+    return backend.git_capture(
+        "rev-parse", "--short", "HEAD",
+        git_dir=co.gitdir, work_tree=co.work_tree).strip()
 
 
 def _branch(co: layout.Checkout, backend: GitBackend) -> str:
+    """Current branch; "" when detached, unborn, or the gitdir has no HEAD.
+
+    `rev-parse --abbrev-ref HEAD` dies (rc=128) on an unborn HEAD, so the
+    verify gate mirrors `_head`: a child with no commits yet renders
+    empty brackets rather than the symbolic-ref target. A failure after
+    HEAD verifies is a genuine git failure and propagates.
+    """
     if not (co.gitdir / "HEAD").is_file():
         return ""
-    try:
-        out = backend.git_capture("rev-parse", "--abbrev-ref", "HEAD", git_dir=co.gitdir, work_tree=co.work_tree).strip()
-    except GitFoldersError:
+    if backend.git(
+        "rev-parse", "--verify", "HEAD",
+        git_dir=co.gitdir, work_tree=co.work_tree, check=False,
+    ).returncode != 0:
         return ""
+    out = backend.git_capture(
+        "rev-parse", "--abbrev-ref", "HEAD",
+        git_dir=co.gitdir, work_tree=co.work_tree).strip()
     return "" if out == "HEAD" else out
 
 
-def _porcelain(co: layout.Checkout, backend: GitBackend) -> str:
-    if not (co.gitdir / "HEAD").is_file():
+def _porcelain(
+    co: layout.Checkout,
+    backend: GitBackend,
+    paths: list[str] | None = None,
+) -> str:
+    if not (co.gitdir / "HEAD").is_file() or not co.work_tree.is_dir():
         return ""
+    if paths is not None:
+        return shelf.scoped_porcelain(co, paths, backend)
     return backend.git_capture("status", "--porcelain", git_dir=co.gitdir, work_tree=co.work_tree)
 
 
@@ -395,7 +545,11 @@ def cmd_status(args, backend: GitBackend) -> int:
     if not args.path:
         _, child = manifest.resolve_context(cwd)
         if child:
-            args.path = [child.relative_to(parent).as_posix()]
+            # Absolute operand: `cwd / <abs>` collapses to `<abs>`, so the
+            # selection target is `child` itself regardless of cwd — a
+            # parent-relative spelling would re-anchor at a cwd inside the
+            # physical `.gf/wt` checkout and select nothing.
+            args.path = [str(child)]
 
     overrides = manifest.read_local_overrides(parent)
     selected = shelf.select_children(parent, cwd, args.path, manifest_data)
@@ -406,19 +560,20 @@ def cmd_status(args, backend: GitBackend) -> int:
     porcelains: list[str] = []
     for folder in selected:
         co = layout.resolve_checkout((parent / folder["path"]).resolve())
-        branch = _branch(co, backend)
-        row = [folder["name"], folder["url"], f"[{branch}]"]
-        if args.remote:
-            url, ref = manifest.effective_url_ref(folder, overrides)
-            try:
-                state = shelf.drift(co, ref, remote=True, backend=backend)
-            except GitFoldersError as e:
-                die(folder_error(
-                    folder["name"], folder["path"], "status", str(e)),
-                    code=e.code)
-            row.append(state)
-        rows.append(row)
-        porcelains.append(_porcelain(co, backend))
+        scope = shelf.binding_scope(parent, folder, co)
+        try:
+            branch = _branch(co, backend)
+            row = [folder["name"], folder["url"], f"[{branch}]"]
+            if args.remote:
+                url, ref = manifest.effective_url_ref(folder, overrides)
+                state = shelf.drift(co, ref, backend=backend, paths=scope)
+                row.append(state)
+            rows.append(row)
+            porcelains.append(_porcelain(co, backend, paths=scope))
+        except GitFoldersError as e:
+            die(folder_error(
+                folder["name"], folder["path"], "status", str(e)),
+                code=e.code)
 
     for line, porcelain in zip(_align_columns(rows), porcelains):
         print(line)
@@ -443,9 +598,15 @@ def cmd_ls(args, backend: GitBackend) -> int:
     rows: list[list[str]] = []
     for folder in selected:
         co = layout.resolve_checkout((parent / folder["path"]).resolve())
-        branch = _branch(co, backend)
-        head = _head(co, backend)
-        porcelain = _porcelain(co, backend)
+        scope = shelf.binding_scope(parent, folder, co)
+        try:
+            branch = _branch(co, backend)
+            head = _head(co, backend)
+            porcelain = _porcelain(co, backend, paths=scope)
+        except GitFoldersError as e:
+            die(folder_error(
+                folder["name"], folder["path"], "ls", str(e)),
+                code=e.code)
         dirty = porcelain.strip() != ""
         rows.append([
             folder["name"],
@@ -472,17 +633,47 @@ def cmd_init(args, backend: GitBackend) -> int:
     if parent is None:
         die("not inside a git repo")
 
-    target = Path(args.path).resolve() if args.path else cwd
-    if not target.is_relative_to(parent):
+    if args.path:
+        # Same leaf-literal normalization as `gf clone`: a leaf consumer
+        # link stays the spelled consumer path so `rel` and the error
+        # envelope name it rather than the physical path it resolves to.
+        raw = Path(args.path)
+        target = raw.parent.resolve() / raw.name
+        # Same dot-segment leaf normalization as `gf clone`: a `.`/`..`
+        # leaf is never a consumer link, so realpath it before the
+        # containment, `target == parent`/`.git`, and occupancy guards
+        # and `rel`/`target.name` observe the true directory.
+        if raw.name in (".", ".."):
+            target = target.resolve()
+    else:
+        target = cwd
+    if not (
+        target.is_relative_to(parent)
+        and target.resolve().is_relative_to(parent)
+    ):
         die(folder_error(
             args.name or target.name or str(target), str(target), "init",
             "child path must be inside the parent repo"))
+
+    # Same `.gf`-storage refusal as `gf clone`: a spelled target inside the
+    # parent's `.gf` — directly or through an ancestor consumer link —
+    # must not let `target.mkdir` or `init_git_folder` write inside a
+    # shared checkout or store. A leaf that is itself a consumer link
+    # stays lexical here and is refused later by the occupancy checks.
+    if target.is_relative_to(parent / layout.GF_DIR):
+        die(folder_error(
+            args.name or target.name or str(target), str(target), "init",
+            f"child path resolves inside gf-managed storage "
+            f"({layout.GF_DIR})"))
 
     rel = target.relative_to(parent).as_posix()
     name = args.name if args.name else (target.name or rel)
     url = args.url if args.url else rel
 
-    # Validate the target before touching the manifest.
+    # Validate the target before any side effect: every refusal —
+    # containment, `.gf`-storage, occupancy and the manifest collision
+    # loop — precedes `target.mkdir` and `init_git_folder`, so a refused
+    # init leaves nothing behind (same ordering as `gf clone`).
     if target == parent or (target / ".git").exists():
         die(folder_error(
             name, rel, "init", f"{target} already has a .git directory"))
@@ -490,18 +681,10 @@ def cmd_init(args, backend: GitBackend) -> int:
         die(folder_error(
             name, rel, "init", f"{target} already has a .gf directory"))
 
-    if not target.exists():
-        target.mkdir(parents=True, exist_ok=True)
-
-    try:
-        shelf.init_git_folder(layout.resolve_checkout(target), backend=backend)
-    except GitFoldersError as e:
-        die(folder_error(name, rel, "init", str(e)), code=e.code)
-
-    # Now that the child is created, update the manifest.
+    # A missing gf.toml materializes through the single write below,
+    # after the child is created.
     if manifest_data is None:
         manifest_data = {"git_folder": []}
-        manifest.write_manifest(parent, manifest_data)
     for folder in manifest_data.get("git_folder", []):
         if folder.get("name") == name:
             die(folder_error(
@@ -511,6 +694,14 @@ def cmd_init(args, backend: GitBackend) -> int:
             die(folder_error(
                 name, rel, "init",
                 f"path {rel} is already used by git-folder '{folder['name']}'"))
+
+    if not target.exists():
+        target.mkdir(parents=True, exist_ok=True)
+
+    try:
+        shelf.init_git_folder(layout.resolve_checkout(target), backend=backend)
+    except GitFoldersError as e:
+        die(folder_error(name, rel, "init", str(e)), code=e.code)
 
     folders = manifest_data.setdefault("git_folder", [])
     folders.append({
@@ -526,8 +717,18 @@ def cmd_init(args, backend: GitBackend) -> int:
     return 0
 
 
-def _git_env_for_child() -> dict[str, str]:
-    """Return an environment dict pointing GIT_DIR and GIT_WORK_TREE at the current child."""
+def _passthrough_target(op: str) -> tuple[layout.Checkout, Path]:
+    """Resolve the caller's position to (checkout, physical subprocess cwd).
+
+    The subprocess cwd is the caller's RESOLVED PHYSICAL position — under
+    a store checkout that is `co.work_tree/co.subdir` (the mapped position
+    with link indirection stripped, so `.` pathspecs and `--show-prefix`
+    report the repo-relative position); under a whole-repo child it is the
+    same directory spelled physically. A missing gitdir dies through the
+    `folder_error` envelope when the cwd identifies a manifest binding
+    (`op` names the entry point); positions outside every binding keep
+    the bare die.
+    """
     cwd = _logical_cwd()
     parent, child = manifest.resolve_context(cwd)
     target = (child or cwd).resolve()
@@ -535,29 +736,49 @@ def _git_env_for_child() -> dict[str, str]:
     co = layout.resolve_checkout(target)
     git_dir = co.gitdir.resolve()
     if not (git_dir / "HEAD").is_file():
+        folder = None
+        if parent is not None and (parent / manifest.MANIFEST).is_file():
+            folder = shelf.folder_containing(
+                parent, cwd, manifest.read_manifest(parent))
+        if folder is not None:
+            die(folder_error(
+                folder["name"], folder["path"], op,
+                "not inside a git-folder child"))
         die("not inside a git-folder child")
+    return co, Path(os.path.realpath(cwd))
 
+
+def _git_env_for_child(co: layout.Checkout) -> dict[str, str]:
+    """Env pointing GIT_DIR at `co.gitdir` and GIT_WORK_TREE at `co.work_tree`.
+
+    For a store checkout `co.gitdir` is the linked worktree's admin dir
+    under the repo store; for a whole-repo child it is `child/.gf/git`.
+    """
     env = os.environ.copy()
-    env["GIT_DIR"] = str(git_dir)
+    env["GIT_DIR"] = str(co.gitdir.resolve())
     env["GIT_WORK_TREE"] = str(co.work_tree)
     return env
 
 
-def _run_child_command(cmd: list[str]) -> int:
-    """Run a command inside the current child, exec on TTY, stream otherwise."""
-    env = _git_env_for_child()
+def _run_child_command(
+    cmd: list[str], co: layout.Checkout, cwd: Path,
+) -> int:
+    """Run a command with the checkout env at the physical position,
+    exec on TTY, stream otherwise."""
+    env = _git_env_for_child(co)
     if sys.stdout.isatty():
-        result = runner.run_command(cmd, env, mode="exec")
+        result = runner.run_command(cmd, env, mode="exec", cwd=cwd)
         if result.returncode != 0:
             die(result.stderr, result.returncode)
         return 0
-    result = runner.run_command(cmd, env, mode="stream")
+    result = runner.run_command(cmd, env, mode="stream", cwd=cwd)
     return result.returncode
 
 
 def cmd_git(args) -> int:
     """Run an arbitrary `git` command inside the current child."""
-    return _run_child_command(["git", *args.git_args])
+    co, cwd = _passthrough_target("git")
+    return _run_child_command(["git", *args.git_args], co, cwd)
 
 
 def cmd_sh(args) -> int:
@@ -576,26 +797,143 @@ def cmd_sh(args) -> int:
     else:
         cmd = [os.environ.get("SHELL", "/bin/sh")]
 
-    return _run_child_command(cmd)
+    co, cwd = _passthrough_target("sh")
+    return _run_child_command(cmd, co, cwd)
+
+
+def _scoped_dot(git_args: list[str], co: layout.Checkout, cwd: Path) -> list[str]:
+    """`-- .` for diff/log when a store checkout and no user pathspec.
+
+    The bare `.` pathspec means "the caller's position" — the subprocess
+    cwd, which `_passthrough_target` anchors at the physical mapped
+    subdir. A user-supplied `--` suppresses the append entirely so their
+    pathspecs pass verbatim. So does any non-flag operand git's own
+    no-`--` promotion would take as a pathspec: one naming an existing
+    path under `cwd`, or one carrying pathspec magic — glob metachars
+    `* ? [` or a leading `:`.
+    """
+    if not co.is_store_checkout or "--" in git_args:
+        return []
+    for token in git_args:
+        if token.startswith("-"):
+            continue
+        if ((cwd / token).exists() or token.startswith(":")
+                or any(mark in token for mark in "*?[")):
+            return []
+    return ["--", "."]
 
 
 def cmd_diff(args) -> int:
-    """Run `git diff` inside the current child."""
-    return _run_child_command(["git", "diff", *args.git_args])
+    """Run `git diff` inside the current child, scoped to the binding."""
+    co, cwd = _passthrough_target("diff")
+    git_args = [*args.git_args, *_scoped_dot(args.git_args, co, cwd)]
+    return _run_child_command(["git", "diff", *git_args], co, cwd)
 
 
 def cmd_log(args) -> int:
-    """Run `git log` inside the current child."""
-    return _run_child_command(["git", "log", *args.git_args])
+    """Run `git log` inside the current child, scoped to the binding."""
+    co, cwd = _passthrough_target("log")
+    git_args = [*args.git_args, *_scoped_dot(args.git_args, co, cwd)]
+    return _run_child_command(["git", "log", *git_args], co, cwd)
+
+
+def _worktree_takeover_detail(new_child: Path, force: bool) -> str | None:
+    """Error detail when the worktree link step may not take over an
+    existing child path; None when it may proceed.
+
+    A missing path links cleanly. Without `force` any collision is
+    refused; under `-f` a symlink or regular file is replaced — never a
+    real directory or other non-regular path, which the add did not
+    create and unlink() cannot remove.
+    """
+    if not (new_child.is_symlink() or new_child.exists()):
+        return None
+    if not force:
+        return f"child path {new_child} already exists"
+    if new_child.is_symlink() or new_child.is_file():
+        return None
+    if new_child.is_dir():
+        return (f"child path {new_child} is a real directory; "
+                f"refusing to remove it")
+    return (f"child path {new_child} is not a symlink or regular "
+            f"file; refusing to remove it")
+
+
+def _worktree_link_folders(
+    parent: Path, new_parent: Path, folders: list[dict], force: bool,
+) -> None:
+    """Copy the manifest and link managed git-folders into the added
+    worktree.
+
+    Runs AFTER `git worktree add` registered `new_parent`, so it raises
+    instead of dying and the caller can roll the worktree back: a
+    folder-identified failure raises ValidationError carrying the
+    folder_error envelope; an OSError escaping the manifest copy
+    propagates raw.
+    """
+    # Propagate the current manifest so commands in the new worktree see the
+    # same git-folders, even when gf.toml is not yet committed.
+    for manifest_name in (manifest.MANIFEST, manifest.LOCAL):
+        src = parent / manifest_name
+        dst = new_parent / manifest_name
+        if not src.exists():
+            continue
+        if dst.is_symlink():
+            # A checked-out symlink (e.g. a committed `gf.toml -> /abs`)
+            # is never written through — the copy replaces it.
+            dst.unlink()
+        elif os.path.lexists(dst) and not dst.is_file():
+            raise ValidationError(
+                f"{dst} in the new worktree is not a regular file; "
+                f"refusing to copy {manifest_name} over it")
+        dst.write_text(src.read_text())
+
+    for folder in folders:
+        source_child = parent / folder["path"]
+        if not manifest.is_git_folder_child(source_child):
+            continue
+        # The link spells the source consumer path AS WRITTEN — for a
+        # subfolder binding that is the consumer link itself, so a later
+        # retarget of the source binding propagates through the chain
+        # (spec L399/L400; GF-D14). Resolving here would freeze the link
+        # at today's checkout position.
+        new_child = new_parent / folder["path"]
+        detail = _worktree_takeover_detail(new_child, force)
+        if detail is not None:
+            raise ValidationError(folder_error(
+                folder["name"], folder["path"], "worktree add", detail))
+        try:
+            new_child.parent.mkdir(parents=True, exist_ok=True)
+            if new_child.is_symlink() or new_child.exists():
+                new_child.unlink()
+            rel = os.path.relpath(source_child, new_child.parent)
+            os.symlink(rel, new_child, target_is_directory=True)
+        except OSError as e:
+            raise ValidationError(folder_error(
+                folder["name"], folder["path"], "worktree add",
+                str(e))) from e
 
 
 def cmd_worktree_add(args, backend: GitBackend) -> int:
-    """Add a parent git worktree and symlink managed git-folders into it."""
+    """Add a parent git worktree and symlink managed git-folders into it.
+
+    A failure after `git worktree add` rolls the registered worktree
+    back (`git worktree remove --force`) before the error is reported,
+    so a retry is never blocked by an orphaned tree.
+    """
     parent, manifest_data = _resolve(_logical_cwd())
     if parent is None or manifest_data is None:
         die("not inside a git repo with gf.toml")
 
     new_parent = Path(args.path).resolve()
+
+    # The worktree destination must never land inside this parent's own
+    # `.gf` storage — a `.gf/...` spelling or one that resolves through a
+    # consumer link into a shared checkout. `new_parent` is already the
+    # resolved target `git worktree add` receives.
+    if new_parent.is_relative_to(parent / layout.GF_DIR):
+        die(f"worktree path {new_parent} resolves inside gf-managed "
+            f"storage ({layout.GF_DIR})")
 
     folders = manifest_data.get("git_folder", [])
 
@@ -606,37 +944,50 @@ def cmd_worktree_add(args, backend: GitBackend) -> int:
         wt_args.extend(["-b", args.new_branch])
     if args.new_or_existing_branch:
         wt_args.extend(["-B", args.new_or_existing_branch])
+    wt_args.append(str(new_parent))
     if args.commitish:
         wt_args.append(args.commitish)
 
+    # Pre-flight the takeover check at the destination: a child path
+    # that already exists dies before `git worktree add` registers the
+    # worktree. The post-add pass repeats it for content the checkout
+    # materializes (and races).
+    for folder in folders:
+        if not manifest.is_git_folder_child(parent / folder["path"]):
+            continue
+        detail = _worktree_takeover_detail(
+            new_parent / folder["path"], args.force)
+        if detail is not None:
+            die(folder_error(
+                folder["name"], folder["path"], "worktree add", detail))
+
     try:
-        backend.git("worktree", "add", *wt_args, str(new_parent), cwd=parent, stream=True)
+        backend.git("worktree", "add", *wt_args, cwd=parent, stream=True)
     except GitFoldersError as e:
         die(str(e), code=e.code)
 
-    # Propagate the current manifest so commands in the new worktree see the
-    # same git-folders, even when gf.toml is not yet committed.
-    for manifest_name in (manifest.MANIFEST, manifest.LOCAL):
-        src = parent / manifest_name
-        dst = new_parent / manifest_name
-        if src.exists():
-            dst.write_text(src.read_text())
-
-    for folder in folders:
-        source_child = parent / folder["path"]
-        if not manifest.is_git_folder_child(source_child):
-            continue
-        source_child = source_child.resolve()
-        new_child = new_parent / folder["path"]
-        new_child.parent.mkdir(parents=True, exist_ok=True)
-        rel = os.path.relpath(source_child, new_child.parent)
-        if new_child.is_symlink() or new_child.exists():
-            if not args.force:
-                die(folder_error(
-                    folder["name"], folder["path"], "worktree add",
-                    f"child path {new_child} already exists"))
-            new_child.unlink()
-        os.symlink(rel, new_child, target_is_directory=True)
+    try:
+        _worktree_link_folders(parent, new_parent, folders, args.force)
+    except (GitFoldersError, OSError) as e:
+        # A post-add failure must not orphan the registered worktree:
+        # retry would fail on the existing directory and a plain remove
+        # refuses the untracked copied manifest. `--force` drops the
+        # registration and the tree; a locked worktree needs the force
+        # doubled (-ff). If the rollback still fails, the user must hear
+        # about the leftover registration, not just the original error.
+        result = backend.git("worktree", "remove", "--force",
+                             str(new_parent), cwd=parent, check=False)
+        if result.returncode != 0:
+            result = backend.git("worktree", "remove", "--force",
+                                 "--force", str(new_parent),
+                                 cwd=parent, check=False)
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            die(f"{e} — and rollback of the new worktree also failed: "
+                f"{detail or 'unknown error'}; remove the orphaned "
+                f"worktree with `git worktree remove --force "
+                f"{new_parent}`")
+        die(str(e), code=getattr(e, "code", 1))
 
     print(f"Added worktree at {new_parent}")
     return 0

@@ -517,13 +517,22 @@ class MockGitBackend(GitBackend):
 
         if cmd == "rev-parse":
             if "HEAD" in args:
+                # An unborn HEAD (a child with no commits yet) resolves
+                # to no commit: real git dies rc=128 on EVERY HEAD form —
+                # --verify, --short, bare HEAD, and --abbrev-ref alike.
+                # Only once HEAD resolves do the per-form outputs apply.
+                try:
+                    sha = (self._head_sha(repo, wt) if wt is not None
+                           else repo.resolve("HEAD"))
+                except GitError:
+                    sha = None
+                if not sha:
+                    raise GitError(
+                        "fatal: ambiguous argument 'HEAD': unknown "
+                        "revision or path not in the working tree")
                 if "--abbrev-ref" in args:
                     branch = self._head_branch(repo, wt)
                     return GitResult(0, (branch or "HEAD") + "\n", "")
-                if wt is not None:
-                    sha = self._head_sha(repo, wt) or ""
-                else:
-                    sha = repo.resolve("HEAD")
                 out = sha[:12] if "--short" in args else sha
                 return GitResult(0, out + "\n", "")
             ref = args[-1]

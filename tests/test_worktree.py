@@ -1,4 +1,6 @@
 """Integration tests for `gf worktree add`."""
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
 
 import os
 import re

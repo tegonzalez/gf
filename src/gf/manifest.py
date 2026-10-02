@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
+
 from pathlib import Path
 from typing import Any, Optional
 

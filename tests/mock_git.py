@@ -4,6 +4,8 @@ This backend does not spawn git. It records every git call and maintains a
 simplified in-memory git model (commits, refs, worktree) so `gf` can still
 read and write files in a `pyfakefs` filesystem.
 """
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
 
 import re
 from dataclasses import dataclass, field

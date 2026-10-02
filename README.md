@@ -66,18 +66,21 @@ uv tool uninstall git-folders
 
 ## Quickstart
 
+Run `gf` from the parent Git repository you want to manage. `gf init` creates an empty local child and records it in `gf.toml`; set that entry's upstream URL before running `gf pull`.
+
+After installing the package with `uv tool install .`, initialize a child from the parent repository:
+
 ```bash
-# In an existing parent git repo
-gf clone https://github.com/foo/libfoo vendor/libfoo
+gf init vendor/libfoo
 gf ls
-gf status
-gf pull
 ```
 
-`gf clone` also supports bare host/path URLs:
+The first command prints `Initialized libfoo in vendor/libfoo` and creates the child without fetching a remote.
+
+From a source checkout, target the parent repository with `-C`:
 
 ```bash
-gf clone github.com/cursor/plugins x/plugins
+uv run gf -C /path/to/parent init vendor/libfoo
 ```
 
 ## Commands
@@ -125,3 +128,8 @@ Local overrides live in `gf.local.toml` and are never tracked.
 - `docs/gf-arch.md` — architecture and data flow
 - `docs/gf-testing.md` — test plan
 - `docs/gf-troubleshooting.md` — common issues and undo procedures
+
+## License
+
+Licensed under the [MIT License](LICENSE).
+SPDX identifier: `MIT`.

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
+
 class GitFoldersError(Exception):
     """Base class for git-folders failures with deterministic exit codes."""
 

@@ -10,6 +10,8 @@ when its runtime dependency is already available.
 The installed console script (`gf` from pyproject.toml) is the preferred
 entry point for packaged releases.
 """
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
 
 import os
 import sys

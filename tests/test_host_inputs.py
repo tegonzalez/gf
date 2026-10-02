@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
+
 import subprocess
 from pathlib import Path
 

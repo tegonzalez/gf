@@ -1,4 +1,6 @@
 """POSIX path and process primitives owned by git-folders."""
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
 
 from __future__ import annotations
 

@@ -1,4 +1,6 @@
 """Comprehensive in-process CLI permutation tests using a mock git backend."""
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
 
 import os
 import re

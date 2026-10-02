@@ -116,7 +116,7 @@ When the local tracking branch and `origin/<branch>` each carry commits the othe
 
 ## `gf pull --autostash` could not restore my changes
 
-`--autostash` stashes with `git stash push -u -m "gf autostash"` before the update and restores with `git stash pop --index` afterwards — on success and on every update failure that follows the stash, so a taken stash is never orphaned. When the pop itself conflicts or fails, `gf` keeps the named stash entry and reports the state rather than dropping the work. Recover by resolving the conflicted paths and running `gf git stash pop --index` inside the child, or drop the entry deliberately once its content is safe elsewhere.
+`--autostash` stashes with `git stash push -u -m "gf autostash"` before the update and restores with `git stash pop --index` afterwards — on success and on every update failure that follows the stash, so a taken stash is never orphaned. When the pop itself conflicts or fails, `gf` keeps the named stash entry and reports the state rather than dropping the work. Recover inside the child: when the pop applied with conflicts, resolve the conflicted paths and run `gf git stash drop` once the content is landed; when the pop never applied, clear the obstruction and run `gf git stash pop --index`.
 
 ## `gf pull` reports commits would be stranded
 

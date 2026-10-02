@@ -1615,13 +1615,183 @@ def unlink_linked_git_folders_in_worktree(
     return removed
 
 
+def _linked_gitfile_plan(git_dir: Path) -> list[tuple[str, Path]]:
+    """Reconcile every registered linked-worktree gitfile before a move.
+
+    `<git_dir>/worktrees/<n>/gitdir` names the external worktree's `.git`
+    FILE — a small file containing `gitdir: <git_dir>/worktrees/<n>`.
+    The gitdir's move leaves that spelling stale, so every record is
+    preflighted here while the gitdir still sits at the old path, and
+    any unreconcilable record refuses with the truthful class:
+
+    - missing record: `<n>/gitdir` itself is absent — the record cannot
+      name its external gitfile;
+    - stale target: the external `.git` file is gone, is not a regular
+      file, or names a path other than `git_dir/worktrees/<n>` (a
+      re-registered or foreign worktree);
+    - present-but-unwritable: the file names the old path but cannot be
+      written.
+
+    The refusal names the offending record and the recovery — `git
+    worktree prune` drops a dead record, `git worktree repair` rebuilds
+    a live one's linkage — so the binding stays fully gf-managed.
+    Returns `(record_name, external_gitfile)` pairs for the post-move
+    rewrite.
+    """
+    records_dir = git_dir / "worktrees"
+    plan: list[tuple[str, Path]] = []
+    if not records_dir.is_dir():
+        return plan
+    problems: list[str] = []
+    for rec in sorted(p for p in records_dir.iterdir() if p.is_dir()):
+        rec_gitdir = rec / "gitdir"
+        if not rec_gitdir.is_file():
+            problems.append(
+                f"{rec}: missing 'gitdir' record file — cannot name the "
+                f"worktree's external .git")
+            continue
+        try:
+            ext_gitfile = Path(rec_gitdir.read_text().strip())
+        except OSError as e:
+            problems.append(f"{rec_gitdir}: unreadable record ({e})")
+            continue
+        expected = git_dir / "worktrees" / rec.name
+        if not ext_gitfile.is_file():
+            problems.append(
+                f"{rec_gitdir}: gitfile {ext_gitfile} is missing or not "
+                f"a regular file (stale target)")
+            continue
+        try:
+            content = ext_gitfile.read_text()
+        except OSError as e:
+            problems.append(f"{ext_gitfile}: unreadable ({e})")
+            continue
+        first = content.splitlines()[0] if content.splitlines() else ""
+        m = re.match(r"^gitdir:\s*(.*?)\s*$", first)
+        if (
+            m is None
+            or os.path.realpath(m.group(1))
+            != os.path.realpath(expected)
+        ):
+            problems.append(
+                f"{ext_gitfile}: names a different gitdir than "
+                f"{expected} (stale or foreign target)")
+            continue
+        if not os.access(ext_gitfile, os.W_OK):
+            problems.append(
+                f"{ext_gitfile}: present but not writable — the "
+                f"converted path cannot be recorded in it")
+            continue
+        plan.append((rec.name, ext_gitfile))
+    if problems:
+        raise ValidationError(
+            f"cannot reconcile linked-worktree records in {records_dir} "
+            f"for the {git_dir} → {git_dir.parent.parent / '.git'} move: "
+            + "; ".join(problems)
+            + "; drop dead records with `git --git-dir "
+            + str(git_dir)
+            + " worktree prune` or repair live ones with `git worktree "
+            + "repair`, then retry")
+    return plan
+
+
+def _rewrite_linked_gitfiles(
+    plan: list[tuple[str, Path]], new_git_dir: Path
+) -> list[tuple[Path, str]]:
+    """Repoint each reconciled external gitfile at `new_git_dir`.
+
+    Runs after the `.gf/git` → `.git` move; a failure is a straggler —
+    the converted checkout is intact and the record's gitfile still
+    points at the old path, recoverable with `git worktree repair`
+    (GF-TRB-13). Returns `(gitfile, detail)` pairs for the caller to
+    report; never raises — the move itself already happened.
+    """
+    strays: list[tuple[Path, str]] = []
+    for rec_name, ext_gitfile in plan:
+        target = new_git_dir / "worktrees" / rec_name
+        try:
+            ext_gitfile.write_text(f"gitdir: {target}\n")
+        except OSError as e:
+            strays.append((ext_gitfile, str(e)))
+    return strays
+
+
+def _convert_whole_repo_gitdir(co: layout.Checkout) -> list[tuple[Path, str]]:
+    """Move `child/.gf/git` to `child/.git`, worktree linkage reconciled.
+
+    `core.worktree` and each record's `commondir` are path-stable across
+    the move — the absolute worktree path and the `../..` relative
+    spelling survive verbatim — while each external worktree's `.git`
+    file holds the absolute old `worktrees/<n>` path and must be
+    rewritten (GF-D19). `_linked_gitfile_plan` refuses before the move
+    when any record cannot be reconciled, so a refused `rm` leaves the
+    binding fully gf-managed; `_rewrite_linked_gitfiles` runs after the
+    move and returns the straggler list for reporting.
+    """
+    git_dir = co.gitdir
+    new_dir = co.work_tree / ".git"
+    plan = _linked_gitfile_plan(git_dir)
+    try:
+        shutil.move(str(git_dir), str(new_dir))
+    except OSError as e:
+        raise ValidationError(
+            f"cannot move {git_dir} to {new_dir}: {e}") from e
+    return _rewrite_linked_gitfiles(plan, new_dir)
+
+
+def _teardown_gf_dir(co: layout.Checkout) -> None:
+    """Remove the provably gf-owned parts of a converted child's `.gf`.
+
+    `.gf/git` already moved to `.git`; `.gf/state` is this binding's own
+    record and is unlinked. `.gf` itself is removed only when nothing
+    else remains — a child that is itself a parent root legitimately
+    holds `.gf/wt` and `.gf/repos` for bindings it declares, and any
+    planted or foreign entry is retained and reported rather than
+    recursively removed (GF-D19, GF-D22).
+    """
+    gf_dir = co.work_tree / layout.GF_DIR
+    state_file = gf_dir / "state"
+    if state_file.is_file() or os.path.islink(state_file):
+        try:
+            state_file.unlink()
+        except OSError as e:
+            raise ValidationError(
+                f"cannot remove {state_file}: {e}") from e
+    if not gf_dir.is_dir():
+        return
+    try:
+        leftovers = sorted(p.name for p in gf_dir.iterdir())
+    except OSError as e:
+        raise ValidationError(
+            f"cannot list {gf_dir}: {e}") from e
+    if not leftovers:
+        try:
+            gf_dir.rmdir()
+        except OSError as e:
+            raise ValidationError(
+                f"cannot remove {gf_dir}: {e}") from e
+        return
+    print(
+        f"gf: kept {gf_dir}: it still holds content not provably this "
+        f"binding's ({', '.join(leftovers)}); retained — remove it by "
+        f"hand once you have checked it",
+        file=sys.stderr,
+    )
+
+
 def remove_child(child: Path, parent_root: Path) -> None:
     """Unregister a git-folder child, preserving its worktree.
 
     A subfolder binding whose consumer link `parent_root` owns loses only
     the link: the checkout — including uncommitted work — its sparse cone,
-    and the repo store are untouched (GF-D9, GF-D14). A whole-repo child
-    keeps its files: `.gf/git` moves to `.git`.
+    its per-checkout state record, and the repo store are untouched
+    (GF-D9, GF-D14). A whole-repo child is converted, not deleted: its
+    `.gf/git` moves to `.git` — `HEAD`, index, refs (the
+    `refs/worktree/gf-retained` retention ref included), config and
+    `origin` all intact, `core.worktree` absolute and path-stable — and
+    registered linked worktrees keep resolving through rewritten
+    gitfiles. A missing or dangling consumer link still unregisters:
+    absence of the link is not absence of the binding's work.
     """
     # `<root>/.gf` is gf's own storage — never a removable child: a
     # corrupted or hand-edited manifest path must not let `gf rm` modify
@@ -1652,6 +1822,8 @@ def remove_child(child: Path, parent_root: Path) -> None:
         raise GitFoldersError(
             f"{child} is a symlinked child; remove it from the owning worktree instead"
         )
+    # A missing consumer path unregisters without touching storage —
+    # the link's absence says nothing about the binding's retained work.
     if not child.is_dir():
         return
 
@@ -1661,7 +1833,7 @@ def remove_child(child: Path, parent_root: Path) -> None:
     # A `.gf` swapped for a link (or a store-co-shaped resolution, whose
     # gitdir legitimately sits under a root's `.gf/repos`) fails the
     # compare, so the move below can never carry the donor's gitdir to
-    # `child/.git` and the rmtree cannot follow the link.
+    # `child/.git` and the teardown cannot follow the link.
     if not layout.whole_repo_gitdir_is_real(co):
         raise ValidationError(
             f"child gitdir path {co.gitdir} resolves through a symlink")
@@ -1669,20 +1841,17 @@ def remove_child(child: Path, parent_root: Path) -> None:
     if git_dir.is_dir():
         if (child / ".git").exists():
             raise GitFoldersError(f"{child} already contains a .git directory")
-        import shutil
-        try:
-            shutil.move(str(git_dir), str(child / ".git"))
-        except OSError as e:
-            raise ValidationError(
-                f"cannot move {git_dir} to {child / '.git'}: {e}") from e
-
-    if gf_dir.is_dir():
-        import shutil
-        try:
-            shutil.rmtree(gf_dir)
-        except OSError as e:
-            raise ValidationError(
-                f"cannot remove {gf_dir}: {e}") from e
+        strays = _convert_whole_repo_gitdir(co)
+        for stray_path, detail in strays:
+            print(
+                f"gf: warning: linked-worktree gitfile {stray_path} was "
+                f"not repointed ({detail}) and still names the old "
+                f".gf/git location; repair it inside the converted "
+                f"folder with `git -C {child} worktree repair "
+                f"{stray_path.parent}` (GF-TRB-13)",
+                file=sys.stderr,
+            )
+    _teardown_gf_dir(co)
 
 
 # --- shared store / checkout / consumer-link machinery ----------------------

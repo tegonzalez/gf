@@ -16,8 +16,8 @@ from pathlib import Path
 import tomli_w
 
 from .backends import GitBackend, GitCliBackend
-from . import manifest, platform, runner, shelf
-from .exceptions import DirtyError, GitError, GitFoldersError, ValidationError
+from . import layout, manifest, platform, runner, shelf
+from .exceptions import DirtyError, GitError, GitFoldersError, ValidationError, folder_error
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -122,24 +122,30 @@ def cmd_clone(args, backend: GitBackend) -> int:
         else (_logical_cwd() / Path(name).name).resolve()
     )
     if not child_path.is_relative_to(parent):
-        die("child path must be inside the parent repo")
+        die(folder_error(
+            name, str(child_path), "clone",
+            "child path must be inside the parent repo"))
 
     rel = child_path.relative_to(parent).as_posix()
     for folder in manifest_data.get("git_folder", []):
         if folder.get("name") == name:
-            die(f"git-folder '{name}' already exists in manifest")
+            die(folder_error(
+                name, rel, "clone",
+                f"git-folder '{name}' already exists in manifest"))
         if Path(folder["path"]).as_posix() == rel:
-            die(f"path {rel} is already used by git-folder '{folder['name']}'")
+            die(folder_error(
+                name, rel, "clone",
+                f"path {rel} is already used by git-folder '{folder['name']}'"))
 
     try:
         shelf.init_child(
-            child_path, url, args.branch or "", parent,
+            layout.resolve_checkout(child_path), url, args.branch or "", parent,
             backend=backend,
             depth=args.depth,
             single_branch=args.single_branch,
         )
     except GitFoldersError as e:
-        die(str(e), code=e.code)
+        die(folder_error(name, rel, "clone", str(e)), code=e.code)
 
     folders = manifest_data.setdefault("git_folder", [])
     folders.append({
@@ -197,10 +203,13 @@ def cmd_pull(args, backend: GitBackend) -> int:
     if not selected:
         return 0
 
+    folders = manifest_data.get("git_folder", [])
+    pending: list[dict] = []
     for folder in selected:
         url, ref = manifest.effective_url_ref(folder, overrides)
         url = _normalize_url(url)
-        child = (parent / folder["path"]).resolve()
+        link_path = parent / folder["path"]
+        child = link_path.resolve()
 
         if not _looks_remote(url):
             resolved = parent / url
@@ -210,17 +219,88 @@ def cmd_pull(args, backend: GitBackend) -> int:
             url = str(resolved.resolve())
 
         try:
-            shelf.update_child(
-                child, url, ref, parent,
-                override=manifest.override_active(folder, overrides),
-                rebase=args.rebase,
-                force=args.force,
-                autostash=args.autostash,
-                backend=backend,
-            )
+            co = layout.resolve_checkout(child)
+            if co.gitdir != co.common_dir:
+                # Established shared-checkout binding: the recorded
+                # resolution lives in the checkout — read it rather than
+                # re-probing. An override/edit changing the URL resolves
+                # the new spelling.
+                repo_url = backend.git_capture(
+                    "config", "remote.origin.url", git_dir=co.common_dir,
+                ).strip()
+                subdir = co.subdir
+                if url != f"{repo_url}/{subdir}":
+                    repo_url, subdir = shelf.resolve_repo_url(
+                        url, parent, backend)
+            else:
+                try:
+                    repo_url, subdir = shelf.resolve_repo_url(
+                        url, parent, backend)
+                except GitFoldersError:
+                    # Unresolvable URLs keep the whole-repo failure
+                    # surface: the fetch reports them with the usual
+                    # failure exit code.
+                    repo_url, subdir = url, ""
+            if not subdir:
+                shelf.update_child(
+                    co, url, ref, parent,
+                    override=manifest.override_active(folder, overrides),
+                    rebase=args.rebase,
+                    force=args.force,
+                    autostash=args.autostash,
+                    backend=backend,
+                )
+            else:
+                effective_ref = ref or "latest"
+                if co.gitdir == co.common_dir:
+                    # The consumer path is not a link yet: convert a
+                    # `gf init` placeholder (only `.gf`, no commits) —
+                    # anything else is refused by ensure_consumer_link
+                    # without deleting it.
+                    shelf.strip_placeholder_child(child, backend)
+                    shelf.ensure_shared_binding(
+                        link_path, parent, repo_url, subdir, url,
+                        effective_ref,
+                        override=manifest.override_active(folder, overrides),
+                        backend=backend,
+                    )
+                else:
+                    pending.append({
+                        "folder": folder,
+                        "url": url,
+                        "ref": effective_ref,
+                        "child": link_path,
+                        "co": co,
+                        "repo_url": repo_url,
+                        "subdir": subdir,
+                        "override": manifest.override_active(
+                            folder, overrides),
+                    })
+                    continue
+            print(f"Pulled {folder['name']}")
         except GitFoldersError as e:
+            die(folder_error(
+                folder["name"], folder["path"], "pull", str(e)),
+                code=e.code)
+
+    try:
+        for line in shelf.pull_shared_bindings(
+            pending, folders, parent,
+            rebase=args.rebase,
+            force=args.force,
+            autostash=args.autostash,
+            backend=backend,
+        ):
+            print(line)
+    except GitFoldersError as e:
+        failed = getattr(e, "folder", None)
+        if failed is None and pending:
+            failed = pending[0]["folder"]
+        if failed is None:
             die(str(e), code=e.code)
-        print(f"Pulled {folder['name']}")
+        die(folder_error(
+            failed["name"], failed["path"], "pull", str(e)),
+            code=e.code)
     return 0
 
 
@@ -264,13 +344,15 @@ def cmd_rm(args, backend: GitBackend) -> int:
     for folder in selected:
         child = parent / folder["path"]
         try:
-            shelf.remove_child(child)
+            shelf.remove_child(child, parent)
         except GitFoldersError as e:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
-            die(str(e), code=e.code)
+            die(folder_error(
+                folder["name"], folder["path"], "rm", str(e)),
+                code=e.code)
 
     os.replace(tmp_path, parent / manifest.MANIFEST)
     for folder in selected:
@@ -278,29 +360,29 @@ def cmd_rm(args, backend: GitBackend) -> int:
     return 0
 
 
-def _head(child: Path, backend: GitBackend) -> str:
-    if not (child / ".gf" / "git" / "HEAD").is_file():
+def _head(co: layout.Checkout, backend: GitBackend) -> str:
+    if not (co.gitdir / "HEAD").is_file():
         return "?"
     try:
-        return backend.git_capture("rev-parse", "--short", "HEAD", git_dir=child / ".gf" / "git", work_tree=child).strip()
+        return backend.git_capture("rev-parse", "--short", "HEAD", git_dir=co.gitdir, work_tree=co.work_tree).strip()
     except GitFoldersError:
         return "?"
 
 
-def _branch(child: Path, backend: GitBackend) -> str:
-    if not (child / ".gf" / "git" / "HEAD").is_file():
+def _branch(co: layout.Checkout, backend: GitBackend) -> str:
+    if not (co.gitdir / "HEAD").is_file():
         return ""
     try:
-        out = backend.git_capture("rev-parse", "--abbrev-ref", "HEAD", git_dir=child / ".gf" / "git", work_tree=child).strip()
+        out = backend.git_capture("rev-parse", "--abbrev-ref", "HEAD", git_dir=co.gitdir, work_tree=co.work_tree).strip()
     except GitFoldersError:
         return ""
     return "" if out == "HEAD" else out
 
 
-def _porcelain(child: Path, backend: GitBackend) -> str:
-    if not (child / ".gf" / "git" / "HEAD").is_file():
+def _porcelain(co: layout.Checkout, backend: GitBackend) -> str:
+    if not (co.gitdir / "HEAD").is_file():
         return ""
-    return backend.git_capture("status", "--porcelain", git_dir=child / ".gf" / "git", work_tree=child)
+    return backend.git_capture("status", "--porcelain", git_dir=co.gitdir, work_tree=co.work_tree)
 
 
 def cmd_status(args, backend: GitBackend) -> int:
@@ -323,18 +405,20 @@ def cmd_status(args, backend: GitBackend) -> int:
     rows: list[list[str]] = []
     porcelains: list[str] = []
     for folder in selected:
-        child = (parent / folder["path"]).resolve()
-        branch = _branch(child, backend)
+        co = layout.resolve_checkout((parent / folder["path"]).resolve())
+        branch = _branch(co, backend)
         row = [folder["name"], folder["url"], f"[{branch}]"]
         if args.remote:
             url, ref = manifest.effective_url_ref(folder, overrides)
             try:
-                state = shelf.drift(child, ref, remote=True, backend=backend)
+                state = shelf.drift(co, ref, remote=True, backend=backend)
             except GitFoldersError as e:
-                die(str(e), code=e.code)
+                die(folder_error(
+                    folder["name"], folder["path"], "status", str(e)),
+                    code=e.code)
             row.append(state)
         rows.append(row)
-        porcelains.append(_porcelain(child, backend))
+        porcelains.append(_porcelain(co, backend))
 
     for line, porcelain in zip(_align_columns(rows), porcelains):
         print(line)
@@ -358,10 +442,10 @@ def cmd_ls(args, backend: GitBackend) -> int:
 
     rows: list[list[str]] = []
     for folder in selected:
-        child = (parent / folder["path"]).resolve()
-        branch = _branch(child, backend)
-        head = _head(child, backend)
-        porcelain = _porcelain(child, backend)
+        co = layout.resolve_checkout((parent / folder["path"]).resolve())
+        branch = _branch(co, backend)
+        head = _head(co, backend)
+        porcelain = _porcelain(co, backend)
         dirty = porcelain.strip() != ""
         rows.append([
             folder["name"],
@@ -390,25 +474,29 @@ def cmd_init(args, backend: GitBackend) -> int:
 
     target = Path(args.path).resolve() if args.path else cwd
     if not target.is_relative_to(parent):
-        die("child path must be inside the parent repo")
-
-    # Validate the target before touching the manifest.
-    if target == parent or (target / ".git").exists():
-        die(f"{target} already has a .git directory")
-    if (target / ".gf").exists():
-        die(f"{target} already has a .gf directory")
+        die(folder_error(
+            args.name or target.name or str(target), str(target), "init",
+            "child path must be inside the parent repo"))
 
     rel = target.relative_to(parent).as_posix()
     name = args.name if args.name else (target.name or rel)
     url = args.url if args.url else rel
 
+    # Validate the target before touching the manifest.
+    if target == parent or (target / ".git").exists():
+        die(folder_error(
+            name, rel, "init", f"{target} already has a .git directory"))
+    if (target / layout.GF_DIR).exists():
+        die(folder_error(
+            name, rel, "init", f"{target} already has a .gf directory"))
+
     if not target.exists():
         target.mkdir(parents=True, exist_ok=True)
 
     try:
-        shelf.init_git_folder(target, backend=backend)
+        shelf.init_git_folder(layout.resolve_checkout(target), backend=backend)
     except GitFoldersError as e:
-        die(str(e), code=e.code)
+        die(folder_error(name, rel, "init", str(e)), code=e.code)
 
     # Now that the child is created, update the manifest.
     if manifest_data is None:
@@ -416,9 +504,13 @@ def cmd_init(args, backend: GitBackend) -> int:
         manifest.write_manifest(parent, manifest_data)
     for folder in manifest_data.get("git_folder", []):
         if folder.get("name") == name:
-            die(f"git-folder '{name}' already exists in manifest")
+            die(folder_error(
+                name, rel, "init",
+                f"git-folder '{name}' already exists in manifest"))
         if Path(folder["path"]).as_posix() == rel:
-            die(f"path {rel} is already used by git-folder '{folder['name']}'")
+            die(folder_error(
+                name, rel, "init",
+                f"path {rel} is already used by git-folder '{folder['name']}'"))
 
     folders = manifest_data.setdefault("git_folder", [])
     folders.append({
@@ -440,13 +532,14 @@ def _git_env_for_child() -> dict[str, str]:
     parent, child = manifest.resolve_context(cwd)
     target = (child or cwd).resolve()
 
-    git_dir = (target / ".gf" / "git").resolve()
+    co = layout.resolve_checkout(target)
+    git_dir = co.gitdir.resolve()
     if not (git_dir / "HEAD").is_file():
         die("not inside a git-folder child")
 
     env = os.environ.copy()
     env["GIT_DIR"] = str(git_dir)
-    env["GIT_WORK_TREE"] = str(target)
+    env["GIT_WORK_TREE"] = str(co.work_tree)
     return env
 
 
@@ -539,7 +632,9 @@ def cmd_worktree_add(args, backend: GitBackend) -> int:
         rel = os.path.relpath(source_child, new_child.parent)
         if new_child.is_symlink() or new_child.exists():
             if not args.force:
-                die(f"child path {new_child} already exists")
+                die(folder_error(
+                    folder["name"], folder["path"], "worktree add",
+                    f"child path {new_child} already exists"))
             new_child.unlink()
         os.symlink(rel, new_child, target_is_directory=True)
 

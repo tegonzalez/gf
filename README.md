@@ -8,6 +8,8 @@ doc-graph: "When there is an intention to amend this document, first Adhere to [
 
 A parent repo declares git-folders in `gf.toml`. Each git-folder is cloned into a child directory. The child has its own git history, and its metadata lives under `.gf/` instead of `.git/`. The child gitdir at `.gf/git` is a full, self-contained gitdir with `origin` pointing to the actual git-folder URL.
 
+A binding may also target one folder inside a repository: give the path to that folder as the URL, and `gf` finds where the repository ends and maps just that folder to the path through a shared sparse checkout under the parent's `.gf/`.
+
 ```text
 parent/
 ├── .git
@@ -22,6 +24,7 @@ parent/
 | Feature                              | What it gives you                                                                   |
 | ------------------------------------ | ----------------------------------------------------------------------------------- |
 | Nested git repos as ordinary folders | Clone external repos into the parent workspace without polluting the parent history |
+| Repository subfolder bindings        | Map one folder of a repository by giving its path as the URL                        |
 | Self-contained child gitdir          | Each child has its own gitdir under `.gf/git/` instead of `.git/`                   |
 | Tracked manifest + local overrides   | Canonical bindings in `gf.toml`; per-user overrides in `gf.local.toml`              |
 | Pinned or floating refs              | Use a commit, tag, branch, or `latest`; `gf` resolves the ref                       |
@@ -83,6 +86,12 @@ From a source checkout, target the parent repository with `-C`:
 uv run gf -C /path/to/parent init vendor/libfoo
 ```
 
+Give the path to a folder inside a repository to bind just that folder instead of the whole repository:
+
+```bash
+gf clone https://github.com/foo/libfoo/docs/api vendor/libfoo-api
+```
+
 ## Commands
 
 All commands accept a global `-C <path>` option, like `git -C`, to run from another directory. `gf --version` (or `gf -v`) prints the package version and exits.
@@ -119,7 +128,7 @@ path = "vendor/libfoo"
 
 Local overrides live in `gf.local.toml` and are never tracked.
 
-`gf` does not edit the parent `.gitignore`. When a child is created it prints a recommendation such as `add "vendor/libfoo/" to .gitignore` so the user can keep git-folder files out of the parent history.
+`gf` does not edit the parent `.gitignore`. When a child is created it prints a recommendation such as `add "vendor/libfoo/" to .gitignore` so the user can keep git-folder files out of the parent history. For a folder binding the path is a symlink, so `gf` recommends the path without a trailing slash (`add "vendor/libfoo-api" to .gitignore`); when the first folder binding creates the parent's `.gf/` store, `gf` also recommends `add ".gf/" to .gitignore`.
 
 ## Documentation
 

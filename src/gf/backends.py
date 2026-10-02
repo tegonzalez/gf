@@ -33,6 +33,7 @@ class GitBackend(Protocol):
         work_tree: Path | None = None,
         check: bool = True,
         stream: bool = False,
+        env: dict[str, str] | None = None,
     ) -> GitResult:
         ...
 
@@ -42,6 +43,7 @@ class GitBackend(Protocol):
         cwd: Path | None = None,
         git_dir: Path | None = None,
         work_tree: Path | None = None,
+        env: dict[str, str] | None = None,
     ) -> str:
         ...
 
@@ -57,17 +59,20 @@ class GitCliBackend:
         work_tree: Path | None = None,
         check: bool = True,
         stream: bool = False,
+        env: dict[str, str] | None = None,
     ) -> GitResult:
-        env = os.environ.copy()
+        merged = os.environ.copy()
+        if env:
+            merged.update(env)
         if git_dir is not None:
-            env["GIT_DIR"] = str(git_dir)
+            merged["GIT_DIR"] = str(git_dir)
         if work_tree is not None:
-            env["GIT_WORK_TREE"] = str(work_tree)
+            merged["GIT_WORK_TREE"] = str(work_tree)
         if cwd is not None:
-            env["PWD"] = str(cwd)
+            merged["PWD"] = str(cwd)
         cmd = ["git"] + [str(a) for a in args]
         try:
-            result = run_command(cmd, env, mode="stream" if stream else "capture", cwd=cwd)
+            result = run_command(cmd, merged, mode="stream" if stream else "capture", cwd=cwd)
         except FileNotFoundError as e:
             raise GitError(f"git {' '.join(cmd[1:])} failed: {e}")
         if check and result.returncode != 0:
@@ -81,5 +86,8 @@ class GitCliBackend:
         cwd: Path | None = None,
         git_dir: Path | None = None,
         work_tree: Path | None = None,
+        env: dict[str, str] | None = None,
     ) -> str:
-        return self.git(*args, cwd=cwd, git_dir=git_dir, work_tree=work_tree).stdout
+        return self.git(
+            *args, cwd=cwd, git_dir=git_dir, work_tree=work_tree, env=env,
+        ).stdout

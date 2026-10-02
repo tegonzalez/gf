@@ -7,19 +7,26 @@ from typing import Any, Optional
 import tomllib
 import tomli_w
 
+from . import layout
+
 MANIFEST = "gf.toml"
 LOCAL = "gf.local.toml"
 
 
 def is_git_folder_child(path: Path) -> bool:
     """Return True if `path` (or a directory it symlinks to) contains a git-folder child."""
-    return (path / ".gf" / "git" / "HEAD").is_file()
+    return (layout.resolve_checkout(path).gitdir / "HEAD").is_file()
 
 
 def find_parent_root(start: Path) -> Optional[Path]:
-    """Walk up from start looking for a parent repo that contains .git."""
+    """Walk up from start looking for a parent repo that contains .git.
+
+    A `.git` inside `<root>/.gf/wt` belongs to a gf-managed checkout — the
+    gitfile's canonical position before removal — and never marks a parent
+    repo, so discovery walks past it (plan D4 / arch GF-D8).
+    """
     for path in [start, *start.parents]:
-        if (path / ".git").exists():
+        if (path / ".git").exists() and not layout.in_gf_wt(path):
             return path.resolve()
     return None
 

@@ -12,20 +12,24 @@ uv run pytest -x
 
 Run this after every meaningful change. The project uses `pyproject.toml` as the pytest config and `pyfakefs` for filesystem isolation.
 
-The bounded change under verification is the POSIX platform seam and the host-independent inputs needed for the same suite to retain one expected result on Linux and macOS.
+The bounded change under verification is repository-subfolder bindings alongside whole-repo bindings. The retained POSIX platform seam and host-independent inputs remain in force so the same suite keeps one expected result on Linux and macOS.
 
 ### Running the control
 
 Run the control on each supported host, with a virtual environment created on that host. The dual-host requirement, the per-host virtual environment, and the pins that keep expected results host-independent are the test-seam contract in [gf-arch.md](gf-arch.md); this plan runs against that contract rather than restating it.
 
-| Check              | Host  | Requirement                                          |
-| ---                | ---   | ---                                                  |
-| `uv run pytest -x` | Linux | Exit 0.                                              |
-| `uv run pytest -x` | macOS | Exit 0 using a virtual environment created on macOS. |
-| `gf` CLI scenario  | Linux | A local bare repository as the upstream; no network. |
-| `gf` CLI scenario  | macOS | A local bare repository as the upstream; no network. |
+| Check                       | Host  | Requirement                                                              |
+| --------------------------- | ----- | ------------------------------------------------------------------------ |
+| `uv run pytest -x`          | Linux | Exit 0.                                                                  |
+| `uv run pytest -x`          | macOS | Exit 0 using a virtual environment created on macOS.                     |
+| `gf` CLI scenario           | Linux | A local bare repository as the upstream; no network.                     |
+| `gf` CLI scenario           | macOS | A local bare repository as the upstream; no network.                     |
+| `gf` subfolder CLI scenario | Linux | A local bare repository with subdirectories as the upstream; no network. |
+| `gf` subfolder CLI scenario | macOS | A local bare repository with subdirectories as the upstream; no network. |
 
 The CLI scenario is: `gf -C <parent> clone <local-upstream> vendor/lib`, then `gf -C <parent> status`, against a local bare repository. It passes when both commands exit 0 and `status` reports the new child.
+
+The subfolder CLI scenario is: `gf -C <parent> clone <local-upstream>/docs/api vendor/api`, then `gf -C <parent> status`, against a local bare repository containing `docs/api`. It passes when both commands exit 0, `status` reports the new binding, and `vendor/api` resolves through its consumer link to the mapped subdirectory.
 
 ### Reading a failure
 
@@ -36,7 +40,7 @@ A host whose git defaults to `main`, with the default-branch pin absent or overr
 ## Test layout
 
 | File                             | Responsibility                                                                                                                                                            |
-| ---                              | ---                                                                                                                                                                       |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `tests/conftest.py`              | `tmp_path` override to `tests/fixtures/tmp/<uuid>`, hermetic git identity and the host-input pins, `gf`/`git` shell helpers, `gf_inproc` in-proc runner, `Result` capture |
 | `tests/test_cli_permutations.py` | In-process CLI permutation tests using `MockGitBackend` and `pyfakefs`                                                                                                    |
 | `tests/test_clone_and_pull.py`   | Real-git integration test for clone, pull, and status                                                                                                                     |
@@ -46,15 +50,17 @@ A host whose git defaults to `main`, with the default-branch pin absent or overr
 | `tests/test_runner.py`           | Tests for the shared `capture`/`stream`/`exec` runner                                                                                                                     |
 | `tests/test_platform.py`         | Tests for `logical_cwd`, `same_path`, and `exec_or_run`                                                                                                                   |
 | `tests/test_host_inputs.py`      | Real-Git proof that the configured initial branch is `master`                                                                                                             |
+| `tests/test_subfolder.py`        | Real-git subfolder-binding scenarios: URL resolution, shared stores and checkouts, consumer links, scoped status, `rm`, worktree commands, `init` conversion      |
 
 ## Mock backend contract
 
 `MockGitBackend` in `tests/mock_git.py` supports the commands `gf` uses in CLI permutation tests:
 
 - `init` / `init --bare`
+- `ls-remote <url>` answering for repository URLs and failing for other prefixes
 - `remote add/set-url`
 - `remote set-head`
-- `fetch`
+- `fetch` / `fetch --filter=<filter>`
 - `config --get remote.origin.fetch`
 - `config remote.origin.fetch <refspec>`
 - `rev-parse HEAD/--short/--abbrev-ref`
@@ -62,12 +68,15 @@ A host whose git defaults to `main`, with the default-branch pin absent or overr
 - `symbolic-ref`
 - `checkout` / `checkout -B <branch> <start>` / `checkout -f ...`
 - `merge --ff-only`
-- `status --porcelain`
+- `status --porcelain`, including a pathspec scope after `--`
 - `stash push -u -m <msg>` / `stash pop`
 - `worktree list --porcelain`
+- `worktree add [--no-checkout] [--detach] <path> <ref>`
+- `worktree lock [--reason <r>] <path>` / `worktree unlock <path>`
 - `worktree remove [--force] <path>`
+- `sparse-checkout set --cone <dirs...>`
 
-New git commands used by `gf` must be added to the mock before they can be tested by CLI permutation tests.
+The mock also models the shared-store semantics the feature depends on: refs are shared across worktrees of one common dir, a second checkout of one branch in one store fails as git does, and a fetch call log is kept so tests can assert one fetch per repo store. New git commands used by `gf` must be added to the mock before they can be tested by CLI permutation tests.
 
 ## Fixture isolation
 
@@ -85,7 +94,8 @@ New git commands used by `gf` must be added to the mock before they can be teste
 ## When to use real-git vs mock-git
 
 | Use real-git when...                                | Use mock-git when...                               |
-| ---                                                 | ---                                                |
+| --------------------------------------------------- | -------------------------------------------------- |
 | Testing actual `subprocess.run` git interactions    | Testing CLI argument parsing and branch code paths |
 | Testing worktree sharing or cross-worktree symlinks | Testing error handling and edge permutations       |
 | Testing refs/tags/branches in real repos            | Testing file-system side effects in `pyfakefs`     |
+| Testing repo stores, sparse checkouts, and links    | Testing grouped pull ordering and command routing  |

@@ -18,9 +18,9 @@ For bugs, write a failing test or a manual reproduction first. The test suite is
 
 Run `uv run pytest -x` after meaningful changes. A red test suite is a blocker.
 
-## One concern per commit
+## Commit by feature
 
-Each commit should address exactly one logical change. Do not bundle unrelated behavior changes or doc updates in the same commit.
+Each commit delivers one feature or one fix, complete: the spec and doc updates, the code, and the tests that prove it land together, across as many files as the feature touches. Do not split one feature into per-file or per-document commits, and do not bundle two unrelated features into one commit.
 
 ## Update the spec and tests together
 
@@ -60,7 +60,6 @@ Expand bare host/path URLs (e.g. `github.com/cursor/plugins`) to `https://` befo
 When you are asked to add, fix, or refactor behavior:
 
 1. Locate the project root (`projects/gf` under the workspace).
-1. Read the workspace `.devin/roles/constraints.md` and `.devin/roles/guidelines.md`.
 1. Read `docs/gf-spec.md` and `docs/gf-goals.md`.
 1. For command behavior, read `docs/gf-spec.md`. For architecture, read `docs/gf-arch.md`. For testing, read `docs/gf-testing.md`.
 1. Write or update the relevant failing test.
@@ -70,8 +69,8 @@ When you are asked to add, fix, or refactor behavior:
 1. For clone/pull/output changes, run a manual check:
    ```bash
    cd /tmp
-   rm -rf smcheck && mkdir -p smcheck && cd smcheck && git init .
-   uv run --directory /path/to/projects/gf gf clone <url> <path>
-   uv run --directory /path/to/projects/gf gf ls
+   rm -rf smcheck && mkdir -p smcheck && git init smcheck
+   uv run --project /path/to/projects/gf gf -C /tmp/smcheck clone <url> <path>
+   uv run --project /path/to/projects/gf gf -C /tmp/smcheck ls
    ```
-1. Stage files by name and commit with a one-concern message.
+1. Stage files by name and commit the feature as one commit with a message that names the feature.

@@ -3,11 +3,18 @@
 This backend does not spawn git. It records every git call and maintains a
 simplified in-memory git model (commits, refs, worktree) so `gf` can still
 read and write files in a `pyfakefs` filesystem.
+
+The model also covers the shared-store shape behind subfolder bindings: a
+bare common gitdir holds refs and objects, and linked worktrees addressed
+through their admin dir ``<store>/worktrees/<name>`` get per-worktree HEAD,
+index, worktree, sparse-cone and stash state while sharing the store's
+refs and commits.
 """
 # SPDX-FileCopyrightText: 2026 Tomas Gonzalez
 # SPDX-License-Identifier: MIT
 
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,6 +36,16 @@ class Worktree:
     path: str
     head: str = ""
     branch: str | None = None  # None = detached HEAD
+    # Linked-worktree state (shared repo store). Seeded worktrees leave
+    # these at their defaults and only appear in `worktree list/remove`.
+    admin_dir: str | None = None  # <store>/worktrees/<name>
+    locked: str | None = None     # None = unlocked, "" = locked w/o reason
+    cone: frozenset[str] | None = None
+    files: dict[str, str] = field(default_factory=dict)      # full commit tree
+    indexed: dict[str, str] = field(default_factory=dict)    # cone-filtered
+    worktree: dict[str, str] = field(default_factory=dict)   # disk model
+    stashes: list[dict] = field(default_factory=list)
+    checked_out: bool = False
 
 
 @dataclass
@@ -40,8 +57,11 @@ class Repo:
     symrefs: dict[str, str] = field(default_factory=dict)
     remotes: dict[str, str] = field(default_factory=dict)
     remote_fetch: dict[str, str] = field(default_factory=dict)
+    config: dict[str, list[str]] = field(default_factory=dict)
+    files: dict[str, str] = field(default_factory=dict)
     worktree: dict[str, str] = field(default_factory=dict)
     indexed: dict[str, str] = field(default_factory=dict)
+    cone: frozenset[str] | None = None
     head_ref: str | None = None
     head_sha: str | None = None
     worktrees: list[Worktree] = field(default_factory=list)
@@ -58,6 +78,14 @@ class Repo:
         # follow symrefs
         if ref in self.symrefs:
             return self.resolve(self.symrefs[ref])
+
+        # HEAD resolves through this checkout's own state before a literal
+        # refs["HEAD"] entry left behind by an earlier fetch.
+        if ref in ("HEAD", ""):
+            if self.head_ref and self.head_ref in self.refs:
+                return self.refs[self.head_ref]
+            if self.head_sha:
+                return self.head_sha
 
         candidates = [
             ref,
@@ -82,6 +110,7 @@ class Repo:
 class MockGitBackend(GitBackend):
     def __init__(self):
         self.calls: list[tuple] = []
+        self.envs: list[dict | None] = []
         self.repos: dict[str, Repo] = {}
 
     def _path(self, cwd: Any, git_dir: Any, work_tree: Any) -> str:
@@ -91,6 +120,29 @@ class MockGitBackend(GitBackend):
         if path not in self.repos:
             self.repos[path] = Repo()
         return self.repos[path]
+
+    def _repo_for(self, path: str) -> tuple[Repo, Worktree | None]:
+        """Resolve a command address to (repo, linked worktree | None).
+
+        A git_dir of the form ``<store>/worktrees/<name>`` selects the
+        linked worktree registered under that admin dir; the returned repo
+        is the shared store. Any other path selects (or creates) the repo
+        keyed by that path.
+        """
+        if path in self.repos:
+            return self.repos[path], None
+        for repo in self.repos.values():
+            for wt in repo.worktrees:
+                if wt.path == path:
+                    return repo, wt
+        p = Path(path)
+        if p.parent.name == "worktrees" and str(p.parent.parent) in self.repos:
+            repo = self.repos[str(p.parent.parent)]
+            for wt in repo.worktrees:
+                if wt.admin_dir == path:
+                    return repo, wt
+            raise GitError(f"fatal: '{path}' is not a git repository")
+        return self._repo(path), None
 
     def _target_repo(self, url: str) -> Repo:
         """Find the repo at a URL (which is a local path in tests)."""
@@ -104,6 +156,12 @@ class MockGitBackend(GitBackend):
             if sha in repo.commits:
                 return repo.commits[sha]
         raise GitError(f"unknown sha {sha}")
+
+    def _find_worktree(self, repo: Repo, target: str) -> Worktree | None:
+        for wt in repo.worktrees:
+            if wt.path == target:
+                return wt
+        return None
 
     def seed(self, path: str | Path, bare: bool = False, mirror: bool = False, head: str = "master") -> Repo:
         path = str(Path(path).resolve())
@@ -133,10 +191,12 @@ class MockGitBackend(GitBackend):
         work_tree: Path | None = None,
         check: bool = True,
         stream: bool = False,
+        env: dict | None = None,
     ) -> GitResult:
         args = tuple(str(a) for a in args)
         path = self._path(cwd, git_dir, work_tree)
         self.calls.append((args, path))
+        self.envs.append(env)
 
         try:
             return self._dispatch(args, path, cwd, git_dir, work_tree)
@@ -151,11 +211,207 @@ class MockGitBackend(GitBackend):
         cwd: Path | None = None,
         git_dir: Path | None = None,
         work_tree: Path | None = None,
+        env: dict | None = None,
     ) -> str:
-        return self.git(*args, cwd=cwd, git_dir=git_dir, work_tree=work_tree, check=True).stdout
+        return self.git(
+            *args, cwd=cwd, git_dir=git_dir, work_tree=work_tree,
+            check=True, env=env,
+        ).stdout
+
+    # -- shared-store helpers -------------------------------------------------
+
+    def _head_branch(self, repo: Repo, wt: Worktree | None) -> str | None:
+        """Short name of the branch HEAD is attached to, if any."""
+        if wt is not None:
+            return wt.branch
+        if repo.head_ref and repo.head_ref.startswith("refs/heads/"):
+            return repo.head_ref.split("/", 2)[2]
+        return None
+
+    def _head_sha(self, repo: Repo, wt: Worktree | None) -> str | None:
+        """Current HEAD sha; attached worktrees resolve through the common dir."""
+        if wt is not None:
+            if wt.branch:
+                return repo.refs.get(f"refs/heads/{wt.branch}", wt.head)
+            return wt.head
+        return repo.head_sha
+
+    def _branch_in_use(self, repo: Repo, branch: str, exclude: Worktree | None = None) -> str | None:
+        """Path of the checkout already using `branch`, or None.
+
+        Git allows each branch to be checked out in at most one worktree of
+        a common dir. The (non-bare) repo's own checkout counts too.
+        """
+        for w in repo.worktrees:
+            if w is not exclude and w.branch == branch:
+                return w.path
+        if not repo.bare and repo.head_ref == f"refs/heads/{branch}":
+            return next((k for k, v in self.repos.items() if v is repo), "")
+        return None
+
+    def _cone_includes(self, name: str, cone: frozenset[str] | None) -> bool:
+        """Cone-mode membership: root files plus the listed directories."""
+        if cone is None or "/" not in name:
+            return True
+        return any(name == d or name.startswith(d + "/") for d in cone)
+
+    def _cone_filter(self, files: dict[str, str], cone: frozenset[str] | None) -> dict[str, str]:
+        return {n: c for n, c in files.items() if self._cone_includes(n, cone)}
+
+    def _work_root(self, wt: Worktree | None, work_tree: Any) -> Path | None:
+        if work_tree:
+            return Path(work_tree)
+        if wt is not None:
+            return Path(wt.path)
+        return None
+
+    def _apply_commit(
+        self,
+        repo: Repo,
+        wt: Worktree | None,
+        commit: Commit,
+        sha: str,
+        branch: str | None,
+        git_dir: Any,
+        work_root: Path | None,
+    ) -> None:
+        """Attach `branch` (detach when None) at `sha` and write the tree."""
+        cone = wt.cone if wt is not None else repo.cone
+        written = self._cone_filter(commit.files, cone)
+        if wt is not None:
+            wt.head = sha
+            wt.branch = branch
+            wt.files = dict(commit.files)
+            wt.indexed = dict(written)
+            wt.worktree = dict(written)
+            wt.checked_out = True
+        else:
+            repo.head_sha = sha
+            repo.head_ref = f"refs/heads/{branch}" if branch else None
+            repo.files = dict(commit.files)
+            repo.indexed = dict(written)
+            repo.worktree = dict(written)
+        if branch:
+            repo.refs[f"refs/heads/{branch}"] = sha
+        if git_dir:
+            self._write_head(
+                Path(git_dir),
+                ref=f"refs/heads/{branch}" if branch else None,
+                sha=sha,
+            )
+        if work_root is not None:
+            self._write_worktree(Path(work_root), written)
+
+    def _remote_url(self, repo: Repo, name: str) -> str | None:
+        vals = repo.config.get(f"remote.{name}.url")
+        if vals:
+            return vals[0]
+        return repo.remotes.get(name)
+
+    def _set_config(self, repo: Repo, key: str, value: str, append: bool = False) -> None:
+        if append:
+            repo.config.setdefault(key, []).append(value)
+        else:
+            repo.config[key] = [value]
+        # Keep the remote model in step with `config remote.<name>.*` writes.
+        parts = key.split(".", 2)
+        if parts[0] == "remote" and len(parts) == 3:
+            name, field_name = parts[1], parts[2]
+            if field_name == "url":
+                repo.remotes[name] = value
+            elif field_name == "fetch":
+                repo.remote_fetch[name] = "\n".join(repo.config[key])
+
+    @staticmethod
+    def _positionals(args: tuple[str, ...], value_flags: tuple[str, ...] = ()) -> list[str]:
+        """Non-option args, skipping flags that consume a value."""
+        pos: list[str] = []
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a in value_flags:
+                i += 2
+                continue
+            if a.startswith("-"):
+                i += 1
+                continue
+            pos.append(a)
+            i += 1
+        return pos
+
+    def _pathspec_match(self, name: str, specs: list[str]) -> bool:
+        for spec in specs:
+            spec = spec.strip("/")
+            if spec in ("", ".") or name == spec or name.startswith(spec + "/"):
+                return True
+        return False
+
+    def _status_lines(self, repo: Repo, wt: Worktree | None, work_root: Path | None) -> list[str]:
+        indexed = wt.indexed if wt is not None else repo.indexed
+        workmap = wt.worktree if wt is not None else repo.worktree
+        cone = wt.cone if wt is not None else repo.cone
+        lines: list[str] = []
+        if work_root is not None:
+            for name, expected in indexed.items():
+                work_path = work_root / name
+                actual = work_path.read_text() if work_path.exists() else None
+                if actual != expected:
+                    lines.append(f" M {name}")
+        for name in workmap:
+            if name not in indexed:
+                lines.append(f"?? {name}")
+        # Detect untracked files actually present on disk in the worktree.
+        if work_root is not None and work_root.is_dir():
+            known = set(indexed.keys()) | set(workmap.keys())
+            if wt is not None:
+                known |= set(wt.files.keys())
+            for entry in work_root.rglob("*"):
+                if not entry.is_file():
+                    continue
+                rel = entry.relative_to(work_root).as_posix()
+                if rel.startswith(".gf/"):
+                    continue
+                if wt is not None and (rel == ".git" or rel.startswith(".git/")):
+                    continue
+                if not self._cone_includes(rel, cone):
+                    continue
+                if rel not in known:
+                    lines.append(f"?? {rel}")
+        # Deduplicate while preserving order.
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for line in lines:
+            if line not in seen:
+                seen.add(line)
+                deduped.append(line)
+        return deduped
+
+    def _worktree_dirty(self, wt: Worktree) -> bool:
+        """Whether a linked worktree has modified or untracked files."""
+        if wt.admin_dir is None:
+            # Seeded worktrees carry no checkout state; keep them removable.
+            return False
+        root = Path(wt.path)
+        for name, expected in wt.indexed.items():
+            p = root / name
+            if not p.exists() or p.read_text() != expected:
+                return True
+        if root.is_dir():
+            known = set(wt.indexed.keys()) | set(wt.worktree.keys()) | set(wt.files.keys())
+            for entry in root.rglob("*"):
+                if not entry.is_file():
+                    continue
+                rel = entry.relative_to(root).as_posix()
+                if rel.startswith(".gf/") or rel == ".git" or rel.startswith(".git/"):
+                    continue
+                if not self._cone_includes(rel, wt.cone):
+                    continue
+                if rel not in known:
+                    return True
+        return False
 
     def _dispatch(self, args: tuple[str, ...], path: str, cwd: Any, git_dir: Any, work_tree: Any) -> GitResult:
-        repo = self._repo(path)
+        repo, wt = self._repo_for(path)
         cmd = args[0]
 
         if cmd == "init":
@@ -166,23 +422,39 @@ class MockGitBackend(GitBackend):
                 self._write_head(Path(git_dir), ref=repo.head_ref)
             return GitResult(0, "", "")
 
+        if cmd == "ls-remote":
+            url = next((a for a in args[1:] if not a.startswith("-")), None)
+            if url is None:
+                raise GitError("usage: git ls-remote <url>")
+            source = self._target_repo(url)
+            lines = []
+            head_sha = source.refs.get(source.head_ref, source.head_sha or "")
+            if head_sha:
+                lines.append(f"{head_sha}\tHEAD")
+            for ref in sorted(source.refs):
+                lines.append(f"{source.refs[ref]}\t{ref}")
+            return GitResult(0, "\n".join(lines) + "\n" if lines else "", "")
+
         if cmd == "config":
-            if args[1] == "--get":
+            if len(args) >= 3 and args[1] == "--get":
                 key = f"{args[2]}.{args[3]}" if len(args) == 4 else args[2]
-                if key == "remote.origin.fetch":
-                    val = repo.remote_fetch.get("origin")
-                    if val:
-                        return GitResult(0, val + "\n", "")
+                vals = repo.config.get(key)
+                if vals:
+                    return GitResult(0, "\n".join(vals) + "\n", "")
                 return GitResult(1, "", "")
+            if len(args) >= 4 and args[1] == "--add":
+                # Fetch refspecs are append-only: --add keeps existing lines.
+                self._set_config(repo, args[2], args[3], append=True)
+                return GitResult(0, "", "")
             # config key value
             if len(args) == 3:
-                repo.remote_fetch["origin"] = args[2]
+                self._set_config(repo, args[1], args[2])
                 return GitResult(0, "", "")
 
         if cmd == "fetch":
-            # fetch origin  (or fetch --prune origin)
+            # fetch origin  (or fetch --prune origin / fetch --filter=... origin)
             remote_name = args[-1]
-            remote_url = repo.remotes.get(remote_name)
+            remote_url = self._remote_url(repo, remote_name)
             if remote_url:
                 source = self._target_repo(remote_url)
                 if repo.mirror:
@@ -209,8 +481,9 @@ class MockGitBackend(GitBackend):
         if cmd == "remote":
             if args[1] == "get-url":
                 name = args[2]
-                if name in repo.remotes:
-                    return GitResult(0, repo.remotes[name] + "\n", "")
+                url = self._remote_url(repo, name)
+                if url:
+                    return GitResult(0, url + "\n", "")
                 return GitResult(1, "", "")
             if args[1] in ("add", "set-url"):
                 is_push = "--push" in args
@@ -221,13 +494,13 @@ class MockGitBackend(GitBackend):
                 else:
                     name = args[2]
                     url = args[3]
-                    repo.remotes[name] = url
-                    repo.remote_fetch[name] = "+refs/heads/*:refs/remotes/origin/*"
+                    self._set_config(repo, f"remote.{name}.url", url)
+                    self._set_config(repo, f"remote.{name}.fetch", "+refs/heads/*:refs/remotes/origin/*")
                 return GitResult(0, "", "")
             if args[1] == "set-head":
                 # remote set-head <name> -a
                 name = args[2]
-                remote_url = repo.remotes.get(name)
+                remote_url = self._remote_url(repo, name)
                 if not remote_url:
                     return GitResult(1, "", f"remote {name} not found")
                 source = self._target_repo(remote_url)
@@ -245,11 +518,12 @@ class MockGitBackend(GitBackend):
         if cmd == "rev-parse":
             if "HEAD" in args:
                 if "--abbrev-ref" in args:
-                    if repo.head_ref and repo.head_ref.startswith("refs/heads/"):
-                        short = repo.head_ref.split("/")[2]
-                        return GitResult(0, short + "\n", "")
-                    return GitResult(0, "HEAD\n", "")
-                sha = repo.resolve("HEAD")
+                    branch = self._head_branch(repo, wt)
+                    return GitResult(0, (branch or "HEAD") + "\n", "")
+                if wt is not None:
+                    sha = self._head_sha(repo, wt) or ""
+                else:
+                    sha = repo.resolve("HEAD")
                 out = sha[:12] if "--short" in args else sha
                 return GitResult(0, out + "\n", "")
             ref = args[-1]
@@ -260,6 +534,10 @@ class MockGitBackend(GitBackend):
 
         if cmd == "symbolic-ref":
             ref = args[1]
+            if wt is not None and ref == "HEAD":
+                if wt.branch:
+                    return GitResult(0, f"refs/heads/{wt.branch}\n", "")
+                return GitResult(1, "", "ref HEAD is not a symbolic ref")
             if ref in repo.symrefs:
                 return GitResult(0, repo.symrefs[ref] + "\n", "")
             if ref == "HEAD" and repo.head_ref:
@@ -291,42 +569,34 @@ class MockGitBackend(GitBackend):
                 branch = None
                 # Skip flags like -f to find the commit-ish.
                 sha = next(a for a in args[1:] if not a.startswith("-"))
+            if branch and wt is not None:
+                # One checkout per branch per common dir.
+                conflict = self._branch_in_use(repo, branch, exclude=wt)
+                if conflict:
+                    raise GitError(
+                        f"fatal: '{branch}' is already used by worktree at '{conflict}'"
+                    )
             commit = self._find_commit(sha)
             repo.commits[sha] = commit
-            repo.head_sha = sha
-            if branch:
-                repo.head_ref = f"refs/heads/{branch}"
-                repo.refs[repo.head_ref] = sha
-            else:
-                repo.head_ref = None
-            repo.indexed = dict(commit.files)
-            repo.worktree = dict(commit.files)
-            if git_dir:
-                self._write_head(Path(git_dir), ref=repo.head_ref, sha=sha)
-            if work_tree:
-                self._write_worktree(Path(work_tree), commit.files)
+            self._apply_commit(
+                repo, wt, commit, sha, branch, git_dir, self._work_root(wt, work_tree),
+            )
             return GitResult(0, f"HEAD is now at {sha}\n", "")
 
         if cmd == "merge" and "--ff-only" in args:
             ref = args[args.index("--ff-only") + 1]
             target_sha = repo.resolve(ref)
-            if target_sha == repo.head_sha:
+            cur_sha = self._head_sha(repo, wt) if wt is not None else repo.head_sha
+            if target_sha == cur_sha:
                 return GitResult(0, "Already up to date.\n", "")
             commit = self._find_commit(target_sha)
             repo.commits[target_sha] = commit
-            if repo.head_sha and repo.head_sha not in commit.parents:
+            if cur_sha and cur_sha not in commit.parents:
                 return GitResult(1, "", "merge: not fast-forward")
-            repo.head_sha = target_sha
-            if repo.head_ref:
-                repo.refs[repo.head_ref] = target_sha
-            else:
-                repo.head_ref = None
-            repo.indexed = dict(commit.files)
-            repo.worktree = dict(commit.files)
-            if git_dir:
-                self._write_head(Path(git_dir), ref=repo.head_ref, sha=target_sha)
-            if work_tree:
-                self._write_worktree(Path(work_tree), commit.files)
+            self._apply_commit(
+                repo, wt, commit, target_sha, self._head_branch(repo, wt),
+                git_dir, self._work_root(wt, work_tree),
+            )
             return GitResult(0, f"Updating {target_sha}\n", "")
 
         if cmd == "rebase":
@@ -334,121 +604,267 @@ class MockGitBackend(GitBackend):
             target_sha = repo.resolve(target_ref)
             commit = self._find_commit(target_sha)
             repo.commits[target_sha] = commit
-            repo.head_sha = target_sha
-            if repo.head_ref:
-                repo.refs[repo.head_ref] = target_sha
-            repo.indexed = dict(commit.files)
-            repo.worktree = dict(commit.files)
-            if git_dir:
-                self._write_head(Path(git_dir), ref=repo.head_ref, sha=target_sha)
-            if work_tree:
-                self._write_worktree(Path(work_tree), commit.files)
-            return GitResult(0, f"Successfully rebased and updated refs/heads/{repo.head_ref.split('/')[-1] if repo.head_ref else 'HEAD'}.\n", "")
+            branch = self._head_branch(repo, wt)
+            self._apply_commit(
+                repo, wt, commit, target_sha, branch, git_dir, self._work_root(wt, work_tree),
+            )
+            return GitResult(0, f"Successfully rebased and updated refs/heads/{branch or 'HEAD'}.\n", "")
 
         if cmd == "status" and "--porcelain" in args:
-            lines = []
-            for name in repo.indexed:
-                work_path = Path(work_tree) / name
-                actual = work_path.read_text() if work_path.exists() else None
-                expected = repo.indexed[name]
-                if actual != expected:
-                    lines.append(f" M {name}")
-            for name in repo.worktree:
-                if name not in repo.indexed:
-                    lines.append(f"?? {name}")
-            # Detect untracked files actually present on disk in the worktree.
-            if work_tree:
-                wt_path = Path(work_tree)
-                if wt_path.is_dir():
-                    known = set(repo.indexed.keys()) | set(repo.worktree.keys())
-                    for entry in wt_path.rglob("*"):
-                        if not entry.is_file():
-                            continue
-                        rel = entry.relative_to(wt_path).as_posix()
-                        if rel.startswith(".gf/"):
-                            continue
-                        if rel not in known:
-                            lines.append(f"?? {rel}")
-            # Deduplicate while preserving order.
-            seen = set()
-            deduped = []
-            for line in lines:
-                if line not in seen:
-                    seen.add(line)
-                    deduped.append(line)
-            return GitResult(0, ("\n".join(deduped) + "\n") if deduped else "", "")
+            lines = self._status_lines(repo, wt, self._work_root(wt, work_tree))
+            if "--" in args:
+                specs = list(args[args.index("--") + 1:])
+                lines = [l for l in lines if self._pathspec_match(l[3:], specs)]
+            return GitResult(0, ("\n".join(lines) + "\n") if lines else "", "")
+
+        if cmd == "sparse-checkout":
+            # sparse-checkout set --cone <dirs...>
+            if len(args) > 1 and args[1] == "set":
+                cone = frozenset(
+                    a.strip("/") for a in args[2:] if not a.startswith("-") and a.strip("/")
+                )
+                if wt is not None:
+                    self._set_cone(repo, wt, cone, self._work_root(wt, work_tree))
+                else:
+                    repo.cone = cone
+                    new_map = self._cone_filter(repo.files or repo.indexed, cone)
+                    if repo.indexed and work_tree:
+                        self._resparsify_map(repo.indexed, new_map, Path(work_tree))
+                    repo.indexed = dict(new_map)
+                    repo.worktree = dict(new_map)
+                return GitResult(0, "", "")
+            raise GitError(f"unmocked git command: {' '.join(args)}")
 
         if cmd == "worktree":
             sub = args[1] if len(args) > 1 else ""
             if sub == "list" and "--porcelain" in args:
                 out = []
-                for wt in repo.worktrees:
-                    out.append(f"worktree {wt.path}")
-                    if wt.head:
-                        out.append(f"HEAD {wt.head}")
-                    if wt.branch:
-                        out.append(f"branch refs/heads/{wt.branch}")
+                if repo.bare:
+                    out.append(f"worktree {path}")
+                    out.append("bare")
+                    out.append("")
+                for w in repo.worktrees:
+                    out.append(f"worktree {w.path}")
+                    if w.head:
+                        out.append(f"HEAD {w.head}")
+                    if w.branch:
+                        out.append(f"branch refs/heads/{w.branch}")
+                    elif w.head:
+                        out.append("detached")
+                    if w.locked is not None:
+                        out.append(f"locked {w.locked}".rstrip())
                     out.append("")
                 return GitResult(0, "\n".join(out) + "\n" if out else "", "")
+
+            if sub == "add":
+                # worktree add [--no-checkout] [--detach] [-b|-B <br>] <path> [<ref>]
+                pos = self._positionals(args[2:], value_flags=("-b", "-B"))
+                if not pos:
+                    raise GitError("fatal: worktree add requires a path")
+                target = str(Path(pos[0]).resolve())
+                ref = pos[1] if len(pos) > 1 else "HEAD"
+                new_branch = None
+                for flag in ("-b", "-B"):
+                    if flag in args:
+                        new_branch = args[args.index(flag) + 1]
+                sha = repo.resolve(ref)
+                commit = self._find_commit(sha)
+                if self._find_worktree(repo, target) is not None:
+                    raise GitError(f"fatal: '{target}' already exists")
+                made_branch = False
+                if new_branch:
+                    branch = new_branch
+                    made_branch = True
+                elif "--detach" in args or "-d" in args:
+                    branch = None
+                elif f"refs/heads/{ref}" in repo.refs:
+                    branch = ref
+                else:
+                    # git names the new branch after the path basename.
+                    branch = Path(target).name
+                    made_branch = True
+                if branch:
+                    conflict = self._branch_in_use(repo, branch)
+                    if conflict:
+                        raise GitError(
+                            f"fatal: '{branch}' is already used by worktree at '{conflict}'"
+                        )
+                    if f"refs/heads/{branch}" not in repo.refs:
+                        repo.refs[f"refs/heads/{branch}"] = sha
+                wt_path = Path(target)
+                admin = Path(path) / "worktrees" / wt_path.name
+                new_wt = Worktree(
+                    path=target,
+                    head=sha,
+                    branch=branch,
+                    admin_dir=str(admin),
+                    files=dict(commit.files),
+                    indexed=dict(commit.files),
+                    worktree=dict(commit.files),
+                )
+                repo.worktrees.append(new_wt)
+                wt_path.mkdir(parents=True, exist_ok=True)
+                (wt_path / ".git").write_text(f"gitdir: {admin}\n")
+                admin.mkdir(parents=True, exist_ok=True)
+                (admin / "commondir").write_text("../..\n")
+                (admin / "gitdir").write_text(f"{wt_path / '.git'}\n")
+                self._write_head(
+                    admin,
+                    ref=f"refs/heads/{branch}" if branch else None,
+                    sha=sha,
+                )
+                if "--no-checkout" not in args:
+                    self._write_worktree(wt_path, commit.files)
+                    new_wt.checked_out = True
+                if not branch:
+                    what = f"detached HEAD {sha[:7]}"
+                elif made_branch:
+                    what = f"new branch '{branch}'"
+                else:
+                    what = f"checking out '{branch}'"
+                return GitResult(0, "", f"Preparing worktree ({what})\n")
+
+            if sub == "lock":
+                # worktree lock [--reason <r>] <path>
+                reason = ""
+                if "--reason" in args:
+                    reason = args[args.index("--reason") + 1]
+                for a in args[2:]:
+                    if a.startswith("--reason="):
+                        reason = a.split("=", 1)[1]
+                pos = self._positionals(args[2:], value_flags=("--reason",))
+                if not pos:
+                    raise GitError("fatal: worktree lock requires a path")
+                target = str(Path(pos[-1]).resolve())
+                target_wt = self._find_worktree(repo, target)
+                if target_wt is None:
+                    raise GitError(f"fatal: '{target}' is not a working tree")
+                if target_wt.locked is not None:
+                    raise GitError(
+                        f"fatal: '{target}' is already locked, reason: {target_wt.locked}"
+                    )
+                target_wt.locked = reason
+                return GitResult(0, "", "")
+
+            if sub == "unlock":
+                pos = self._positionals(args[2:])
+                if not pos:
+                    raise GitError("fatal: worktree unlock requires a path")
+                target = str(Path(pos[-1]).resolve())
+                target_wt = self._find_worktree(repo, target)
+                if target_wt is None:
+                    raise GitError(f"fatal: '{target}' is not a working tree")
+                if target_wt.locked is None:
+                    raise GitError(f"fatal: '{target}' is not locked")
+                target_wt.locked = None
+                return GitResult(0, "", "")
+
             if sub == "remove":
                 # worktree remove [--force] <path>
-                rest = [a for a in args[2:] if a != "--force"]
-                target = str(Path(rest[-1]).resolve())
+                pos = self._positionals(args[2:])
+                if not pos:
+                    raise GitError("fatal: worktree remove requires a path")
+                target = str(Path(pos[-1]).resolve())
+                target_wt = self._find_worktree(repo, target)
+                if target_wt is None:
+                    raise GitError(f"fatal: '{target}' is not a working tree")
+                if target_wt.locked is not None and args.count("--force") < 2:
+                    raise GitError(
+                        f"fatal: cannot remove a locked working tree, lock reason: "
+                        f"{target_wt.locked}\nuse 'remove -f -f' to override or unlock first"
+                    )
+                if "--force" not in args and self._worktree_dirty(target_wt):
+                    raise GitError(
+                        f"fatal: '{target}' contains modified or untracked files, "
+                        "use --force to delete it"
+                    )
                 repo.worktrees = [w for w in repo.worktrees if w.path != target]
+                shutil.rmtree(target, ignore_errors=True)
+                if target_wt.admin_dir:
+                    shutil.rmtree(target_wt.admin_dir, ignore_errors=True)
                 return GitResult(0, "", "")
+
             raise GitError(f"unmocked git command: {' '.join(args)}")
 
         if cmd == "stash":
             sub = args[1] if len(args) > 1 else ""
+            indexed = wt.indexed if wt is not None else repo.indexed
+            workmap = wt.worktree if wt is not None else repo.worktree
+            stashes = wt.stashes if wt is not None else repo.stashes
+            cone = wt.cone if wt is not None else repo.cone
+            root = self._work_root(wt, work_tree)
             if sub == "push":
                 # stash push -u -m <msg>
                 # Snapshot only the dirty/untracked files from disk so the
                 # pop reapplies local changes on top of the updated worktree
                 # without clobbering files the update changed.
                 snapshot: dict[str, str] = {}
-                if work_tree:
-                    wt_path = Path(work_tree)
-                    for name in repo.indexed:
-                        p = wt_path / name
-                        if p.exists() and p.read_text() != repo.indexed[name]:
+                if root is not None:
+                    for name in indexed:
+                        p = root / name
+                        if p.exists() and p.read_text() != indexed[name]:
                             snapshot[name] = p.read_text()
-                    known = set(repo.indexed.keys()) | set(repo.worktree.keys())
-                    for entry in wt_path.rglob("*"):
+                    known = set(indexed.keys()) | set(workmap.keys())
+                    if wt is not None:
+                        known |= set(wt.files.keys())
+                    for entry in root.rglob("*"):
                         if not entry.is_file():
                             continue
-                        rel = entry.relative_to(wt_path).as_posix()
+                        rel = entry.relative_to(root).as_posix()
                         if rel.startswith(".gf/"):
+                            continue
+                        if wt is not None and (rel == ".git" or rel.startswith(".git/")):
+                            continue
+                        if not self._cone_includes(rel, cone):
                             continue
                         if rel not in known:
                             snapshot[rel] = entry.read_text()
-                repo.stashes.append({"worktree": snapshot, "indexed": dict(repo.indexed)})
+                stashes.append({"worktree": snapshot, "indexed": dict(indexed)})
                 # Reset tracked files to indexed (clean) state and remove the
                 # now-stashed untracked files.
-                repo.worktree = dict(repo.indexed)
-                if work_tree:
-                    self._write_worktree(Path(work_tree), repo.indexed)
+                workmap.clear()
+                workmap.update(indexed)
+                if root is not None:
+                    self._write_worktree(root, indexed)
                     for name in list(snapshot.keys()):
-                        if name not in repo.indexed:
-                            p = Path(work_tree) / name
+                        if name not in indexed:
+                            p = root / name
                             if p.exists():
                                 p.unlink()
                 return GitResult(0, "Saved working directory and index state\n", "")
             if sub == "pop":
-                if not repo.stashes:
+                if not stashes:
                     return GitResult(1, "", "No stash entries found.")
-                entry = repo.stashes.pop()
+                entry = stashes.pop()
                 # Reapply stashed files on top of the current worktree.
-                repo.worktree.update(entry["worktree"])
-                if work_tree:
-                    wt_path = Path(work_tree)
+                workmap.update(entry["worktree"])
+                if root is not None:
                     for name, content in entry["worktree"].items():
-                        p = wt_path / name
+                        p = root / name
                         p.parent.mkdir(parents=True, exist_ok=True)
                         p.write_text(content)
                 return GitResult(0, "", "")
             raise GitError(f"unmocked git command: {' '.join(args)}")
 
         raise GitError(f"unmocked git command: {' '.join(args)}")
+
+    def _set_cone(self, repo: Repo, wt: Worktree, cone: frozenset[str], root: Path | None) -> None:
+        """Apply `sparse-checkout set --cone` to a linked worktree."""
+        source = wt.files or wt.indexed
+        wt.cone = cone
+        new_map = self._cone_filter(source, cone)
+        if wt.checked_out and root is not None:
+            self._resparsify_map(wt.indexed, new_map, root)
+        wt.indexed = dict(new_map)
+        wt.worktree = dict(new_map)
+
+    def _resparsify_map(self, old_map: dict[str, str], new_map: dict[str, str], root: Path) -> None:
+        """Bring the disk in line with a narrowed or widened cone."""
+        for gone in set(old_map) - set(new_map):
+            p = root / gone
+            if p.exists():
+                p.unlink()
+        self._write_worktree(root, {n: c for n, c in new_map.items() if n not in old_map})
 
     def _write_worktree(self, work_tree: Path, files: dict[str, str]) -> None:
         for name, content in files.items():

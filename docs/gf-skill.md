@@ -8,7 +8,9 @@ description: How to use the `gf` git-folder manager inside a parent git repo.
 `gf` manages git-folder git repositories as children of a parent git repo.
 Each child keeps its own gitdir under `child/.gf/git`, so the parent repo
 does not track the child's contents. Add child paths to the parent
-`.gitignore`.
+`.gitignore`. A URL that is a path to a folder inside a repository binds just
+that folder through a shared sparse checkout under the parent's `.gf/`; add
+`.gf/` and the folder path (no trailing slash) to `.gitignore`.
 
 ## Typical workflow
 
@@ -19,6 +21,9 @@ gf status
 
 # Clone a git-folder into the parent
 gf clone https://github.com/foo/libfoo vendor/libfoo
+
+# Bind just one repository subdirectory
+gf clone https://github.com/foo/libfoo/docs/api vendor/libfoo-api
 
 # Move into a child and use git normally
 gf -C vendor/libfoo git status
@@ -51,7 +56,10 @@ gf rm vendor/libfoo
 ## Rules of thumb
 
 - `gf` never creates commits in the parent for you. Add child paths to the
-  parent's `.gitignore` after `clone` or `init`.
+  parent's `.gitignore` after `clone` or `init`; for a folder binding, add its
+  path without a trailing slash and the parent's `.gf/` store directory.
+- `gf rm` on a folder binding removes only the link; `gf clone` with the same
+  URL brings it back with any uncommitted work.
 - `gf ls` and `gf status` do not access the network.
 - `gf pull` refuses to run if a child has uncommitted changes.
 - `gf pull --rebase` only makes sense for branch refs; for tags or commits it

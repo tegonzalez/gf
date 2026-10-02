@@ -8,7 +8,7 @@ This document addresses the author implementing, extending, or reconsidering `gf
 
 ## Do not place git-folder storage outside the parent worktree
 
-The default object/reference store for git-folders must live inside the discovered parent worktree, under each child's `.gf/git`. The tool must never create a shared object store or other git-folder storage outside the parent worktree.
+The object/reference store for a git-folder must live inside the discovered parent worktree: under each child's `.gf/git` for a whole-repo binding, and under `<root>/.gf` (repo stores and checkouts) for subfolder bindings. The tool must never create a shared object store or other git-folder storage outside the parent worktree.
 
 ## Do not add new manifest fields without explicit approval
 
@@ -16,7 +16,7 @@ The manifest schema (`name`, `url`, `ref`, `path`) is intentionally minimal. Reu
 
 ## Do not delete user worktrees
 
-`gf rm` must only unregister the git-folder and convert the child back to a normal git repo by moving `child/.gf/git` to `child/.git`. The rest of the child directory and its contents must remain.
+For a whole-repo binding, `gf rm` must only unregister the git-folder and convert the child back to a normal git repo by moving `child/.gf/git` to `child/.git`. The rest of the child directory and its contents must remain. For a subfolder binding, `gf rm` removes only the consumer link and the manifest entry; it must not modify anything under `<root>/.gf` — not the checkout, its uncommitted work, its sparse cone, or the repo store — so adding the binding back restores the folder as it was.
 
 ## Do not resolve `gf.toml` outside the project root
 
@@ -40,7 +40,7 @@ For `latest`, branch, and default-branch refs, `init_child` and `update_child` m
 
 ## Do not fetch the network in `ls` or `status`
 
-`gf ls` and `gf status` must be local-only operations. They may not call `git fetch`, `git remote`, `git ls-remote`, or any other command that requires a network connection. Network access is only allowed in `clone`, `pull`, and `worktree add`.
+`gf ls` and `gf status` must be local-only operations. They may not call `git fetch`, `git remote`, `git ls-remote`, or any other command that requires a network connection, and they never run URL resolution; they read the recorded resolution. Network access is only allowed in `clone`, `pull`, and `worktree add`.
 
 ## Do not display the consumer path as the URL in `ls` or `status`
 
@@ -69,3 +69,43 @@ Instead: express the host-dependent behavior once in `src/gf/platform.py` as a p
 Detection signal: `platform.py` importing `gf.backends`, `gf.manifest`, `gf.shelf`, or `tomllib`, or naming `git`, `gf.toml`, or `.gf` in any string it builds.
 
 Instead: keep `GitCliBackend` the only caller of `git` and `manifest.py` the only reader of the manifest, and have them call platform primitives. A portability problem that looks like it needs a git wrapper is usually a missing primitive; add the primitive, not the wrapper.
+
+## Do not re-root a repository subdirectory by rewriting or copying history
+
+A subfolder binding must map the repository's real subdirectory; it must not manufacture one. Git cannot re-root a subdirectory as a worktree root, and sparse checkout filters paths without relocating them. `git subtree split`, `read-tree --prefix` exports, file copy-sync, and bind mounts all fabricate a different history or a second file population, so the consumer's `git log`, `status`, and commits would stop matching the upstream repository.
+
+Detection signal: a `subtree`, `read-tree`, `filter-branch`, or bulk copy producing a binding's file view, or a second physical copy of one repository subdirectory under the parent worktree.
+
+Instead: keep the subdirectory inside one sparse linked worktree of the repository's store and publish it through the consumer link.
+
+## Do not leave a `.git` gitfile in a `gf` checkout
+
+A linked worktree under `<root>/.gf/wt` must not keep its `.git` gitfile. A surviving gitfile lets plain `git` inside a consumer link stop at the checkout instead of resolving to the parent repository, and it lets tools that scan for `.git` treat the hidden checkout as a nested repository — the confusion `.gf` exists to prevent. `gf` addresses the checkout through `GIT_DIR`/`GIT_WORK_TREE`, so the gitfile carries no needed function.
+
+Detection signal: a `.git` file existing at the root of any directory under `<root>/.gf/wt/`.
+
+Instead: remove the gitfile after `git worktree add` and lock the checkout with `git worktree lock` so `git worktree prune` does not reap it; pass `--git-dir`/`--work-tree` (or `GIT_DIR`/`GIT_WORK_TREE`) on every git call that touches the checkout.
+
+## Do not rewrite or remove fetch refspec lines on a shared repo store
+
+A repo store under `<root>/.gf/repos/<key>/git` is shared by every checkout and binding of that repository. Rewriting or removing one of its `remote.origin.fetch` lines — for example to narrow the store to one branch after it exists — silently changes what every other checkout of that store fetches.
+
+Detection signal: a `config remote.origin.fetch <value>` write without `--add` to a store that already exists, or a `--unset`/`--replace-all` on that key.
+
+Instead: write the first refspec line when the store is created — the wildcard, or the single branch under `--single-branch` — and append a line with `config --add` when a later binding needs a branch no existing line covers.
+
+## Do not create a second checkout of one branch in one repo store
+
+Git permits one checkout of a branch per repository; a second `worktree add` of the same branch in the same store fails (`'main' is already used by worktree at …`). Two bindings of one repository on one branch must therefore be views into one checkout, not two checkouts.
+
+Detection signal: `git worktree add` invoked for a `<repo-key>/<checkout-key>` pair that already exists under `<root>/.gf/wt/`.
+
+Instead: key checkouts by `(repo store, checkout key)` — branch name for branch and `latest` refs, ref string for tag and commit refs — and widen an existing checkout's sparse cone when a new binding joins it; where stored, key = 'ref=' + quote(ref, safe='').
+
+## Do not construct `.gf` layout paths outside the checkout resolver
+
+Both binding forms resolve their `gitdir`, `work_tree`, `common_dir`, `subdir`, and state path through one checkout-resolver function. A second place that spells `".gf" / "git"` or walks `.gf/wt` structure gives the layout two owners, and the owners diverge exactly where whole-repo and subfolder bindings differ.
+
+Detection signal: a `".gf"` or `"git"` layout literal, or a `worktrees/` path join, in `src/gf/` outside the resolver module; `grep -n '"\.gf"' src/gf/` must match only the resolver module.
+
+Instead: put the literal layout in the resolver module (planned as `src/gf/layout.py`) and call it everywhere a path under `.gf` is needed.

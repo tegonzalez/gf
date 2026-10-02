@@ -123,7 +123,7 @@ class MockGitBackend(GitBackend):
         self.repos: dict[str, Repo] = {}
 
     def _path(self, cwd: Any, git_dir: Any, work_tree: Any) -> str:
-        return str(Path(cwd or git_dir or work_tree or Path.cwd()).resolve())
+        return str(Path(git_dir or cwd or work_tree or Path.cwd()).resolve())
 
     def _repo(self, path: str) -> Repo:
         if path not in self.repos:
@@ -381,11 +381,17 @@ class MockGitBackend(GitBackend):
         return pos
 
     def _pathspec_match(self, name: str, specs: list[str]) -> bool:
+        included = []
+        excluded = []
         for spec in specs:
+            flags = []
+            if spec.startswith(":("):
+                magic, spec = spec[2:].split(")", 1)
+                flags = magic.split(",")
             spec = spec.strip("/")
-            if spec in ("", ".") or name == spec or name.startswith(spec + "/"):
-                return True
-        return False
+            match = spec in ("", ".") or name == spec or name.startswith(spec + "/")
+            (excluded if "exclude" in flags else included).append(match)
+        return (not included or any(included)) and not any(excluded)
 
     def _status_lines(self, repo: Repo, wt: Worktree | None, work_root: Path | None) -> list[str]:
         indexed = wt.indexed if wt is not None else repo.indexed
@@ -615,6 +621,21 @@ class MockGitBackend(GitBackend):
                 return GitResult(0, f"{name}/HEAD set to {head_branch}\n", "")
 
         if cmd == "rev-parse":
+            if "--absolute-git-dir" in args:
+                key = next((k for k, r in self.repos.items() if r is repo), path)
+                gitpath = (wt.admin_dir if wt is not None and wt.admin_dir else
+                           key if repo.bare or git_dir else str(Path(key) / ".git"))
+                return GitResult(0, gitpath + "\n", "")
+            if "--git-common-dir" in args:
+                # The one gitdir every worktree shares. Real git answers
+                # the absolute common dir from a linked worktree and
+                # `<root>/.git` (or the dir itself, when bare) from a
+                # normal repo — production absolutizes a relative reply,
+                # so return the absolute form for either shape.
+                key = next(
+                    (k for k, r in self.repos.items() if r is repo), path)
+                common = key if repo.bare else str(Path(key) / ".git")
+                return GitResult(0, common + "\n", "")
             if "HEAD" in args:
                 # An unborn HEAD (a child with no commits yet) resolves
                 # to no commit: real git dies rc=128 on EVERY HEAD form —
@@ -685,8 +706,49 @@ class MockGitBackend(GitBackend):
             if len(pos) < 2:
                 raise GitError("usage: git update-ref <ref> <sha>")
             sha = repo.resolve(pos[1].replace("^{}", ""))
+            if len(pos) > 2:
+                expected = pos[2]
+                existing = target.get(ref)
+                if ((set(expected) == {"0"} and existing is not None) or
+                    (set(expected) != {"0"} and existing != expected)):
+                    raise GitError(f"cannot lock ref '{ref}': unexpected existing value")
             target[ref] = sha
             return GitResult(0, "", "")
+
+        if cmd == "for-each-ref":
+            refs = dict(repo.refs)
+            if wt is not None:
+                refs.update(wt.refs)
+            contains = None
+            if "--contains" in args:
+                contains = args[args.index("--contains") + 1]
+            pattern = next((a.split("=", 1)[1] for a in args if a.startswith("--format=")),
+                           "%(objectname) %(refname)")
+            names = [ref for ref in sorted(refs) if contains is None or
+                     self._is_ancestor(contains, refs[ref]) or contains == refs[ref]]
+            return GitResult(0, "".join(
+                pattern.replace("%(refname)", ref).replace("%(objectname)", refs[ref]) + "\n"
+                for ref in names), "")
+
+        if cmd == "rev-list" and "--reverse" in args:
+            left, right = args[-1].split("..", 1)
+            excluded = self._ancestors(repo.resolve(left))
+            ordered = []
+            seen = set()
+            def visit(sha):
+                if sha in seen or sha in excluded:
+                    return
+                seen.add(sha)
+                for parent in self._find_commit(sha).parents:
+                    visit(parent)
+                ordered.append(sha)
+            visit(repo.resolve(right))
+            return GitResult(0, "".join(sha + "\n" for sha in ordered), "")
+
+        if cmd == "rev-list" and "--parents" in args:
+            sha = repo.resolve(args[-1])
+            parents = self._find_commit(sha).parents
+            return GitResult(0, " ".join([sha, *parents]) + "\n", "")
 
         if cmd == "rev-list" and "--left-right" in args:
             # rev-list --left-right --count <a>...<b> — the drift
@@ -785,6 +847,10 @@ class MockGitBackend(GitBackend):
                 repo, wt, commit, target_sha, branch, git_dir, self._work_root(wt, work_tree),
             )
             return GitResult(0, f"Successfully rebased and updated refs/heads/{branch or 'HEAD'}.\n", "")
+
+        if cmd == "ls-files" and "-v" in args:
+            indexed = wt.indexed if wt is not None else repo.indexed
+            return GitResult(0, "".join(f"H {name}\0" for name in sorted(indexed)), "")
 
         if cmd == "status" and "--porcelain" in args:
             lines = self._status_lines(repo, wt, self._work_root(wt, work_tree))

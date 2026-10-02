@@ -1,342 +1,114 @@
 ---
-doc-graph: "When there is an intention to amend this document, first Adhere to [dc-doc-test-plan]; otherwise, do not modify."
+doc-graph: "When there is an intention to amend this document, first Adhere to [dc-doc-test-strategy]; otherwise, do not modify."
 ---
 
-# git-folders Testing Plan
+# git-folders Test Strategy
 
 ## Purpose
 
-Select and apply this repository's durable testing strategy to the bounded work-preservation Change `DC-DOC-PLAN-007`, and carry that Change's verification obligations through acceptance: preservation-witness oracles, independent authorship, host and Git profiles, and the changed-criterion disposition of every test family.
+Provide the reusable verification model for the `git-folders` tool across Changes. This strategy maps the tool's accepted requirements to evidence responsibilities, profiles, and harness boundaries; the product specification and contracts remain the source of expected behavior.
 
-## Orientation
+## Scope
 
-The receivers are the verification authors who compose and rewrite the executable assets under `tests/`, the architecture owner and coordinator who consume phase evidence, and the independent evaluator of this preparation packet. The user's preservation decisions and the removal of `gf pull --force` are settled inputs from [the plan](../.planning/DC-DOC-PLAN-007-gf-work-preservation.md); this document selects how they are verified and does not restate product meaning.
+The scope is the complete `git-folders` tool: supported commands and global controls, repository and checkout identity, manifest and storage state, and the links between its modules. The strategy applies to verification assets under `tests/` and the supported-host control. Windows is outside the supported host scope; subfolder-binding evidence observes the Git 2.35 minimum in [the specification](gf-spec.md#boundaries).
 
-Scope: every executable test, fixture, oracle, driver, and manual scenario that verifies `gf` under this Change. Non-goals: product semantics ([gf-spec.md](gf-spec.md)), producer design ([gf-arch.md](gf-arch.md)), coordination state ([gf-progress.md](../.planning/gf-progress.md)), and the executable assets themselves — this document owns selection and obligation, not test code, fixtures, run results, or any acceptance decision.
-
-### Receiver contract
-
-The verification author's task is to compose the preservation witnesses and rewrite the mapped families against admitted criteria. Authorized inputs: the product owners' amended documents ([specification](gf-spec.md), [architecture](gf-arch.md), [constraints](gf-constraints.md), [goals](gf-goals.md), [principles](gf-principles.md)), the active plan, and the archived review stimuli under `.trash/planning/2026-09-30-subfolder-remediation/review-evidence/` as donor stimuli only. Authorized actions: create and modify verification assets under `tests/`; the production surfaces `src/gf/` and `bin/gf` are read-only to this assignment. Unresolved bindings: the exact criterion clauses land when the specification, constraints, and architecture owners' amendments are admitted; `rewrite` families re-derive expected values at that admission, not from production output.
+The strategy selects reusable evidence. It does not define product behavior, implementation architecture, executable tests, fixtures, scripts, configuration, individual cases, run results, or receiving acceptance. Receiver applicability: `receiver-facing=false`; this reusable model supplies no current task, selected architecture, unresolved assignment choices, source-use authority, or execution actions. A Change's temporal test plan and execution handoff supply those bindings.
 
 ## Terminology
 
-| Term                     | Meaning                                                                                                                                                                         |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Protected work           | Staged and unstaged changes, untracked and ignored files, local commits and refs, stashes, detached work, and the configuration needed to use them.                             |
-| Provenance               | Usable Git history, refs, index and worktree relationships, plus the retained identity needed to find and reconnect work.                                                       |
-| Preservation witness     | A stimulus through a real production path plus before/after observations that distinguish retained work and usable provenance from loss or wrong-target mutation.               |
-| Binding form             | Whole-repo (`child/.gf/git`) or subfolder (shared repo store, sparse linked checkout, consumer link); obligations apply to both unless a clause says otherwise.                 |
-| Scenario class           | `completion` (the command succeeds), `refusal` (it declines with protected state intact), or `recovery` (failure or interruption leaves retained work and a truthful report).   |
-| Regression observer      | A retained family or case whose expectation is unchanged by this Change; it watches for unrelated drift.                                                                        |
-| Candidate                | The exact source revision, local changes, inputs, and environment under verification.                                                                                           |
-| Verification subject     | The `gf` operation exercised through its public entry point.                                                                                                                    |
-| Verification component   | The production seam an obligation's evidence binds to.                                                                                                                          |
-| Double boundary          | Where a test double may stand in for git: CLI-shape branches only, never preservation semantics.                                                                                |
-
-## Change under verification
-
-The bounded change under verification is `DC-DOC-PLAN-007`: `gf`'s own mapping, update, unmapping, and recovery operations must preserve user work and usable Git provenance across both binding forms. It supersedes this document's previous selection (repository-subfolder bindings); that selection's durable mechanics remain in force and are re-applied under [Strategy application](#strategy-application).
-
-Admitted starting baseline: local `main` at `8488b74` with the refreshed Linux control `uv run pytest -q -x` at 885 tests, exit 0 in about 109 seconds. Baseline and evidence bindings refresh at each phase admission; a commit identifier or an old green run alone establishes no implementation readiness.
-
-Candidate boundary: production is `src/gf/` and `bin/gf`, read-only to the verification assignment; verification assets are `tests/` — fixtures, drivers, the mock backend, and the executable cases. Host profile: Linux and macOS, each with a virtual environment created on that host. Git profile: floor 2.35 wherever subfolder features are exercised ([gf-spec.md](gf-spec.md) Boundaries: `worktree add --no-checkout`, `worktree lock --reason`, cone-mode sparse checkout, `fetch --filter`, `ls-remote`); whole-repo bindings carry no new minimum.
-
-Affected work-product scope: the `gf` tool's complete public surface — the command set (`clone`, `init`, `pull`, `rm`, `status`, `ls`, `worktree add`/`list`/`remove`, and the `sh`/`git`/`diff`/`log` passthroughs), the manifest and per-checkout state model, and the `.gf` storage layout — plus the `tests/` verification surface.
-
-Receiving decisions this plan serves: phase admission (architecture owner), preservation per increment (architecture owner and coordinator at receipt), integrated supported hosts (coordinator, with user-supplied macOS evidence), and whole-Change acceptance (user). Every selected obligation binds one criterion of an amended product owner; criterion provenance uses the keys in [Changed criteria](#changed-criteria).
-
-## Changed criteria
-
-| Criterion    | Admitted direction under governing preparation (receiving owner)                                                                                                                                                          |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `C-preserve` | `gf`-owned operations preserve protected work and usable provenance; uncertain ownership refuses (goals, constraints, principles).                                                                                        |
-| `C-pull`     | Pull integrates upstream while preserving local work; `--force` is removed; fast-forward-only default; complete autostash restoration; recoverable explicit rebase (specification, constraints, architecture).            |
-| `C-unmap`    | Whole-repo unmap yields an ordinary working repository; subfolder unmap retains the shared checkout and edits; re-add reconnects identified retained work without silently choosing latest (specification, architecture). |
-| `C-inspect`  | Status, ls, and drift truthfully distinguish requested upstream, actual `HEAD`, ahead/behind/diverged, and dirty state; the unborn-child behavior survives (specification, architecture).                                 |
-| `C-identity` | Every mutation binds a verified repository/worktree/index; only ownership-proven disposal occurs (specification, architecture).                                                                                           |
-| `C-recovery` | Shared mutation is serialized; interruption retains uncertain partial work with truthful partial-effect and recovery reporting (architecture, constraints, specification error handling).                                 |
-| `C-ops`      | Provision, map/remap, integrate, retarget, and unmap stay separate meanings across both forms; purge remains a deliberate user act (specification, architecture).                                                         |
-
-These keys name the admitted directions from the plan's settled inputs. The exact clause identities bind when the specification, constraints, and architecture owners land their amendments; until then a `rewrite` family's expected values are gated on that admission.
-
-## Test command
-
-```bash
-uv run pytest -x
-```
-
-Run this after every meaningful change. The project uses `pyproject.toml` as the pytest config and `pyfakefs` for filesystem isolation. The retained POSIX platform seam and host-independent inputs remain in force so the same suite keeps one expected result on Linux and macOS.
-
-### Running the control
-
-Run the control on each supported host, with a virtual environment created on that host. The dual-host requirement, the per-host virtual environment, and the pins that keep expected results host-independent are the test-seam contract in [gf-arch.md](gf-arch.md); this plan runs against that contract rather than restating it.
-
-| Check                            | Host    | Requirement                                                                              |
-| -------------------------------- | ------- | ---------------------------------------------------------------------------------------- |
-| `uv run pytest -x`               | Linux   | Exit 0.                                                                                  |
-| `uv run pytest -x`               | macOS   | Exit 0 using a virtual environment created on macOS.                                     |
-| `gf` CLI scenario                | Linux   | A local bare repository as the upstream; no network.                                     |
-| `gf` CLI scenario                | macOS   | A local bare repository as the upstream; no network.                                     |
-| `gf` subfolder CLI scenario      | Linux   | A local bare repository with subdirectories as the upstream; no network.                 |
-| `gf` subfolder CLI scenario      | macOS   | A local bare repository with subdirectories as the upstream; no network.                 |
-| `gf` preservation CLI scenario   | Linux   | A local bare upstream; committed and dirty local work in the child; no network.          |
-| `gf` preservation CLI scenario   | macOS   | A local bare upstream; committed and dirty local work in the child; no network.          |
-
-The CLI scenario is: `gf -C <parent> clone <local-upstream> vendor/lib`, then `gf -C <parent> status`, against a local bare repository. It passes when both commands exit 0 and `status` reports the new child.
-
-The subfolder CLI scenario is: `gf -C <parent> clone <local-upstream>/docs/api vendor/api`, then `gf -C <parent> status`, against a local bare repository containing `docs/api`. It passes when both commands exit 0, `status` reports the new binding, and `vendor/api` resolves through its consumer link to the mapped subdirectory.
-
-The preservation CLI scenario is: `gf -C <parent> clone <local-upstream> vendor/lib`; commit local work inside `vendor/lib` and leave one dirty edit; then `gf -C <parent> pull`. It passes when a successful pull leaves the local commit reachable from the child's history and the dirty file's bytes unchanged, and when a refusal exits nonzero inside a `gf:` envelope with the worktree byte-identical. Both arms are preservation invariants whichever pull semantics land.
-
-### Reading a failure
-
-An expected result is admitted as correct because the test-seam contract fixes it, never because the machine running the suite fixes it. When a run is red, separate the two causes before investigating the product.
-
-A host whose git defaults to `main`, with the default-branch pin absent or overridden, fails the real-Git tests whose golden names `master` while the mock-backend and runner tests stay green. Read that signature as a leaked host input and check the pin before treating it as a product regression.
-
-A preservation witness red on a `preserved` expectation reads as `work-loss`, `wrong-target`, or `unusable-provenance` per [the oracle](#preservation-witness-oracle). Any of those findings blocks acceptance; it does not degrade to a documented residual.
-
-## Independent authorship
-
-- Expected behavior derives from the admitted product owners — the amended specification, constraints, architecture, goals, and principles — plus fixture-controlled values the witness itself minted. Implementation output, candidate-generated goldens, and archived probe results never supply an expectation.
-- The acceptance-test author differs from the production author: product implementation binds to `impl-role` and acceptance assets to `verification-impl-role`. Production surfaces stay read-only to the verification assignment; every executable asset lives under `tests/`.
-- Rewritten families re-derive expectations from the amended clauses. Retained families — and retained cases inside rewritten families — stay regression observers; they are not silently deleted or declared covered.
-- The archived review-evidence scripts and outputs are donor stimuli: they motivate witness shapes and candidate cases, they are revalidated against the current candidate, and their outputs supply no intended behavior. Several issues they exposed have already received fixes.
-- Author verification (the document writer's own conformance check), the coordinator's independent mutation evaluation, executable-code review of the candidate, and receiving acceptance are separate surfaces; none substitutes for another.
-
-## Preservation witness oracle
-
-### What a witness observes
-
-A preservation witness snapshots the protected surface before the stimulus, drives the `gf` operation through its real production entry (`python -m gf` subprocess; in-proc only where the branch is CLI-shape), then re-observes. Five observation categories, all against real `git` state:
-
-| Category                  | Observed before and after                                                                                                                                                            | Instruments                                                                                       |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| Protected bytes           | Content hash and existence of every fixture-authored file — staged, unstaged, untracked, ignored.                                                                                    | File hashing (`git hash-object` or equivalent), existence checks                                  |
-| Refs and reachability     | Each fixture-minted commit stays reachable from a live ref — `HEAD`, a local branch, or a tag. Reflog-only survival is loss.                                                         | `git rev-parse`, `git branch --contains`, `git tag --contains`, `git merge-base --is-ancestor`    |
-| Index and stash           | The staged/unstaged partition survives; a taken autostash is restored rather than orphaned.                                                                                          | `git status --porcelain`, `git diff --cached --name-only`, `git stash list`                       |
-| Repository identity       | Mutations land only in the bound repository, store, checkout, and worktree — not a sibling alias, an ambient `GIT_*` target, or another parent root.                                 | `remote.origin.url`, per-repo `git worktree list`, recorded repo keys, link realpaths             |
-| Provenance usability      | Retained work is reachable through the declared mechanism: an unmapped whole-repo child is an ordinary working repository; a re-added binding serves the identified retained work.   | `git status`/`log`/`commit` on the result; retained edits visible through the consumer link       |
-
-### Verdicts
-
-| Verdict                 | Meaning                                                                                                                                                                                             |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `preserved`             | Every required observation holds and the command's intended effect occurred.                                                                                                                        |
-| `work-loss`             | Protected bytes differ or vanish, a minted commit is reached by no live ref, an autostash is orphaned, or the index partition is destroyed.                                                         |
-| `wrong-target`          | The mutation or observation landed in a repository, store, checkout, or worktree other than the bound one.                                                                                          |
-| `unusable-provenance`   | Bytes survive but the declared reconnection path fails — the unmapped child is not an ordinary working repo, or re-add silently serves latest upstream rather than the identified retained work.    |
-
-`work-loss`, `wrong-target`, and `unusable-provenance` are blocking findings: they block acceptance and cannot be downgraded to documented residuals.
-
-### Required observations per scenario class
-
-| Scenario class   | Required observations                                                             | Additional requirement                                                                                                                                  |
-| ---------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `completion`     | All five categories.                                                              | The intended effect is observed too — a green exit that did nothing is not preservation evidence.                                                       |
-| `refusal`        | Bytes, refs/reachability, and index/stash identical to the pre-state; identity.   | Nonzero exit inside a `gf:` envelope naming the folder's name, path, and operation; every mutation outside declared record updates is rolled back.      |
-| `recovery`       | All five categories.                                                              | The induced failure or interruption leaves retained work and a truthful partial-effect report, and the named recovery path reaches a `preserved` end.   |
-
-Every witness whose criterion applies to both binding forms runs against both. Permitted variation: fixture-minted SHAs and file bytes compare exactly; command output wording, ordering, timing, and `.gf`-internal paths are evaluated through their governed behavior rather than pinned literals.
-
-## Scenario coverage
-
-Each selected obligation binds a goal, subject, component, profile, fixtures, allowed double boundary, expected evidence handle, and delivery phase. The independent verification owner for every obligation is the `verification-impl-role` author, distinct from the production author.
-
-| Obligation        | Goal                                                                                     | Kind         | Subject · component                                               | Profile · double boundary                                               | Fixtures · data                                               | Evidence handle                                  | Phase   |
-| ----------------- | ---------------------------------------------------------------------------------------- | ------------ | ----------------------------------------------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------- | ------------------------------------------------ | ------- |
-| `O-update`        | `gf pull` integrates upstream while protected work survives.                             | integrated   | `gf pull`; `update_child`, `_apply_ref`, fetch producers          | real-git subprocess; no double                                          | local commits plus staged/unstaged/untracked/ignored work     | before/after witness capture per the verdicts    | P1      |
-| `O-refusal`       | Mutating commands refuse on uncertain ownership or dirty state with protection intact.   | integrated   | all mutating commands; preflight, dirty, and identity checks      | real-git; in-proc mock only for refusal routing shape                   | uncertain-ownership and dirty fixtures                        | refusal envelope plus unchanged-state capture    | P1      |
-| `O-inspect`       | `status`/`ls`/drift truthfully distinguish upstream, actual `HEAD`, divergence, dirty.   | integrated   | `gf status`/`gf ls`; `drift`                                      | real-git                                                                | local-ahead, diverged, pinned, dirty, and unborn children     | classified output against `rev-list` truth       | P1      |
-| `O-identity`      | Every mutation binds a verified repository, worktree, and index.                         | integrated   | `_resolve`, checkout resolver, `clean_environ`                    | real-git; ambient `GIT_*` injected as controlled fixture environment    | sibling stores, aliased URLs, ambient targets                 | identity observations                            | P1      |
-| `O-fetch`         | Fetch refspecs and pinned refs land without rewriting existing lines or user refs.       | integrated   | store/child fetch and refspec producers                           | real-git                                                                | pinned tag/commit/branch upstreams; pre-existing user refs    | store config and ref observations                | P1      |
-| `O-unmap`         | `gf rm` retains work and leaves usable provenance.                                       | integrated   | `gf rm`; `remove_child`, `_vacate_checkout`, `_siblings_served`   | real-git                                                                | dirty shared checkouts, unmapped siblings, linked worktrees   | provenance-usability observations                | P2      |
-| `O-reconnect`     | A re-added binding reconnects identified retained work, never a silent latest.           | integrated   | `gf clone`/`gf pull` re-add paths; `ensure_*` producers           | real-git                                                                | removed-then-readded bindings carrying retained work          | consumer-link visibility and checkout identity   | P2      |
-| `O-worktree`      | Parent-worktree add/remove preserves linked children and source state.                   | integrated   | `gf worktree add`/`list`/`remove`; link guard                     | real-git                                                                | parent worktrees, linked children, dirty targets              | registrations plus bytes and reachability        | P2–P3   |
-| `O-recovery`      | Interruption or failure leaves retained work and a truthful partial-effect report.       | integrated   | rollback/cleanup producers; error envelopes                       | real-git plus bounded fault injection inside fixture trees              | mid-operation failure fixtures                                | retained-work capture plus report                | P3      |
-| `O-concurrency`   | Concurrent updates serialize; no torn state.                                             | integrated   | lock producers; shared store/manifest writers                     | real-git parallel subprocesses                                          | two writers on one store/manifest                             | one winner, one clean loser, no torn state       | P3      |
-| `O-records`       | Manifest and checkout-state writes serialize correctly under compound operations.        | isolated     | `manifest.py`, `state.py` writers/readers                         | in-proc or real-git                                                     | compound manifests, overrides, checkout state                 | record-level before/after comparison             | P3      |
-| `O-resolver`      | Checkout resolution proves identity beyond locators and live links.                      | isolated     | `layout.py` checkout resolver                                     | seeded layouts; real-git where identity requires git                    | forged, aliased, and relocated layouts                        | resolution verdicts                              | P1–P2   |
-
-The Change's acceptance coverage expands those obligations along these axes:
-
-| Coverage axis                            | Witness shape                                                                                 | Scenario classes              | Phase   |
-| ---------------------------------------- | --------------------------------------------------------------------------------------------- | ----------------------------- | ------- |
-| Staged/unstaged/untracked/ignored work   | Each work kind authored, including an ignored file; bytes and index partition held.           | completion/refusal/recovery   | P1–P3   |
-| Local-ahead, diverged, pinned history    | Fixture mints each history relation; reachability and truthful drift observed.                | completion                    | P1      |
-| Aliases, shared and unmapped siblings    | Two bindings share a store; unmapping one leaves the sibling serving and untouched.           | completion/refusal            | P2      |
-| Missing links                            | Dangling or absent consumer link; the command refuses rather than rebuilding over it.         | refusal/recovery              | P2      |
-| Multiple retained refs                   | Several local branches, tags, and stashes; all still reachable after the operation.           | completion                    | P2      |
-| Ordinary linked `git worktree`s          | A user's own `git worktree add` of a child and `gf worktree add` links both survive.          | completion                    | P2–P3   |
-| Safe parent-worktree removal             | `gf worktree remove` unlinks only its own links; source children and stores persist.          | completion/refusal            | P3      |
-| Conflicting ambient Git context          | Injected `GIT_DIR`/`GIT_WORK_TREE`/index variables aim at another repository.                 | completion/refusal            | P1      |
-| Corrupt state                            | Malformed or non-UTF-8 manifest, checkout state, or worktree record.                          | refusal/recovery              | P3      |
-| Permissions                              | Unreadable or unwritable fixture paths at mutation sites.                                     | refusal/recovery              | P3      |
-| Concurrent updates                       | Parallel `gf` writers on one store or manifest serialize; no torn state.                      | recovery                      | P3      |
-| Interruption                             | A signal or injected fault lands mid-operation; retained work plus a truthful report.         | recovery                      | P3      |
-
-## Strategy application
-
-This Change applies the durable testing strategy the suite already carries: pytest with in-process (`gf_inproc`) and subprocess (`python -m gf`) drivers, real `git` against local bare upstreams, `pyfakefs` plus `MockGitBackend` for CLI permutations, fixture isolation under `tests/fixtures/tmp/`, the transport-denial guard, and the per-host control on Linux and macOS. No separate durable test-strategy document exists today; the reusable mechanics live in this document and in the architecture's seam contracts, and they transfer to the verification owner's successor surface at this Change's succession.
-
-### Boundary comparison
-
-| Dimension                                      | Durable boundary                                                                                          | This Change                                                                                   | Disposition   |
-| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- | ------------- |
-| Execution mechanism                            | pytest; in-proc `gf_inproc` and subprocess `python -m gf`                                                 | Same; preservation witnesses take the subprocess/real-git path.                               | equal         |
-| Process                                        | Real `git` subprocesses on fixture repositories                                                           | Same; interruption witnesses may signal their own spawned processes.                          | equal         |
-| Network                                        | None — `protocol.allow = never`; local transport only                                                     | Same.                                                                                         | equal         |
-| External or autonomous runtime                 | None                                                                                                      | None added.                                                                                   | equal         |
-| Credential/environment/home/external config    | `HOME`-redirected `.gitconfig`, emptied `XDG_CONFIG_HOME`, `GIT_CONFIG_NOSYSTEM`; product `GIT_*` scrub   | Same; witnesses may inject ambient `GIT_*` as controlled fixture input to prove the scrub.    | equal         |
-| Fixture, data, write, cleanup                  | `tmp_path` → `tests/fixtures/tmp/<uuid>`; no writes outside                                               | Same; fault injection and planted corrupt state stay inside fixture trees.                    | equal         |
-| Oracle                                         | Expectations from admitted product owners plus fixture-controlled values                                  | Same, extended by the preservation-witness model above.                                       | equal         |
-| Semantic observation                           | Exit codes, `gf:` envelopes, filesystem effects, real-`git` queries                                       | Same, plus reachability, index/stash, and repository-identity observations.                   | equal         |
-
-Temporal narrowing admitted for this Change: family expectation re-derivation narrows to the `rewrite` rows of the disposition map — retained families revalidate but do not re-derive. Owner: the verification owner; reason: the bounded Change alters only preservation-adjacent criteria; affected acceptance: family-level expectations; expiry: Change succession; receiving disposition: the coordinator at phase receipt. Every other dimension is equal. A broader proposal — new runtimes, network access, host-conditioned paths — requires an independently authorized durable-strategy amendment at the architecture owner before dispatch.
-
-### Durable versus Change-scoped
-
-Reconciliation for `DC-DOC-PLAN-007`: the durable strategy is the selection above — control, isolation, mock boundary, profiles, scenario style — and stays reusable across Changes as this document's transferable content. Change-scoped and ending with the Change: the preservation-oracle bindings to amended clauses, the per-phase obligations, the family disposition map, and the criterion-resolution gate. Splitting a separate durable strategy document now would orphan the suite's verification conventions mid-Change, so they remain here marked as the durable selection; at Change acceptance or re-scope they transfer to the verification owner's successor surface — a durable test-strategy owner if one is admitted, else the next verification-planning surface — and this document's temporal selection withdraws per [Applicability end](#applicability-end).
-
-## Phase obligations
-
-Every affected public observer and its cooperating producers receive an admitted criterion and a witness before code dispatch. The phase rows bind the plan's admission requirements to verification obligations; the plan owns the outcomes and admission authority.
-
-| Phase   | Admitted outcome                                                                                                                              | Verification obligations                                                                                                                                                                                                                                                      | Admission evidence                                                                                   |
-| ------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `P1`    | Safe refusals, verified repository identity/context, protected fetch refs, history-preserving integration and inspection across both forms.   | `O-update`, `O-refusal`, `O-inspect`, `O-identity`, `O-fetch`, `O-resolver` witnessed green; `C-pull`/`C-inspect`/`C-identity` family rewrites landed; retained guard families revalidated; every unsafe transition not yet implemented witnessed as a refusal.               | Real candidate and custody; preservation witnesses; accepted producers and test obligations.         |
-| `P2`    | Retained mapping lifetime and whole/subfolder unmap/remap, with usable linked-worktree provenance.                                            | `O-unmap`, `O-reconnect`, `O-worktree` add-side witnessed; `C-unmap` rewrites landed — aliases, shared and unmapped siblings, missing links, multiple retained refs, identified reconnection.                                                                                 | Retention schema and migration accepted; ambiguity and missing-link contracts executable.            |
-| `P3`    | Safe compound transitions, parent-worktree operations, concurrency, interruption, and recovery over the complete command surface.             | `O-worktree` remove-side, `O-recovery`, `O-concurrency`, `O-records` witnessed; rollback, envelope, and compound-record rewrites landed; concurrent-update, permission-denial, and corrupt-state witnesses bounded and green; unsafe interim paths still witnessed refused.   | Lock/recovery protocol accepted; bounded failure and concurrency witnesses; interim paths refused.   |
-
-## Test layout
-
-Complete disposition of the suite's families for this Change; the `C-*` keys are defined under [Changed criteria](#changed-criteria). `rewrite` re-derives the mapped expectations from the changed criterion; retained cases inside a rewritten family stay regression observers. `retain` marks a regression observer revalidated against the admitted candidate. Retirements are case-level — for example `pull --force` expectations die with the flag; no whole family retires, and no family is unavailable or unresolved. Dispositions of `rewrite` gate on criterion admission: expected values bind only when the owning amendment lands.
-
-### Rewritten families
-
-| Family                                             | Responsibility                                                                       | Changed criterion · regression residue                                                                                                             |
-| -------------------------------------------------- | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tests/conftest.py`                                | `tmp_path` fixture, hermetic git env, `gf`/`git`/`gf_inproc` helpers                 | `C-preserve` — witness helpers (protected-surface capture, reachability probes) land here under verification ownership; isolation pins unchanged   |
-| `tests/mock_git.py`                                | In-memory git model                                                                  | `C-ops` — mock verbs track admitted CLI-shape changes only; the mock is never an oracle for a preservation claim                                   |
-| `tests/test_mock_git.py`                           | Mock self-tests                                                                      | Follows `mock_git.py` verb changes                                                                                                                 |
-| `tests/test_clone_and_pull.py`                     | Whole-repo clone/pull integration                                                    | `C-pull`, `C-ops` — pull expectations re-derived; gitdir/origin/ref pins remain observers                                                          |
-| `tests/test_pull_grouped.py`                       | Grouped subfolder pull                                                               | `C-pull` — shared-checkout dirty rules and `(moved with …)` reporting re-derived                                                                   |
-| `tests/test_pull_autostash_recovery.py`            | Autostash recovery                                                                   | `C-pull` — complete stash restoration and index partition under every failure arm                                                                  |
-| `tests/test_pull_recovery.py`                      | Pull-side rebuild/recovery                                                           | `C-recovery`, `C-identity` — wiped or unknown storage is retained or proven-owned, never rebuilt over                                              |
-| `tests/test_pull_binding_urls.py`                  | Recorded `binding_urls`                                                              | `C-unmap`, `C-identity` — resolution records under retarget/remap lifetime                                                                         |
-| `tests/test_state.py`                              | Checkout state records                                                               | `C-unmap`, `C-recovery` — record lifetime under the retained-state schema                                                                          |
-| `tests/test_status_scoping.py`                     | `status`/`ls`/drift scoping                                                          | `C-inspect` — ahead/diverged/pinned/dirty classification re-derived; unborn-child pins carry forward                                               |
-| `tests/test_edge_cases.py`                         | Multi-worktree, dirty, overrides, passthrough                                        | `C-pull`, `C-inspect` — dirty-abort and drift cases re-derived; passthrough/override cases remain observers                                        |
-| `tests/test_rm_subfolder.py`                       | `gf rm` semantics                                                                    | `C-unmap` — retained lifetime and identified reconnection                                                                                          |
-| `tests/test_clone_subfolder.py`                    | Subfolder clone/init through the seam                                                | `C-unmap`, `C-ops` — re-add reconnection and init-conversion cases re-derived; containment/refusal pins remain observers                           |
-| `tests/test_worktree.py`                           | `gf worktree add` integration                                                        | `C-identity`, `C-recovery` — parent-worktree provenance and rollback under preservation                                                            |
-| `tests/test_worktree_links.py`                     | Worktree consumer links                                                              | `C-unmap` — link provenance across parent worktrees                                                                                                |
-| `tests/test_layout.py`                             | Checkout resolver                                                                    | `C-identity` — identity proven beyond locators and live links                                                                                      |
-| `tests/test_url_resolution.py`                     | URL resolution units                                                                 | `C-identity` — recorded resolution lifetime; re-resolution under overrides                                                                         |
-| `tests/test_store_checkout.py`                     | Store/checkout/link primitives                                                       | `C-identity`, `C-unmap` — creation separated from reconnection; existing refs and work preserved                                                   |
-| `tests/test_cli_permutations.py`                   | Mock-driven CLI permutations                                                         | `C-ops` — flag surface (`--force` removal) and refusal routing; CLI-shape only                                                                     |
-| `tests/test_hardening_regressions.py`              | Defect regression pins                                                               | All changed criteria — per-case criterion comparison; pins whose criterion changed are re-derived, fixed-issue pins stay green                     |
-| `tests/test_worktree_add_rollback.py`              | `worktree add` rollback                                                              | `C-recovery` — failure witnesses observe retained work, not just absence of new state                                                              |
-| `tests/test_worktree_add_rollback_unexpected.py`   | Rollback on unexpected errors                                                        | `C-recovery` — same coverage over unexpected exception types                                                                                       |
-| `tests/test_joined_checkout_rollback.py`           | Joined-checkout rollback                                                             | `C-recovery` — rollback removes only self-created state; foreign work retained                                                                     |
-| `tests/test_manifest_atomic.py`                    | Atomic manifest writes                                                               | `C-recovery` — compound record serialization across manifest and checkout state                                                                    |
-| `tests/test_manifest_errors.py`                    | Manifest error envelopes                                                             | `C-recovery`, `C-identity` — corrupt retained state reported truthfully                                                                            |
-| `tests/test_oserror_envelope.py`                   | `OSError` envelopes                                                                  | `C-recovery` — partial-effect truthfulness at filesystem failure sites                                                                             |
-| Manual CLI scenarios                               | Host CLI checks under Running the control                                            | `C-pull`, `C-unmap` — the preservation scenario is added; existing scenarios unchanged                                                             |
-
-### Retained families
-
-| Family                                      | Responsibility                                                          | Revalidation note                                                                                             |
-| ------------------------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `tests/test_ambient_env_scrub.py`           | `GIT_*` scrub pins                                                      | Revalidated per affected producer; ambient context is itself a wrong-target witness vector                    |
-| `tests/test_consumer_path_containment.py`   | `.gf`/`.git` segment refusals                                           | Observer                                                                                                      |
-| `tests/test_forged_root_adoption.py`        | Forged owning-root refusal                                              | Observer; feeds identity witnesses                                                                            |
-| `tests/test_symlinked_gf_storage.py`        | `.gf` resolve-to-self                                                   | Observer                                                                                                      |
-| `tests/test_subfolder.py`                   | Gap pins: prune survival, URL forms, schema keys, no host branch        | Observer                                                                                                      |
-| `tests/test_checkout_key.py`                | `ref=` checkout keys                                                    | Observer; revalidate only if the admitted retention schema re-keys checkouts                                  |
-| `tests/test_checkout_replumb.py`            | Spec-derived whole-repo seam pins                                       | Observer; re-derived only where an amended clause changes the pinned clause                                   |
-| `tests/test_passthrough.py`                 | `gf sh`/`git`/`diff`/`log` boundary                                     | Observer; passthrough stays a deliberate-user surface whose context binding `C-identity` revalidates          |
-| `tests/test_realpath_discovery.py`          | Seeded-layout discovery/selection                                       | Observer                                                                                                      |
-| `tests/test_chdir_logical_cwd.py`           | `-C` logical cwd                                                        | Observer                                                                                                      |
-| `tests/test_env_guard.py`                   | Transport guard                                                         | Observer                                                                                                      |
-| `tests/test_error_fields.py`                | Error name/path/operation fields                                        | Observer; refusal witnesses reuse the envelope contract                                                       |
-| `tests/test_host_inputs.py`                 | Default-branch pin proof                                                | Observer                                                                                                      |
-| `tests/test_platform.py`                    | Platform primitives                                                     | Observer                                                                                                      |
-| `tests/test_runner.py`                      | Runner modes                                                            | Observer                                                                                                      |
-| `tests/test_runner_non_utf8.py`             | Runner decode pins                                                      | Observer                                                                                                      |
-| `tests/test_non_utf8_envelope.py`           | Non-UTF-8 envelopes                                                     | Observer; corrupt-state witnesses extend it                                                                   |
-| `tests/test_non_utf8_worktree_record.py`    | Corrupt worktree record                                                 | Observer; extended by `O-recovery`                                                                            |
-| `tests/test_sparse_dir_names.py`            | Sparse-cone name collisions                                             | Observer                                                                                                      |
-| `tests/test_upstream_gf_tree.py`            | Hostile upstream `.gf` pins                                             | Observer; revalidated against rewritten `_apply_ref`/`ensure_*` producers                                     |
-| `tests/fixtures/tmp/`                       | Per-test scratch root                                                   | Mechanism unchanged; witness fixtures live here                                                               |
-
-### Candidate new families
-
-Gaps the current families do not cover are assigned to new preservation families, created under verification ownership; the split below is indicative, not contractual:
-
-| Candidate family                        | Obligations covered                                                                                               |
-| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `tests/test_preservation_update.py`     | `O-update`, `O-refusal`, `O-fetch` — update integration, refusal, and fetch witnesses in both forms               |
-| `tests/test_preservation_unmap.py`      | `O-unmap`, `O-reconnect` — unmap lifetime and reconnection witnesses in both forms                                |
-| `tests/test_preservation_identity.py`   | `O-identity`, `O-resolver` — wrong-target and ambient-context witnesses                                           |
-| `tests/test_preservation_recovery.py`   | `O-recovery`, `O-concurrency`, `O-records` — interruption, concurrency, corrupt-state, and permission witnesses   |
-
-## Mock backend contract
-
-`MockGitBackend` in `tests/mock_git.py` supports the commands `gf` uses in CLI permutation tests:
-
-- `init` / `init --bare`
-- `ls-remote <url>` answering for repository URLs and failing for other prefixes
-- `remote add/set-url`
-- `remote set-head`
-- `fetch` / `fetch --filter=<filter>`
-- `config --get remote.origin.fetch`
-- `config remote.origin.fetch <refspec>`
-- `rev-parse HEAD/--short/--abbrev-ref`
-- `show-ref --verify`
-- `symbolic-ref`
-- `checkout` (`checkout -B`/`-f` spellings remain in the mock's vocabulary only so CLI-shape tests can assert no producer issues them — under GF-D16 a producer emitting either is a defect)
-- `merge --ff-only`
-- `status --porcelain`, including a pathspec scope after `--`
-- `stash push -u -m <msg>` / `stash pop --index`
-- `worktree list --porcelain`
-- `worktree add [--no-checkout] [--detach] <path> <ref>`
-- `worktree lock [--reason <r>] <path>` / `worktree unlock <path>`
-- `worktree remove [--force] <path>`
-- `sparse-checkout set --cone <dirs...>`
-
-The mock also models the shared-store semantics the feature depends on: refs are shared across worktrees of one common dir, a second checkout of one branch in one store fails as git does, and a fetch call log is kept so tests can assert one fetch per repo store. New git commands used by `gf` must be added to the mock before they can be tested by CLI permutation tests.
-
-Under this Change the mock is `rewrite` disposition: new verbs land only where an admitted CLI-shape change requires them, under verification ownership. A preservation claim never rests on `MockGitBackend` — its in-memory model cannot prove ref reachability, stash restoration, or index partition — so the double boundary stops at CLI-shape branches that do not touch preservation semantics.
-
-## Fixture isolation
-
-`conftest.py` overrides `tmp_path` so every test creates files under `tests/fixtures/tmp/<uuid>`. `tests/fixtures/tmp/` is in `.gitignore`. No test may write to `/tmp` or the real filesystem outside its fixture.
-
-Preservation witnesses keep the same boundary: fixtures mint real repositories, commits, and files inside the fixture root, and the fixture-minted SHAs and bytes are the exact-comparison source for the oracle. Fault injection — signals to spawned subprocesses, planted corrupt state, permission denial, parallel writers — stays inside fixture-owned trees and processes. `deny_file_transport` pins transport denial wherever a case needs it.
-
-## Verification checklist
-
-- [ ] `uv run pytest -x` passes on Linux
-- [ ] `uv run pytest -x` passes on macOS with a virtual environment created on that host
-- [ ] The CLI, subfolder, and preservation CLI scenarios pass on each supported host
-- [ ] Every affected public observer has an admitted criterion and a witness before its code dispatch
-- [ ] Each preservation witness observes the required categories for its scenario class on real git, in both binding forms where its criterion applies
-- [ ] Each `rewrite` family's expectations derive from the admitted amended clauses, not from implementation output or archived probe output
-- [ ] New behavior has an assertion-coupled test at its owning implementation boundary
-- [ ] `docs/gf-spec.md` matches the new behavior
-- [ ] Manual verification matches the expected output for at least one real git repo
-
-## When to use real-git vs mock-git
-
-| Use real-git when...                                                              | Use mock-git when...                                                 |
-| --------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| Testing actual `subprocess.run` git interactions                                  | Testing CLI argument parsing and branch code paths                   |
-| Testing worktree sharing or cross-worktree symlinks                               | Testing error handling and edge permutations                         |
-| Testing refs/tags/branches in real repos                                          | Testing file-system side effects in `pyfakefs`                       |
-| Testing repo stores, sparse checkouts, and links                                  | Testing grouped pull ordering and command routing                    |
-| Testing any preservation claim: bytes, reachability, stash/index, repo identity   | Testing CLI-shape refusal routing that never touches git semantics   |
-
-## Applicability end
-
-This plan applies while Change `DC-DOC-PLAN-007` is active. It ends when the Change is accepted with succession complete, or when it is explicitly abandoned or re-scoped. At succession: the durable strategy sections (control, isolation, mock boundary, profiles, scenario style) transfer to the verification owner's successor surface; the oracle bindings, phase obligations, family dispositions, and criterion gate retire with the Change; and the index owner withdraws or redirects this document's temporal route (`GF-AUTH-007` in [gf-index.md](gf-index.md)). Known `work-loss`, `wrong-target`, or `unusable-provenance` findings block acceptance and never downgrade to residuals. Byte disposition is a separate authorized action.
+| Term                   | Meaning                                                                                                                             |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Candidate              | The source revision, local changes, verification assets, inputs, and environment being evaluated together.                          |
+| Profile                | A repeatable execution and observation boundary used by one or more evidence families.                                              |
+| Evidence category      | A kind of observation that can establish or refute one mapped criterion.                                                            |
+| Verification subject   | The `gf` behavior exercised through its public or specified module boundary.                                                        |
+| Verification component | The independently authored test assets and harness that produce evidence about the subject.                                         |
+| Fixture                | A controlled repository, file tree, environment, or value created for one test and confined to its declared writable root.          |
+| Preservation witness   | A real `gf` operation paired with before-and-after observations of work, repository identity, and usable provenance.                |
+| Permitted variation    | Any result or configuration the governing specification leaves open; tests accept it when the required behavior remains observable. |
+
+## Test Model
+
+Use three complementary levels with named profiles: `unit`, `process-capture`, `cli-shape`, `real-git`, `command`, `raw-ref`, and `host`. Unit evidence checks isolated parsing, resolution, and pure decision rules against specification-owned inputs. Real-Git integration evidence exercises the production Git boundary using repositories and worktrees created inside test fixtures. Command integration evidence starts `gf` through its command entry point and observes actual Git state for selected requirements. In-process CLI permutations with `MockGitBackend` cover argument parsing and CLI-shape branches only. Process creation is admitted where the criterion requires process output, command execution, concurrency, interruption, or a protocol boundary; each profile binds its child processes and cleanup effects. The `process-capture` profile exercises `runner.run_command` with test-authored Python that emits controlled bytes and exit codes. The `raw-ref` profile uses one fixture-owned loopback Git daemon as described under Harness Boundaries.
+
+When a Change needs a maintained verification selection through its acceptance, its temporal test plan records the affected criteria and profiles with their criterion owners, evidence categories, and verification owners. A bounded assignment without a maintained Change-level selection can bind the exact mapped clause, profile, evidence category, inputs, and owner in its execution handoff. Isolated evidence answers only the isolated obligation it covers; it does not complete an integrated obligation. A mock result never proves Git behavior or protected-work preservation.
+
+| Evidence family          | Violating witness                                                                                                              | Benign variation                                                                                                                            |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Input and model          | A malformed manifest, unresolved target, or invalid path is accepted or misdirected.                                           | Fixture names, safe path spellings, and local URLs vary while the specification's identity and containment rules still hold.                |
+| Repository state         | A required ref, staged partition, file, checkout identity, or reachable commit is missing or changed.                          | Fixture-minted commit IDs, file bytes, branch names, and valid subfolder paths vary within the specification.                               |
+| Preservation             | A completion, refusal, or recovery loses protected state, mutates another repository, or leaves retained work unusable.        | The fixture supplies different protected bytes and valid refs; the observations follow the same specified ownership and reachability rules. |
+| Command and refusal      | The public command has the wrong effect, exit class, or truthful state report, or refusal changes protected state.             | Unspecified message wording and output order may vary; specified fields, exit behavior, state, and recovery meaning may not.                |
+| Process capture          | The captured child output raises a decode traceback, changes the child's exit status, or corrupts a fixed byte observation.    | ASCII output and child exit codes remain exact; raw bytes are decoded according to the specification.                                       |
+| CLI shape                | A producer emits a forbidden Git command or accepts a removed option through the mock seam.                                    | Options and input forms vary only where the specification admits them.                                                                      |
+| Concurrency and recovery | A writer bypasses the shared lock, loses one concurrent update, or leaves the next writer blocked after its lock holder exits. | Scheduling order and delay vary; all completed writers remain represented and a terminated holder releases only its own lock.               |
+| Host control             | The candidate, host, Git floor, or required scenario is not the one the receipt names.                                         | Linux and macOS tool versions vary within supported bounds; subfolder evidence still uses Git 2.35 or newer.                                |
+
+A preservation witness compares the exact before-and-after state through real Git and the fixture filesystem. It observes protected file bytes; refs and commit reachability; staged and unstaged index partition plus stashes; repository, store, checkout, and worktree identity; and whether the resulting repository or mapping can use the retained work. A reflog-only commit, matching bytes under the wrong repository, or an unusable reconnect path is a failure. Completion also proves the intended effect occurred. Refusal proves nonzero status, the required `gf:` error information, and unchanged protected state. Recovery proves retained state and truthful partial effects and next steps.
+
+## Acceptance Map
+
+Each row maps one acceptance obligation to its governing specification clause, one acceptance kind, one evidence category, one profile, and the independent verification implementation owner. The temporal test plan selects the rows affected by a Change.
+
+| Authoritative criterion                                                                                    | Kind       | Evidence category        | Profile         | Evidence owner                    |
+| ---------------------------------------------------------------------------------------------------------- | ---------- | ------------------------ | --------------- | --------------------------------- |
+| [Host platform](gf-spec.md#host-platform)                                                                  | isolated   | Host control             | host            | verification implementation owner |
+| [Public surface](gf-spec.md#public-surface)                                                                | integrated | Command and refusal      | command         | verification implementation owner |
+| [Global `-C` behavior](gf-spec.md#global--c-vs-git--c-ambiguity)                                           | isolated   | CLI shape                | cli-shape       | verification implementation owner |
+| [Physical layout](gf-spec.md#physical-layout)                                                              | isolated   | Repository state         | real-git        | verification implementation owner |
+| [Manifest](gf-spec.md#manifest)                                                                            | isolated   | Input and model          | unit            | verification implementation owner |
+| [URL resolution](gf-spec.md#url-resolution)                                                                | isolated   | Repository state         | real-git        | verification implementation owner |
+| [Reference model](gf-spec.md#reference-model)                                                              | isolated   | Repository state         | real-git        | verification implementation owner |
+| [`.gf` directory](gf-spec.md#gf-directory)                                                                 | isolated   | Repository state         | real-git        | verification implementation owner |
+| [Parent and child gitignore handling](gf-spec.md#parent-and-child-gitignore-handling)                      | integrated | Command and refusal      | command         | verification implementation owner |
+| [`gf clone`](gf-spec.md#gf-clone-url-path--n-name--b-ref---depth-n---single-branch)                        | integrated | Command and refusal      | command         | verification implementation owner |
+| [`gf pull`](gf-spec.md#gf-pull---rebase---autostash-path)                                                  | integrated | Preservation             | command         | verification implementation owner |
+| [`gf rm`](gf-spec.md#gf-rm-path---all)                                                                     | integrated | Preservation             | command         | verification implementation owner |
+| [`gf status`](gf-spec.md#gf-status-path---remote)                                                          | integrated | Command and refusal      | command         | verification implementation owner |
+| [`gf ls`](gf-spec.md#gf-ls-path)                                                                           | integrated | Command and refusal      | command         | verification implementation owner |
+| [`gf init`](gf-spec.md#gf-init-path--b-ref--n-name---url-url)                                              | integrated | Command and refusal      | command         | verification implementation owner |
+| [`gf sh`](gf-spec.md#gf-sh-command)                                                                        | integrated | Command and refusal      | command         | verification implementation owner |
+| [`gf git`](gf-spec.md#gf-git-args)                                                                         | integrated | Command and refusal      | command         | verification implementation owner |
+| [`gf diff`](gf-spec.md#gf-diff-args)                                                                       | integrated | Command and refusal      | command         | verification implementation owner |
+| [`gf log`](gf-spec.md#gf-log-args)                                                                         | integrated | Command and refusal      | command         | verification implementation owner |
+| [`gf worktree add`](gf-spec.md#gf-worktree-add-path-commit-ish--b-new-branch--b-new-or-existing-branch--f) | integrated | Preservation             | command         | verification implementation owner |
+| [`gf worktree list`](gf-spec.md#gf-worktree-list---porcelain---verbose)                                    | integrated | Repository state         | command         | verification implementation owner |
+| [`gf worktree remove`](gf-spec.md#gf-worktree-remove-path---force)                                         | integrated | Preservation             | command         | verification implementation owner |
+| [Target selection rules](gf-spec.md#target-selection-rules)                                                | isolated   | Repository state         | real-git        | verification implementation owner |
+| [Update algorithm](gf-spec.md#update-algorithm)                                                            | integrated | Preservation             | command         | verification implementation owner |
+| [Drift algorithm](gf-spec.md#drift-algorithm)                                                              | isolated   | Repository state         | real-git        | verification implementation owner |
+| [Security and authority](gf-spec.md#security-and-authority)                                                | integrated | Concurrency and recovery | command         | verification implementation owner |
+| [Error handling](gf-spec.md#error-handling)                                                                | integrated | Command and refusal      | command         | verification implementation owner |
+| [Captured child output decoding](gf-spec.md#error-handling)                                                | isolated   | Process capture          | process-capture | verification implementation owner |
+| [Malformed byte capture envelope](gf-spec.md#error-handling)                                               | integrated | Command and refusal      | raw-ref         | verification implementation owner |
+| [Testing requirements](gf-spec.md#testing)                                                                 | integrated | Host control             | host            | verification implementation owner |
+| [Supported boundaries](gf-spec.md#boundaries)                                                              | integrated | Host control             | host            | verification implementation owner |
+
+## Harness Boundaries
+
+The `tests/` suite is the verification component for the `gf` tool. It consumes the behavior clauses in [the specification](gf-spec.md) and the test seams and mechanism contracts in [the architecture](gf-arch.md). The Python test harness, `pytest`, `pyfakefs`, the real Git executable, and `MockGitBackend` are verification mechanisms; none is a second source of product behavior. `MockGitBackend` is an in-memory double, not a separately managed work product.
+
+| Dimension                                                        | Unit                                                                                                    | Process-capture                                                                                                        | CLI-shape                                                                                            | Real-Git                                                                                                         | Command                                                                                                                | Raw-ref loopback                                                                                                                                                                     | Host control                                                                                      |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| Permitted execution mechanisms                                   | In-process Python and `pyfakefs` for isolated functions.                                                | `runner.run_command` with test-authored Python children that emit controlled bytes and exit codes.                     | In-process Python, `pyfakefs`, and `MockGitBackend` for argument and dispatch behavior.              | Test process plus the real Git CLI.                                                                              | Candidate `gf` entry point and real Git CLI; concurrency cases may start a Python lock-holder helper.                  | Candidate `gf` process, Git CLI, and the fixture-owned `git-daemon`.                                                                                                                 | `uv run pytest -x`, candidate interpreter, and installed test tools.                              |
+| Process creation and process boundary                            | No child process.                                                                                       | Only the named `runner.run_command` Python child; no daemon or Git process.                                            | No child process; the mock never spawns Git.                                                         | Git subprocesses operate only on fixture repositories.                                                           | `gf`, Git, and criterion-required Python helpers use the fixture working directory; tests own and reap child PIDs.     | Daemon, `gf`, and Git child processes are fixture-owned and reaped by fixture teardown.                                                                                              | Local runner and its declared test processes only.                                                |
+| Network access                                                   | External network prohibited.                                                                            | External network prohibited.                                                                                           | External network prohibited.                                                                         | External network prohibited; use local bare repositories or fixture paths.                                       | External network prohibited; fixture Git configuration refuses network transports.                                     | Only `git://127.0.0.1:<ephemeral-port>` to the fixture-owned daemon; no external network.                                                                                            | External network prohibited; the raw-ref profile is loopback-only.                                |
+| External or autonomous runtime                                   | None.                                                                                                   | No external runtime; only the candidate Python interpreter as a local child.                                           | None.                                                                                                | None.                                                                                                            | None.                                                                                                                  | No external runtime; only the test-owned local daemon process for this profile.                                                                                                      | None beyond the selected host, `uv`, candidate interpreter, pytest, and installed Git.            |
+| Credentials, named environment, home, and external configuration | No credentials, host user home, or host Git configuration.                                              | Use the harness-supplied environment and synthetic `HOME`; the fixed child code reads and emits no environment values. | Same isolated fixture environment as unit tests.                                                     | Synthetic Git identity, per-test `HOME`, isolated `XDG_CONFIG_HOME`, and `GIT_CONFIG_NOSYSTEM=1`.                | Same fixture settings; tests may supply explicit `GIT_*` adversarial values to verify scrubbing.                       | Synthetic fixture `HOME`; temporary Git config permits the loopback protocol only for this fixture; no credentials or host configuration.                                            | Use local tool paths and record versions; never read secrets or host user configuration.          |
+| Fixture and data sources, writes, effects, and cleanup           | `pyfakefs` or the test's unique `tests/fixtures/tmp/<id>` tree; clean only that tree.                   | The child emits test-authored bytes and creates no files; surrounding test data stays in its fixture root.             | `pyfakefs`; the unique fixture tree is the only real writable root.                                  | Local repository, checkout, and files are created under the unique fixture root and removed after the case.      | All repositories, scenario data, and outputs stay under the unique fixture root; cleanup removes only that run's tree. | `tmp_path` is the data root; pytest may allocate a unique factory candidate eagerly, used for raw-byte data only if the `tmp_path` capability probe fails; no supplied `--basetemp`. | Manual scenarios use the same fixture root and clean only their own run directory.                |
+| Exact-versus-variable oracle authority                           | Expected values come from one specification clause and fixture-authored inputs, never candidate output. | Assert exact decoded output and exit code fixed by the capture contract; use test-authored bytes.                      | Exact command shape only where the specification fixes it; otherwise accept its permitted variation. | Compare fixed refs, bytes, and state exactly; allow only specification-permitted names and formatting variation. | Compare specified exit, state, and message fields; allow unspecified output wording and order.                         | Require exact replacement decoding and a `gf:` error without traceback; skip only the raw-byte integration arm when the host filesystem cannot preserve its fixture.                 | Bind evidence to the exact candidate, command, host, Git version, fixture, and selected criteria. |
+| Semantic or behavioral observation                               | Observe the owning function's specified result.                                                         | Observe captured stdout/stderr text and child status at the real process boundary.                                     | Observe argument parsing, dispatch, and CLI-shape assertions only.                                   | Observe actual Git state independently of `gf`.                                                                  | Observe `gf` exit/output with real files, refs, index, stash, links, checkout records, and reachability as applicable. | Observe the daemon's raw ref response and candidate process's decoded envelope; reap the daemon and clean only its fixture-owned paths.                                              | Record full control status and manual assertions; counts alone do not prove behavior.             |
+
+The `process-capture` profile permits only the named `runner.run_command` Python child boundary; the `raw-ref` profile permits only its fixture-owned loopback daemon. Other profiles receive no process or network permission from those exceptions. A test double or isolated profile may establish only the branch or value behavior it exercises. Every claim about Git's refs, worktrees, index, stash, repository identity, preservation, or recovery requires real-Git integration evidence. The fixture Git configuration denies external transports by default and isolates the Git default branch and configuration. Only the raw-ref profile temporarily enables the fixture-owned loopback daemon; it contacts no external network.
+
+## Evidence
+
+The full-suite control is `uv run pytest -x` from the `git-folders` project root. Run it on Linux and macOS with a virtual environment created on each host. Record the candidate, test-asset revision, host and operating-system version, Python and pytest versions, Git version, command, exit code, pass and skip counts, and the reason for each skip. A skip is limited to a named environment capability required by that evidence family, such as a filesystem unable to preserve a raw-byte filename, a missing local `git-daemon` or loopback listener, or a non-UTF-8 process locale for the replacement-character assertion. Record the exact reason and keep all independent unit or command observations running.
+
+For subfolder-binding behavior, the supported Git floor is 2.35. Evidence for that profile must run the selected subfolder obligations with Git 2.35 and record the observed version. Current-host runs supplement that floor result. Whole-repo behavior has no additional Git minimum beyond the supported environment described by the specification.
+
+Manual command evidence uses local bare repositories only; the raw-ref integration profile uses its fixture-owned loopback daemon for the malformed-byte response. It records the exact candidate and commands, fixture setup, expected exit and output facts, and post-operation file, ref, index, stash, checkout, and link observations required by the selected acceptance map. Preservation assertions use a real Git observation path independent of the command under test. Store executed tests, scripts, and per-run receipts with the verification implementation and evidence owner; this strategy records no run result or acceptance disposition.
+
+## Boundaries
+
+Product semantics belong to [the specification](gf-spec.md), mechanisms and seam rationale to [the architecture](gf-arch.md), and prohibited failure patterns to [the constraints](gf-constraints.md). A temporal test plan selects this strategy for one Change; a temporal test matrix expands that selection into cases. Tests, fixtures, mock behavior, manual scripts, and run receipts remain with the verification implementation and evidence owners. The architecture owner and coordinator make their separate receiving decisions; passing evidence does not itself grant acceptance.

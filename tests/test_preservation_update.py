@@ -41,9 +41,10 @@ Expected behavior derives only from the admitted documents:
 - gf-arch.md GF-D16 / GF-D23 + P1 gate: `merge --ff-only` attach
   integration; `checkout -B`/`checkout -f`/`pull --force` are gone — an
   unsafe transition refuses rather than falling back to them; before a
-  transition that could orphan the outgoing HEAD (and on the diverged
-  refusal) the per-checkout retention ref `refs/worktree/gf-retained`
-  holds the outgoing HEAD.
+  transition that could orphan the outgoing HEAD, an immutable
+  per-checkout retention ref `refs/worktree/gf-retained-commits/<sha>`
+  durably names that tip. Early refusal preserves the existing branch
+  and needs no extra retention write.
 
 Nothing in this file consults `src/gf/` to decide expected behavior.
 """
@@ -51,6 +52,7 @@ Nothing in this file consults `src/gf/` to decide expected behavior.
 import os
 import re
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -189,10 +191,10 @@ def _head_of(gitdir: Path) -> str:
     return _out("--git-dir", gitdir, "rev-parse", "HEAD")
 
 
-def _retained(gitdir: Path) -> str | None:
-    """`refs/worktree/gf-retained` in this gitdir, or None."""
+def _retained(gitdir: Path, sha: str) -> str | None:
+    """`refs/worktree/gf-retained-commits/<sha>` in this gitdir, or None."""
     r = _git("--git-dir", gitdir, "rev-parse", "--verify", "-q",
-             "refs/worktree/gf-retained", check=False)
+             f"refs/worktree/gf-retained-commits/{sha}", check=False)
     return r.stdout.strip() if r.returncode == 0 else None
 
 
@@ -555,6 +557,445 @@ def test_pull_dirty_refuses_all_served_bindings_shared_checkout(
 
 
 # ---------------------------------------------------------------------------
+# refusal + autostash — the ignored-work gate (spec `gf pull` update
+# algorithm: "an ignored file that sits at a path the incoming
+# transition would write ... counts as dirty, since git
+# checkout/merge silently overwrite ignored files by default"; the
+# shared-checkout bullet applies the same check per checkout; the
+# `--autostash` arm must `stash push -a` so ignored files are carried)
+#
+# Verified against real git before authoring: `git merge --ff-only`
+# overwrites an ignored file at a colliding path SILENTLY (rc=0, no
+# warning), and `git stash pop --index` cannot restore a stashed
+# ignored file over a path the update has meanwhile made TRACKED —
+# "already exists, no checkout" — so the colliding autostash arm takes
+# the documented pop-failure contract: the named `gf autostash` entry
+# is retained and reported, and clearing the obstruction plus a manual
+# `git stash pop --index` lands the user's bytes (gf-troubleshooting
+# "gf pull --autostash could not restore my changes").
+
+
+def _upstream_ignored_cfg(tmp_path: Path, name: str = "upcfg") -> Path:
+    """Bare upstream seeding `.gitignore` covering `config.local` and
+    the `build/` DIRECTORY — a ROOT file, so it is materialized in
+    every cone checkout too — plus the usual docs/api + tools trees.
+    The trailing-slash form ignores only directories, so an upstream
+    FILE committed at path `build` needs no `-f`."""
+    up = tmp_path / name
+    _git("init", "-q", "--bare", str(up))
+    work = tmp_path / f"_seed_{name}"
+    _git("clone", "-q", str(up), str(work))
+    (work / "docs" / "api").mkdir(parents=True)
+    (work / "docs" / "api" / "x.txt").write_text("api on master\n")
+    (work / "tools").mkdir()
+    (work / "tools" / "t.txt").write_text("tool on master\n")
+    (work / ".gitignore").write_text(
+        "ignored.txt\nconfig.local\nbuild/\n")
+    _git("-C", work, "add", "-A")
+    _git("-C", work, "commit", "-qm", "init")
+    _git("-C", work, "push", "-q", "origin", "master")
+    return up
+
+
+def _advance_adding(up: Path, tmp_path: Path, path: str, content: str,
+                    tag: str) -> str:
+    """Push one commit to master force-adding `path` (it is covered by
+    `.gitignore`, so the tracked write needs `-f`) — the incoming
+    transition that collides with a locally ignored file."""
+    work = tmp_path / f"_adv_{tag}"
+    _git("clone", "-q", str(up), str(work))
+    target = work / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content)
+    _git("-C", work, "add", "-f", path)
+    _git("-C", work, "commit", "-qm", tag)
+    _git("-C", work, "push", "-q", "origin", "master")
+    return _out("-C", work, "rev-parse", "HEAD")
+
+
+def test_pull_ignored_collision_refuses_preserving_ignored_work(
+        tmp_path):
+    """refusal · whole-repo · ignored-work gate: an ignored file at a
+    path the incoming transition writes counts as dirty — `gf pull`
+    without `--autostash` refuses exit 3 in the `gf:` envelope, the
+    child's bytes/HEAD/index/stash are unchanged, and the ignored file
+    keeps the user's bytes (the silent-overwrite hazard the gate
+    exists to refuse)."""
+    up = _upstream_ignored_cfg(tmp_path)
+    parent = _parent(tmp_path)
+    gf("-C", str(parent), "clone", str(up), "vendor/lib")
+    child = parent / "vendor" / "lib"
+    ignored = child / "config.local"
+    ignored.write_text("USER ignored bytes\n")
+    assert "!! config.local" in _child_git(
+        child, "status", "--porcelain", "--ignored").stdout
+    before = _cap_child(child)
+    _advance_adding(up, tmp_path, "config.local", "UPSTREAM config\n",
+                    "cfg")
+
+    r = gf("-C", str(parent), "pull", check=False)
+    assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
+    err = _envelope(r, "lib", "vendor/lib")
+    assert "dirty" in err.lower() or "uncommitted" in err.lower() \
+        or "ignored" in err.lower(), err
+
+    after = _cap_child(child)
+    for key in ("bytes", "porcelain", "staged", "stash", "head"):
+        assert after[key] == before[key], key
+    # the mirror ref may have advanced — resolving the incoming
+    # transition is what names the collision; a fetch is a legitimate
+    # retained partial effect
+    assert ignored.read_text() == "USER ignored bytes\n"
+
+
+def test_pull_ignored_collision_autostash_retains_stash_and_recovers(
+        tmp_path):
+    """recovery · whole-repo · ignored-work gate + `--autostash`:
+    `stash push -a` carries the ignored file (verified recoverable,
+    which is exactly what `-u` would lose), the update lands the
+    colliding tracked path, and `stash pop --index` then hits the
+    documented failure — 'already exists, no checkout' — leaving the
+    named `gf autostash` entry retained and reported rather than
+    dropped (gf-arch update algorithm; gf-troubleshooting). Clearing
+    the obstruction and re-running `git stash pop --index` lands the
+    user's ignored bytes."""
+    up = _upstream_ignored_cfg(tmp_path)
+    parent = _parent(tmp_path)
+    gf("-C", str(parent), "clone", str(up), "vendor/lib")
+    child = parent / "vendor" / "lib"
+    ignored = child / "config.local"
+    ignored.write_text("USER ignored bytes\n")
+    new_tip = _advance_adding(up, tmp_path, "config.local",
+                              "UPSTREAM config\n", "cfg")
+
+    r = gf("-C", str(parent), "pull", "--autostash", check=False)
+    err = r.stderr + r.stdout
+    # the pop failure is reported, not swallowed — nonzero with the
+    # stash/recovery named
+    assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)
+    assert "stash" in err or "pop" in err, (
+        f"pop failure unreported:\n{err}")
+    # whatever the outcome, `stash push -a` must never carry `.gf` —
+    # the child's own gitdir is repository identity, not work bytes
+    assert (child / ".gf" / "git" / "HEAD").is_file(), (
+        "the pull stashed/carried away the child's own .gf gitdir")
+    # update landed; the colliding path now carries upstream's bytes
+    # on disk and is tracked
+    assert _head_of(child / ".gf" / "git") == new_tip
+    assert ignored.read_text() == "UPSTREAM config\n"
+    # the named autostash entry is retained — and provably carries the
+    # ignored file (the `-a` guarantee: `stash@{0}^3` is the
+    # untracked/ignored-files commit)
+    stash = _stash_list(child)
+    assert "gf autostash" in stash
+    carried = _child_git(
+        child, "cat-file", "-p", "stash@{0}^3:config.local")
+    assert carried.stdout == "USER ignored bytes\n"
+
+    # documented recovery: user clears the obstruction, re-runs pop
+    os.remove(ignored)
+    p = _child_git(child, "stash", "pop", "--index")
+    assert p.returncode == 0, p.stderr
+    assert ignored.read_text() == "USER ignored bytes\n"
+    assert _stash_list(child) == ""
+
+
+def test_pull_ignored_noncollision_pulls_normally(tmp_path):
+    """completion · whole-repo · regression: the gate is
+    COLLISION-scoped — an ignored file whose path the incoming
+    transition does not write must not count as dirty: a normal
+    (non-autostash) pull succeeds and the ignored bytes are
+    untouched."""
+    up = _upstream_ignored_cfg(tmp_path)
+    parent = _parent(tmp_path)
+    gf("-C", str(parent), "clone", str(up), "vendor/lib")
+    child = parent / "vendor" / "lib"
+    ignored = child / "config.local"
+    ignored.write_text("USER ignored bytes\n")
+    new_tip = _advance_adding(up, tmp_path, "docs/api/new.txt",
+                              "upstream sibling\n", "sib")
+    before = _cap_child(child)
+
+    r = gf("-C", str(parent), "pull", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+
+    after = _cap_child(child)
+    assert after["head"] == new_tip
+    assert ignored.read_text() == "USER ignored bytes\n"
+    assert (child / "docs" / "api" / "new.txt").read_text() == \
+        "upstream sibling\n"
+    assert after["stash"] == before["stash"] == ""
+    assert "!! config.local" in _child_git(
+        child, "status", "--porcelain", "--ignored").stdout
+
+
+def test_pull_subfolder_ignored_collision_refuses_checkout_unchanged(
+        tmp_path):
+    """refusal · subfolder · ignored-work gate: one ignored file inside
+    a mapped subdir at a path the incoming transition writes counts
+    the whole shared checkout as dirty — exit 3, no `Pulled` line for
+    either binding the checkout serves, HEAD and every byte unchanged,
+    consumer links intact."""
+    up = _upstream_ignored_cfg(tmp_path)
+    parent = _parent(tmp_path)
+    _clone_pair(parent, up)
+    co = _co(parent, up, "master")
+    ignored = co.work_tree / "docs" / "api" / "config.local"
+    ignored.write_text("USER ignored bytes\n")
+    assert "!! docs/api/config.local" in _co_git(
+        co, "status", "--porcelain", "--ignored").stdout
+    before = _cap_co(co)
+    _advance_adding(up, tmp_path, "docs/api/config.local",
+                    "UPSTREAM config\n", "cfg")
+
+    r = gf("-C", str(parent), "pull", check=False)
+    assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
+    err = r.stderr + r.stdout
+    assert "gf:" in err, err
+    assert "Pulled" not in r.stdout, r.stdout
+
+    after = _cap_co(co)
+    for key in ("bytes", "porcelain", "staged", "stash", "head"):
+        assert after[key] == before[key], key
+    assert ignored.read_text() == "USER ignored bytes\n"
+    assert (parent / "vendor" / "api").is_symlink()
+    assert (parent / "vendor" / "tools").is_symlink()
+    # the manifest still serves both bindings
+    m = tomllib.loads((parent / "gf.toml").read_text())
+    assert {f["name"] for f in m["git_folder"]} == {"api", "tools"}
+
+
+def test_pull_subfolder_ignored_collision_autostash_retains_and_recovers(
+        tmp_path):
+    """recovery · subfolder · ignored-work gate + `--autostash`: same
+    contract on the shared checkout — `stash push -a` carries the
+    ignored file inside the cone, the update lands the colliding
+    tracked path, pop fails 'already exists', the named `gf autostash`
+    entry stays in the checkout's stash list and is reported; the
+    documented manual recovery lands the user's bytes."""
+    up = _upstream_ignored_cfg(tmp_path)
+    parent = _parent(tmp_path)
+    _clone_pair(parent, up)
+    co = _co(parent, up, "master")
+    ignored = co.work_tree / "docs" / "api" / "config.local"
+    ignored.write_text("USER ignored bytes\n")
+    new_tip = _advance_adding(up, tmp_path, "docs/api/config.local",
+                              "UPSTREAM config\n", "cfg")
+
+    r = gf("-C", str(parent), "pull", "--autostash", check=False)
+    err = r.stderr + r.stdout
+    assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)
+    assert "stash" in err or "pop" in err, (
+        f"pop failure unreported:\n{err}")
+    assert _head_of(co.gitdir) == new_tip
+    assert ignored.read_text() == "UPSTREAM config\n"
+    stash = _co_git(co, "stash", "list").stdout
+    assert "gf autostash" in stash
+    carried = _co_git(co, "cat-file", "-p",
+                      "stash@{0}^3:docs/api/config.local")
+    assert carried.stdout == "USER ignored bytes\n"
+
+    os.remove(ignored)
+    p = _co_git(co, "stash", "pop", "--index")
+    assert p.returncode == 0, p.stderr
+    assert ignored.read_text() == "USER ignored bytes\n"
+    assert _co_git(co, "stash", "list").stdout == ""
+
+
+def test_pull_subfolder_ignored_noncollision_pulls(tmp_path):
+    """completion · subfolder · regression: ignored files whose paths
+    the incoming transition does not write do not block a shared-
+    checkout pull — both bindings report their lines and the ignored
+    bytes stay put."""
+    up = _upstream_ignored_cfg(tmp_path)
+    parent = _parent(tmp_path)
+    _clone_pair(parent, up)
+    co = _co(parent, up, "master")
+    ignored = co.work_tree / "docs" / "api" / "config.local"
+    ignored.write_text("USER ignored bytes\n")
+    new_tip = _advance_adding(up, tmp_path, "docs/api/new.txt",
+                              "upstream sibling\n", "sib")
+
+    r = gf("-C", str(parent), "pull", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+
+    assert _head_of(co.gitdir) == new_tip
+    assert ignored.read_text() == "USER ignored bytes\n"
+    assert (parent / "vendor" / "api" / "new.txt").read_text() == \
+        "upstream sibling\n"
+
+
+# --- ignored-work gate, dir-vs-file shape -----------------------------------
+# `status --porcelain --ignored` collapses a wholly-ignored directory
+# to `!! build/` while `diff --name-only` only ever emits FILE paths,
+# so an ignored `build/` directory colliding with an incoming tracked
+# file `build` needs the dir-prefix arm of the collision matcher —
+# without it, unpack-trees deletes the ignored dir's contents to make
+# room (git's overwrite-ignore default) and the pull "succeeds" while
+# destroying the directory.
+
+
+def test_pull_ignored_dir_vs_incoming_file_refuses_child_unchanged(
+        tmp_path):
+    """refusal · whole-repo · ignored-work gate, dir-vs-file shape:
+    an ignored directory `build/` at a path where the incoming tree
+    carries a tracked FILE `build` collides — exit 3 in the `gf:`
+    envelope naming the collision, the child's bytes/HEAD/index/stash
+    unchanged, every file inside `build/` intact."""
+    up = _upstream_ignored_cfg(tmp_path)
+    parent = _parent(tmp_path)
+    gf("-C", str(parent), "clone", str(up), "vendor/lib")
+    child = parent / "vendor" / "lib"
+    build = child / "build"
+    build.mkdir()
+    (build / "x.log").write_text("log bytes\n")
+    (build / "state.bin").write_bytes(b"\x01\x02state")
+    assert "!! build/" in _child_git(
+        child, "status", "--porcelain", "--ignored").stdout
+    before = _cap_child(child)
+    _advance_adding(up, tmp_path, "build", "upstream file build\n",
+                    "bld")
+
+    r = gf("-C", str(parent), "pull", check=False)
+    assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
+    err = _envelope(r, "lib", "vendor/lib")
+    assert "ignored" in err.lower() or "dirty" in err.lower() \
+        or "uncommitted" in err.lower(), err
+    assert "build" in err, (
+        f"refusal did not name the colliding path:\n{err}")
+
+    after = _cap_child(child)
+    for key in ("bytes", "porcelain", "staged", "stash", "head"):
+        assert after[key] == before[key], key
+    assert (build / "x.log").read_text() == "log bytes\n"
+    assert (build / "state.bin").read_bytes() == b"\x01\x02state"
+
+
+def test_pull_ignored_dir_vs_incoming_file_autostash_retains_stash(
+        tmp_path):
+    """recovery · whole-repo · dir-vs-file + `--autostash`: `stash
+    push -a` carries the ignored directory's contents, the update
+    lands the tracked FILE `build`, and the pop hits the documented
+    'already exists' failure — the named `gf autostash` entry retained
+    and reported, the dir's bytes recoverable by the documented
+    clear-and-pop path. Whatever the outcome the child's `.gf` gitdir
+    must never be stashed away."""
+    up = _upstream_ignored_cfg(tmp_path)
+    parent = _parent(tmp_path)
+    gf("-C", str(parent), "clone", str(up), "vendor/lib")
+    child = parent / "vendor" / "lib"
+    build = child / "build"
+    build.mkdir()
+    (build / "x.log").write_text("log bytes\n")
+    (build / "state.bin").write_bytes(b"\x01\x02state")
+    new_tip = _advance_adding(up, tmp_path, "build",
+                              "upstream file build\n", "bld")
+
+    r = gf("-C", str(parent), "pull", "--autostash", check=False)
+    err = r.stderr + r.stdout
+    assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)
+    assert "stash" in err or "pop" in err, (
+        f"pop failure unreported:\n{err}")
+    # `.gf` is gf-owned metadata, not work — the stash must exclude it
+    assert (child / ".gf" / "git" / "HEAD").is_file(), (
+        "the pull stashed/carried away the child's own .gf gitdir")
+    # update landed; tracked `build` file carries upstream's bytes
+    assert _head_of(child / ".gf" / "git") == new_tip
+    assert build.is_file()
+    assert build.read_text() == "upstream file build\n"
+    # named autostash entry retained, dir bytes provably inside it
+    stash = _stash_list(child)
+    assert "gf autostash" in stash
+    carried = _child_git(
+        child, "cat-file", "-p", "stash@{0}^3:build/x.log")
+    assert carried.stdout == "log bytes\n"
+
+    # documented recovery: user clears the obstruction, re-runs pop
+    os.remove(build)
+    p = _child_git(child, "stash", "pop", "--index")
+    assert p.returncode == 0, p.stderr
+    assert (child / "build" / "x.log").read_text() == "log bytes\n"
+    assert (child / "build" / "state.bin").read_bytes() == \
+        b"\x01\x02state"
+    assert _stash_list(child) == ""
+
+
+def test_pull_subfolder_ignored_dir_vs_incoming_file_refuses(tmp_path):
+    """refusal · subfolder · ignored-work gate, dir-vs-file shape: a
+    wholly-ignored directory inside a mapped subdir, at a path where
+    the incoming tree carries a tracked file, counts the shared
+    checkout dirty — exit 3, no `Pulled` line, HEAD and every byte
+    unchanged, consumer links intact."""
+    up = _upstream_ignored_cfg(tmp_path)
+    parent = _parent(tmp_path)
+    _clone_pair(parent, up)
+    co = _co(parent, up, "master")
+    build = co.work_tree / "docs" / "api" / "build"
+    build.mkdir()
+    (build / "x.log").write_text("log bytes\n")
+    (build / "state.bin").write_bytes(b"\x01\x02state")
+    assert "!! docs/api/build/" in _co_git(
+        co, "status", "--porcelain", "--ignored").stdout
+    before = _cap_co(co)
+    _advance_adding(up, tmp_path, "docs/api/build",
+                    "upstream file build\n", "bld")
+
+    r = gf("-C", str(parent), "pull", check=False)
+    assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
+    err = r.stderr + r.stdout
+    assert "gf:" in err, err
+    assert "Pulled" not in r.stdout, r.stdout
+
+    after = _cap_co(co)
+    for key in ("bytes", "porcelain", "staged", "stash", "head"):
+        assert after[key] == before[key], key
+    assert (build / "x.log").read_text() == "log bytes\n"
+    assert (build / "state.bin").read_bytes() == b"\x01\x02state"
+    assert (parent / "vendor" / "api").is_symlink()
+    assert (parent / "vendor" / "tools").is_symlink()
+
+
+def test_pull_subfolder_ignored_dir_vs_incoming_file_autostash(
+        tmp_path):
+    """recovery · subfolder · dir-vs-file + `--autostash`: same
+    documented pop-failure arm on the shared checkout — `stash push
+    -a` carries the ignored directory, the update lands the tracked
+    file at its path, pop reports the collision and keeps the named
+    `gf autostash` entry; clearing the obstruction and popping by hand
+    lands the dir's bytes."""
+    up = _upstream_ignored_cfg(tmp_path)
+    parent = _parent(tmp_path)
+    _clone_pair(parent, up)
+    co = _co(parent, up, "master")
+    build = co.work_tree / "docs" / "api" / "build"
+    build.mkdir()
+    (build / "x.log").write_text("log bytes\n")
+    (build / "state.bin").write_bytes(b"\x01\x02state")
+    new_tip = _advance_adding(up, tmp_path, "docs/api/build",
+                              "upstream file build\n", "bld")
+
+    r = gf("-C", str(parent), "pull", "--autostash", check=False)
+    err = r.stderr + r.stdout
+    assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)
+    assert "stash" in err or "pop" in err, (
+        f"pop failure unreported:\n{err}")
+    assert _head_of(co.gitdir) == new_tip
+    assert build.is_file()
+    stash = _co_git(co, "stash", "list").stdout
+    assert "gf autostash" in stash
+    carried = _co_git(co, "cat-file", "-p",
+                      "stash@{0}^3:docs/api/build/x.log")
+    assert carried.stdout == "log bytes\n"
+
+    os.remove(build)
+    p = _co_git(co, "stash", "pop", "--index")
+    assert p.returncode == 0, p.stderr
+    assert (co.work_tree / "docs" / "api" / "build" / "x.log"
+            ).read_text() == "log bytes\n"
+    assert _co_git(co, "stash", "list").stdout == ""
+
+
+# ---------------------------------------------------------------------------
 # refusal — diverged branch
 
 
@@ -563,9 +1004,9 @@ def test_pull_diverged_refuses_truthful_and_retains_head(tmp_path):
     1 — the envelope names the folder and reports the truthful
     ahead/behind state plus the deliberate recoveries (`--rebase`);
     HEAD, the local branch, and the index are untouched, the local
-    commit stays reachable from `master`, and the retention ref
-    `refs/worktree/gf-retained` holds the outgoing HEAD (gf-arch.md
-    failure-modes row)."""
+    commit stays durably reachable from `master`. Refusal before any
+    transition needs no extra retention ref because the branch remains
+    the commit's usable name."""
     parent, up, child = _clone_lib(tmp_path)
     local_sha = _commit_child(child, "local.txt", "local commit\n",
                               "local work")
@@ -579,8 +1020,11 @@ def test_pull_diverged_refuses_truthful_and_retains_head(tmp_path):
     low = err.lower()
     # the refusal names the true relation, not a generic failure
     assert "ahead" in low and "behind" in low or "diverg" in low, err
-    # the deliberate recoveries are reported
-    assert "rebase" in low, err
+    # Dirty-work preparation cannot reconcile already-diverged history.
+    # Offer explicit rebase without presenting commit/stash as the remedy.
+    # User-Git integration wording is reviewed semantically, not snapshotted.
+    assert "gf pull --rebase" in low, err
+    assert "commit or stash" not in low, err
 
     after = _cap_child(child)
     # user refs and HEAD unmoved; the mirror ref may have advanced —
@@ -592,9 +1036,9 @@ def test_pull_diverged_refuses_truthful_and_retains_head(tmp_path):
                       "refs/heads/master")
     assert after["porcelain"] == before["porcelain"] == ""
     assert after["stash"] == ""
-    # retention ref holds the outgoing HEAD
-    assert _retained(child / ".gf" / "git") == local_sha, (
-        "refs/worktree/gf-retained:", _retained(child / ".gf" / "git"))
+    # The untouched local branch durably names the outgoing tip.
+    assert _child_git(child, "for-each-ref", "--contains", local_sha,
+                      "--format=%(refname)").stdout.strip()
     # the truthful drift class follows
     s = gf("-C", str(parent), "status", "--remote", check=False)
     assert s.returncode == 0, s.stderr

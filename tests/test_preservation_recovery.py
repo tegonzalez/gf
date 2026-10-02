@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 """P1 preservation witnesses for `gf pull` — recovery class and the
-`refs/worktree/gf-retained` retention mechanism (Change DC-DOC-PLAN-007,
+`refs/worktree/gf-retained-commits/<sha>` retention mechanism (Change DC-DOC-PLAN-007,
 obligations O-recovery / O-update; gf-arch.md GF-D16/GF-D23).
 
 Oracle: docs/gf-testing.md "Preservation witness oracle" — recovery
@@ -28,7 +28,7 @@ Expected behavior derives only from the admitted documents:
 - gf-arch.md GF-D23: before a transition that could orphan the
   outgoing HEAD — attaching or switching branches, a detached move, a
   rebase — the outgoing HEAD is written to the per-checkout retention
-  ref `refs/worktree/gf-retained`; a failed write refuses the
+  ref `refs/worktree/gf-retained-commits/<sha>`; a failed write refuses the
   transition.
 - gf-spec.md "Error handling": exit 1 refused update, 2 network/git
   failure, 3 dirty worktree; partial effects are reported truthfully.
@@ -156,10 +156,10 @@ def _commit_child(child: Path, name: str, content: str,
     return _out("--git-dir", child / ".gf" / "git", "rev-parse", "HEAD")
 
 
-def _retained(gitdir: Path) -> str | None:
-    """`refs/worktree/gf-retained` in this gitdir, or None."""
+def _retained(gitdir: Path, sha: str) -> str | None:
+    """`refs/worktree/gf-retained-commits/<sha>` in this gitdir, or None."""
     r = _git("--git-dir", gitdir, "rev-parse", "--verify", "-q",
-             "refs/worktree/gf-retained", check=False)
+             f"refs/worktree/gf-retained-commits/{sha}", check=False)
     return r.stdout.strip() if r.returncode == 0 else None
 
 
@@ -393,7 +393,7 @@ def test_pull_detached_head_move_writes_retention_ref(tmp_path):
     """recovery · whole-repo: local commits on a detached HEAD carry no
     ref. A pull that moves HEAD off them (attach to `master` + ff) would
     strand them — GF-D23 requires the per-checkout retention ref
-    `refs/worktree/gf-retained` to hold the outgoing HEAD. After the
+    `refs/worktree/gf-retained-commits/<sha>` to hold the outgoing HEAD. After the
     pull the commits are durably reachable through it, never
     reflog-only."""
     parent, _up, child = _clone_lib(tmp_path)
@@ -413,11 +413,11 @@ def test_pull_detached_head_move_writes_retention_ref(tmp_path):
     r = gf("-C", str(parent), "pull", check=False)
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
 
-    assert _retained(gitdir) == stranded, (
-        "expected refs/worktree/gf-retained =", stranded,
-        "got", _retained(gitdir))
+    assert _retained(gitdir, stranded) == stranded, (
+        "expected immutable retention ref =", stranded,
+        "got", _retained(gitdir, stranded))
     # the stranded commit is durably reachable through the retention ref
-    assert _reachable(gitdir, stranded, "refs/worktree/gf-retained")
+    assert _reachable(gitdir, stranded, f"refs/worktree/gf-retained-commits/{stranded}")
     # intended effect: attached to master at the new tip
     assert _out("--git-dir", gitdir, "rev-parse",
                 "--abbrev-ref", "HEAD") == "master"
@@ -433,7 +433,7 @@ def test_pull_rebase_writes_retention_ref_for_outgoing_tip(tmp_path):
     """recovery · whole-repo: `gf pull --rebase` on a diverged branch is
     the explicit recovery — the rebase replays the local commit onto the
     new tip and the outgoing tip is retained under
-    `refs/worktree/gf-retained` (a rebase is a strand-risk transition)."""
+    `refs/worktree/gf-retained-commits/<sha>` (a rebase is a strand-risk transition)."""
     parent, _up, child = _clone_lib(tmp_path)
     old_tip = _commit_child(child, "local.txt", "local commit\n",
                             "local work")
@@ -449,5 +449,5 @@ def test_pull_rebase_writes_retention_ref_for_outgoing_tip(tmp_path):
     assert (child / "local.txt").read_text() == "local commit\n"
     assert _out("--git-dir", gitdir, "rev-parse", "HEAD") != old_tip
     # the outgoing (pre-rebase) tip is durably retained
-    assert _retained(gitdir) == old_tip
-    assert _reachable(gitdir, old_tip, "refs/worktree/gf-retained")
+    assert _retained(gitdir, old_tip) == old_tip
+    assert _reachable(gitdir, old_tip, f"refs/worktree/gf-retained-commits/{old_tip}")

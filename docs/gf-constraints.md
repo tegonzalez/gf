@@ -18,17 +18,29 @@ The manifest schema (`name`, `url`, `ref`, `path`) is intentionally minimal. Reu
 
 For a whole-repo binding, `gf rm` must only unregister the git-folder and convert the child back to a normal git repo by moving `child/.gf/git` to `child/.git`. The rest of the child directory and its contents must remain — every staged, unstaged, untracked, ignored, committed, and stashed change included. The moved gitdir must be an immediately usable ordinary `.git`: `HEAD`, index, refs, and config intact, `origin` still pointing at the real URL, and any `git worktree` entries registered in that gitdir still resolving after the move — `gf` rewrites their path references for the new location or refuses with instructions when a record cannot be reconciled; it never leaves a `.git` that loses or misdirects a registered worktree. The remaining `child/.gf` content is `gf`'s own bookkeeping (such as `state`) and is removed with the binding's registration. For a subfolder binding, `gf rm` removes only the consumer link and the manifest entry; it must not modify anything under `<root>/.gf` — not the checkout, its uncommitted work, its sparse cone, its per-checkout state record, or the repo store — so adding the binding back restores the folder as it was. A dangling or absent consumer link still unregisters cleanly: missing linkage is never a reason to touch retained storage.
 
+The same rule bounds `gf worktree remove`: staged, unstaged, untracked and ignored work inside the target requires refusal before unlinking or removal, even when ordinary status appears clean and even with `--force`; only verified linked-out child symlinks are excluded. Private detached history without a surviving shared name, per-worktree refs and unproven-disposable configuration/metadata also require refusal, because deleting the worktree registration would destroy their provenance. A target worktree that owns `.gf` storage — repo stores, checkouts, binding state, or a child directory carrying `.gf/git` — must be refused, since removing the worktree deletes the storage inside it and unlinking protects only children linked out. `gf` owns no discard of that storage; retiring the worktree is the user's own `git worktree remove`.
+
+Detection signal: a removal that proceeds over protected user files, an ignored file lost on apparently clean removal, or a `worktree remove` path that proceeds while the target's `.gf` holds stores, checkouts, or state, or while a declared child inside the target carries a `.gf` gitdir — or one that unlinks through a target to reach a source.
+
 ## Do not resolve `gf.toml` outside the project root
 
 All commands must discover the parent repo and `gf.toml` through the centralized `_resolve(cwd)` helper. Do not read or write a manifest above the discovered parent root.
 
-## Do not let integration tests touch `tests/fixtures` outside their own fixture
+## Keep test writes inside an owned fixture
 
-`conftest.py` overrides `tmp_path` to `tests/fixtures/tmp/<uuid>`. Tests must not create, modify, or delete files elsewhere in `tests/fixtures` or the real filesystem.
+`conftest.py` overrides `tmp_path` to a unique directory under `tests/fixtures/tmp/`; this is the writable root for each test by default. Tests must not create, modify, or delete files in another fixture's tree, user data, or an arbitrary filesystem location. The raw-byte filename capability case in `tests/test_runner_non_utf8.py` may allocate the unique directory returned by `tmp_path_factory.mktemp("raw-bytes")` as a candidate fallback. It may use that exact returned directory for raw-byte fixture data only when the default `tmp_path` fails its byte-preservation probe; pytest owns cleanup of the allocated candidate. No other case may use it, and a caller-supplied `--basetemp` or another unowned path is not an admitted fixture root.
 
-## Do not use the real network in tests
+Detection signal: a test writes or deletes outside its returned fixture root; the raw-byte case uses the candidate fallback for fixture data when the default root preserves the raw filename; or a test uses an unowned base such as a caller-supplied `--basetemp`.
 
-Tests must use `MockGitBackend` and `pyfakefs`. Real `git` subprocesses are allowed only in the integration tests under `tests/` that explicitly spin up local bare repos.
+Instead: use the per-case `tmp_path` root. For the raw-byte capability case only, allow pytest to allocate its exact `tmp_path_factory` candidate and write the raw-byte fixture there only when the byte-preservation probe fails for `tmp_path`; keep every created repository and file under that returned directory, and leave its lifecycle to pytest.
+
+## Do not use external or unowned networks in tests
+
+Tests must not connect to an external host or an unowned service. Real Git subprocesses may use only repositories created inside an owned test fixture. The sole protocol exception is the raw-byte refname case in `tests/test_runner_non_utf8.py`, which starts its own `git-daemon` on `127.0.0.1` with an ephemeral port to verify captured ref bytes; it creates the daemon's repositories and log inside its fixture, terminates only its daemon, and uses no credentials or Internet connection. One raw-byte refname case in `tests/test_runner_non_utf8.py` may start its own `git-daemon` on `127.0.0.1` with an ephemeral port and use Git's loopback protocol to observe the byte-preserving ref response; the case creates the daemon's repositories and log under its owned fixture root, terminates only its own daemon, and uses no Internet connection or credentials.
+
+Detection signal: a test resolves or contacts an external host, uses a service it did not create, binds beyond loopback, reuses a fixed listener port, or leaves its daemon running or its log outside its fixture.
+
+Instead: use fixture-local repository paths for Git integration; when the malformed-byte response itself is the criterion, use the bounded loopback profile in [the test strategy](gf-testing.md#harness-boundaries).
 
 ## Do not allow `gf` to become a second committer
 
@@ -124,7 +136,7 @@ Instead: write the operation once against the `Checkout` fields — `common_dir`
 
 ## Do not implicitly discard or overwrite user work
 
-Every `gf`-owned operation preserves the user's staged and unstaged changes, untracked and ignored files, local commits and refs, stashes, detached work, and the config and metadata needed to use them. `gf` must not destroy or overwrite any of it as a side effect, and must not offer a flag that does: `gf pull` has no `--force`, because discarding work is the user's own deliberate git action — `git` run through `gf sh`/`gf git`, or files deleted by hand — never a `gf` mode. The same bar covers cleanup and rollback: an operation removes only artifacts it provably created itself; unknown or ambiguous state is retained and reported.
+Every `gf`-owned operation preserves the user's staged and unstaged changes, untracked and ignored files, local commits and refs, stashes, detached work, and the config and metadata needed to use them. `gf` must not destroy or overwrite any of it as a side effect, and must not offer a flag that does: `gf pull` has no `--force`, because discarding work is the user's own deliberate git action — `git` run through `gf sh`/`gf git`, or files deleted by hand — never a `gf` mode. The same bar covers cleanup and rollback: an operation removes only artifacts it provably created itself; unknown or ambiguous state is retained and reported. A placeholder's unborn `HEAD` and empty visible worktree do not establish disposable Git metadata: private refs, dangling objects, changed config, index or stash state must remain intact. A verified initialization snapshot, or equivalent complete pristine proof, is required before placeholder conversion.
 
 Detection signal: `checkout -f`, `reset --hard`, `clean`, `stash drop`/`clear`, `branch -f`/`tag -f`/`update-ref` deletions or forced writes, or a `checkout -B`/`rebase` that can strand or overwrite existing work issued by `gf`-owned code; a remove/rmtree/unlink whose target was not provably created by that invocation; a pull path that proceeds over uncommitted work or a divergence without the user's explicit `--autostash` or `--rebase`.
 
@@ -150,6 +162,6 @@ Instead: create user-visible local branch or tag refs only when absent, advance 
 
 Every `gf` write must land on storage proven to belong to the selected binding: the resolved checkout's `.gf` components must resolve to themselves, a repo store's `remote.origin.url` must key-match the binding's recorded URL resolution, and a consumer path must resolve inside its owning root. A `.gf` anchor that resolves through a link, a store whose origin no longer keys to the recorded resolution, or a consumer path that escapes its owner names another repository's storage — `gf` refuses rather than reading or writing through it.
 
-Detection signal: a `git` write (`config`, `fetch`, `checkout`, `worktree`, a ref update, `stash`) whose `git_dir`/`GIT_DIR`/`GIT_WORK_TREE` was not first verified against the binding's recorded identity, or a mutation that proceeds when an identity check cannot be proven — for example treating an unresolvable realpath as the local target.
+Detection signal: a `git` write (`config`, `fetch`, `checkout`, `worktree`, a ref update, `stash`) whose `git_dir`/`GIT_DIR`/`GIT_WORK_TREE` was not first verified against the binding's recorded identity, a mutation under a lock belonging to another parent's common directory, or a mutation that proceeds when an identity check cannot be proven — for example treating an unresolvable realpath as the local target.
 
-Instead: run the resolve-to-self and recorded-identity checks before any mutation and refuse on a mismatch; where the true target cannot be established, stop and report rather than operate on a guess.
+Instead: run the resolve-to-self and recorded-identity checks and verify that the storage owner shares the invoking parent's Git common directory before any mutation and refuse on a mismatch; where the true target cannot be established, stop and report rather than operate on a guess.

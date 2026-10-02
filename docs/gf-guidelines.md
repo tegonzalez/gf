@@ -28,7 +28,7 @@ When command behavior changes, update `docs/gf-spec.md`, the relevant tests, and
 
 ## Use `MockGitBackend` for new CLI permutation tests
 
-Add in-process tests to `tests/test_cli_permutations.py` using the mock backend. Reserve real-git integration tests for cross-worktree and symlink behavior.
+Add in-process tests to `tests/test_cli_permutations.py` using the mock backend for CLI-shape behavior. Use real Git when a claim depends on repository state, preservation, worktree or symlink behavior, concurrency, process output, or transport semantics; the test strategy binds each such profile to its fixture-owned process and observation boundary.
 
 ## Derive names from the basename
 
@@ -70,11 +70,9 @@ When you are asked to add, fix, or refactor behavior:
 1. Update `docs/gf-spec.md` if the change affects command semantics.
 1. Implement the change in `src/gf/`.
 1. Run `uv run pytest -x`.
-1. For clone/pull/output changes, run a manual check:
+1. For clone/pull/output changes, run the verification-owned CLI preservation witness from the project root with the exact Git binary for the profile:
    ```bash
-   cd /tmp
-   rm -rf smcheck && mkdir -p smcheck && git init smcheck
-   uv run --project /path/to/projects/gf gf -C /tmp/smcheck clone <url> <path>
-   uv run --project /path/to/projects/gf gf -C /tmp/smcheck ls
+   uv run python tests/verify_preservation_cli.py --git /absolute/path/to/git
    ```
+   Supply the absolute path to the installed or Git-floor executable under evaluation; the witness returns its assertions and cleans only its own fixture.
 1. Stage files by name and commit the feature as one commit with a message that names the feature.

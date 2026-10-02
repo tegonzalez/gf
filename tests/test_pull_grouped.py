@@ -218,10 +218,15 @@ def test_pull_one_fetch_per_store_one_apply_per_checkout(tmp_path, capsys):
                if "checkout" in c[0] and c[1].get("git_dir") == admin]
     assert len(applies) == 1, f"applies: {[c[0] for c in applies]}"
 
-    # one dirty check over the shared checkout
-    stats = [c for c in rec.calls
+    # one dirty check over the shared checkout, plus the ignored-work
+    # gate's `--ignored` read of the same checkout (spec Update
+    # algorithm — both are once-per-checkout, never per-binding)
+    stats = [c[0] for c in rec.calls
              if "status" in c[0] and c[1].get("git_dir") == admin]
-    assert len(stats) == 1
+    plain = [c for c in stats if "--ignored" not in c]
+    ignored = [c for c in stats if "--ignored" in c]
+    assert len(plain) == 1, f"status calls: {stats}"
+    assert len(ignored) == 1, f"status calls: {stats}"
 
     assert (parent / "vendor/api/x.txt").read_text().strip() == "api adv"
     assert (parent / "vendor/tools/t.txt").read_text().strip() == "tool adv"

@@ -158,15 +158,16 @@ def test_worktree_remove_force(tmp_path):
     new_parent = tmp_path / "feature"
     gf("-C", str(parent), "worktree", "add", str(new_parent), "-b", "feature")
 
-    # Dirty the worktree so a plain remove would fail; --force should still work.
+    # Force cannot waive the protected-work gate (GF-G10).
     (new_parent / "README").write_text("dirty")
 
     result = gf(
         "-C", str(parent), "worktree", "remove", str(new_parent), "--force",
         check=False,
     )
-    assert result.returncode == 0, result.stderr
-    assert not new_parent.exists()
+    assert result.returncode != 0, result.stderr
+    assert new_parent.exists()
+    assert (new_parent / "README").read_text() == "dirty"
     # Source child preserved.
     assert (parent / "vendor" / "lib" / ".gf" / "git" / "HEAD").is_file()
 
@@ -268,7 +269,7 @@ def test_worktree_remove_refuses_unlisted_path(tmp_path):
 
 
 def test_worktree_remove_restores_symlinks_on_failure(tmp_path):
-    """If `git worktree remove` fails, unlinked git-folder symlinks are restored."""
+    """Dirty-work refusal leaves git-folder symlinks intact."""
     parent, _ = _setup_parent_with_git_folder(tmp_path)
     new_parent = tmp_path / "feature"
     gf("-C", str(parent), "worktree", "add", str(new_parent), "-b", "feature")
@@ -277,14 +278,14 @@ def test_worktree_remove_restores_symlinks_on_failure(tmp_path):
     assert new_child.is_symlink()
     link_target = os.readlink(new_child)
 
-    # Dirty the worktree and try a plain (no --force) remove; git refuses.
+    # Dirty work is refused before any link is unlinked.
     (new_parent / "README").write_text("dirty")
     result = gf(
         "-C", str(parent), "worktree", "remove", str(new_parent),
         check=False,
     )
     assert result.returncode != 0
-    # The symlink was restored after the failed remove.
+    # The original symlink remains intact after refusal.
     assert new_child.is_symlink()
     assert os.readlink(new_child) == link_target
     # The source git-folder child is untouched.

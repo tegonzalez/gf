@@ -22,6 +22,61 @@ def die(msg: str, code: int = 1) -> None:
     sys.exit(code)
 
 
+def _parent_common_dir(parent: Path, backend: GitBackend) -> Path:
+    """Resolve the actual parent-family lock domain, refusing uncertainty."""
+    result = backend.git(
+        "rev-parse", "--git-common-dir", cwd=parent, check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise ValidationError(
+            f"cannot resolve the repository lock for {parent}: "
+            f"git rev-parse --git-common-dir failed"
+            f"{f': {detail}' if detail else ''}")
+    common = Path(result.stdout.strip())
+    if not common.is_absolute():
+        common = parent / common
+    return common.resolve()
+
+
+def _acquire_parent_lock(parent: Path, backend: GitBackend) -> int:
+    """Serialize a mutating command on the parent repository's `gf.lock`.
+
+    `git rev-parse --git-common-dir` at the resolved root names the one
+    gitdir every worktree of the repository shares, so the single
+    `<common dir>/gf.lock` domain covers a mutating command invoked from
+    any worktree — including a pull writing storage under a binding's
+    owning root elsewhere in the worktree set (GF-D20). The returned
+    descriptor is held for the command's whole run; acquisition blocks
+    until a current writer finishes, and a common dir that cannot be
+    resolved or a lock file that cannot be opened refuses with the
+    contended resource named.
+    """
+    common = _parent_common_dir(parent, backend)
+    lock = common.resolve() / "gf.lock"
+    try:
+        return platform.acquire_lock(lock)
+    except OSError as e:
+        raise ValidationError(
+            f"cannot acquire the parent repository lock {lock}: {e}"
+        ) from e
+
+
+def _mutating_command(args) -> bool:
+    """True when the parsed command mutates shared state (GF-D20).
+
+    `clone`, `init`, `pull`, `rm`, `worktree add`, and `worktree remove`
+    serialize on the parent lock; read commands (`status`, `ls`,
+    `worktree list`) and passthroughs (`sh`, `git`, `diff`, `log`) take
+    none — lock-free reads are the design, not a migration state.
+    """
+    if args.command in ("clone", "init", "pull", "rm"):
+        return True
+    return (
+        args.command == "worktree"
+        and getattr(args, "worktree_command", None) in ("add", "remove")
+    )
+
+
 def _get_version() -> str:
     """Return the git-folders package version.
 
@@ -315,6 +370,14 @@ def cmd_pull(args, backend: GitBackend) -> int:
                 folder["name"], folder["path"], "pull",
                 f"consumer path {link_path} resolves to {child}, "
                 f"outside {anchor}"))
+        if anchor.resolve() != parent.resolve():
+            try:
+                if _parent_common_dir(anchor, backend) != _parent_common_dir(parent, backend):
+                    raise ValidationError(
+                        f"storage owner {anchor} belongs to another parent repository; "
+                        f"the held lock for {parent} cannot protect it")
+            except GitFoldersError as e:
+                die(folder_error(folder["name"], folder["path"], "pull", str(e)), code=e.code)
         url = _normalize_url(url, anchor)
 
         if not _looks_remote(url):
@@ -497,14 +560,28 @@ def cmd_rm(args, backend: GitBackend) -> int:
     names = {s["name"] for s in selected}
     kept = [s for s in manifest_data.get("git_folder", []) if s["name"] not in names]
 
+    removed: list[str] = []
     for folder in selected:
         child = parent / folder["path"]
         try:
             shelf.remove_child(child, parent)
         except GitFoldersError as e:
+            # Partial-effect envelope (GF-D21): removals already served
+            # are real effects — name them so the failure reports what
+            # happened, and name what remains: this binding's own state
+            # plus every unprocessed binding is still registered, so a
+            # re-run classifies them instead of guessing.
+            detail = str(e)
+            if removed:
+                detail += (
+                    f" — already removed: {', '.join(removed)}; this "
+                    f"binding and every unprocessed one are still "
+                    f"registered in {manifest.MANIFEST} — re-run `gf rm` "
+                    f"to continue")
             die(folder_error(
-                folder["name"], folder["path"], "rm", str(e)),
+                folder["name"], folder["path"], "rm", detail),
                 code=e.code)
+        removed.append(folder["name"])
 
     # Atomic write (mkstemp + os.replace) shared with clone/init via
     # `write_manifest` — after the removals so a failed `remove_child`
@@ -779,7 +856,9 @@ def cmd_init(args, backend: GitBackend) -> int:
         target.mkdir(parents=True, exist_ok=True)
 
     try:
-        shelf.init_git_folder(layout.resolve_checkout(target), backend=backend)
+        co = layout.resolve_checkout(target)
+        shelf.init_git_folder(co, backend=backend)
+        shelf.record_pristine_placeholder(co, backend)
     except GitFoldersError as e:
         die(folder_error(name, rel, "init", str(e)), code=e.code)
 
@@ -1184,6 +1263,196 @@ def cmd_worktree_list(args, backend: GitBackend) -> int:
     return 0
 
 
+def _gf_subtree_has_content(gf: Path) -> bool:
+    """True when `.gf` dir `gf` holds real content — any non-symlink
+    entry reachable inside it that is not an empty directory.
+
+    A symlinked entry dies with the removed tree while its target
+    survives elsewhere, so it is not carried-away storage. Empty
+    skeleton dirs (`repos/<key>/` residue a cleanup left behind) hold
+    nothing and do not make the `.gf` owned — spec `gf worktree
+    remove`: "a `.gf` left holding nothing — empty or residue skeleton
+    dirs — does not block removal". Real files anywhere beneath — a
+    store's `git/HEAD`, a state file, a checkout's materialized files —
+    do. `os.walk` never descends through symlinked dirs
+    (`followlinks=False`), so the check cannot leave the tree.
+    """
+    for dirpath, _dirnames, filenames in os.walk(gf, followlinks=False):
+        for name in filenames:
+            if not (Path(dirpath) / name).is_symlink():
+                return True
+    return False
+
+
+def _worktree_owned_gf_storage(
+    worktree_path: Path, manifest_data: dict
+) -> list[str]:
+    """Spellings of gf storage inside `worktree_path` its removal destroys.
+
+    Detection is filesystem-first (spec `gf worktree remove`): a `.gf`
+    directory ANYWHERE in the tree holding real content — repo stores,
+    checkouts, binding state, or a child's `.gf` gitdir — is owned
+    storage whether or not a parseable manifest names it, so
+    unmanifested crash residue (GF-D21 retains it for classification)
+    and bindings registered only in the target's own manifest are
+    caught the same way. The walk prunes `.git` trees (repo metadata is
+    never gf storage) and `.gf` interiors (a found `.gf` is counted
+    once), and never follows symlinked dirs, so it cannot leave the
+    target tree — a `.gf` that is itself a symlink is not a carrier:
+    the link dies while its outside target survives.
+
+    The manifest arms still run to NAME the binding a carrier serves.
+    A target `gf.toml` that exists but is a symlink, non-regular, or
+    unparseable fails closed: its declared bindings cannot be
+    enumerated, ownership is ambiguous, and the refusal lists it. A
+    directory the walk cannot list might hide a `.gf` carrier and
+    refuses the same way.
+    """
+    owned: dict[str, str] = {}
+    target_real = Path(os.path.realpath(worktree_path))
+
+    # Arm 1 — the filesystem walk catches every `.gf` carrier,
+    # manifest-declared or not.
+    unreadable: list[str] = []
+
+    def _on_walk_error(err: OSError) -> None:
+        unreadable.append(getattr(err, "filename", None) or str(err))
+
+    for dirpath, dirnames, _files in os.walk(
+            worktree_path, onerror=_on_walk_error, followlinks=False):
+        dirnames.sort()
+        keep: list[str] = []
+        for d in dirnames:
+            p = Path(dirpath) / d
+            if d == ".git":
+                continue  # repo metadata is never gf storage — prune
+            if d == layout.GF_DIR:
+                if not p.is_symlink() and _gf_subtree_has_content(p):
+                    owned[os.path.normpath(str(p))] = str(p)
+                continue  # counted once — never descend a `.gf` interior
+            keep.append(d)
+        dirnames[:] = keep
+    for d in unreadable:
+        owned[os.path.normpath(d)] = (
+            f"{d} (unreadable — a `.gf` carrier inside it cannot be "
+            f"enumerated)")
+
+    # Arm 2 — manifest enumeration, fail closed. The target's own
+    # `gf.toml` may declare bindings the invoking copy does not know
+    # (a bare `git worktree add` followed by `gf clone` there); a
+    # symlinked, non-regular, or corrupt one makes ownership ambiguous.
+    folders = list(manifest_data.get("git_folder", []))
+    target_manifest = worktree_path / manifest.MANIFEST
+    if os.path.lexists(target_manifest):
+        if target_manifest.is_symlink():
+            owned[os.path.normpath(str(target_manifest))] = (
+                f"{target_manifest} (symlinked manifest — declared "
+                f"bindings cannot be enumerated)")
+        else:
+            try:
+                tdata = manifest.read_manifest(worktree_path)
+            except GitFoldersError:
+                owned[os.path.normpath(str(target_manifest))] = (
+                    f"{target_manifest} (unreadable or corrupt "
+                    f"manifest — declared bindings cannot be "
+                    f"enumerated)")
+            else:
+                for folder in tdata.get("git_folder", []):
+                    if folder not in folders:
+                        folders.append(folder)
+    for folder in folders:
+        child = worktree_path / folder["path"]
+        if child.is_symlink() or not child.is_dir():
+            continue
+        if not Path(os.path.realpath(child)).is_relative_to(target_real):
+            continue
+        child_gf = child / layout.GF_DIR
+        if (
+            child_gf.is_dir()
+            and not child_gf.is_symlink()
+            and _gf_subtree_has_content(child_gf)
+        ):
+            # Same carrier the filesystem arm found, now named by its
+            # binding — or a carrier the walk could not have produced a
+            # binding name for.
+            owned[os.path.normpath(str(child_gf))] = (
+                f"git-folder '{folder['name']}' ({child_gf})")
+    return list(owned.values())
+
+
+def _assert_removable_worktree(
+    parent: Path, target: Path, symlinks: list[tuple[Path, str]], backend: GitBackend,
+) -> None:
+    """Prove target work and private Git provenance survive removal."""
+    flags = backend.git("ls-files", "-v", "-z", cwd=target, check=False)
+    if flags.returncode != 0:
+        raise ValidationError(f"cannot enumerate protected index state in {target}; refusing removal")
+    hidden = [entry for entry in flags.stdout.split("\0") if entry and (
+        entry[0].islower() or entry[0] == "S")]
+    if hidden:
+        raise ValidationError(
+            f"worktree remove refused: {target} has assume-unchanged or skip-worktree "
+            f"paths whose work cannot be proven clean: {', '.join(hidden)}")
+    args = ["status", "--porcelain", "--ignored", "--untracked-files=all", "-z", "--", ":(top)"]
+    # Only exact verified linked-out child leaves are dispensable links.
+    args.extend(f":(top,exclude,literal){p.relative_to(target).as_posix()}" for p, _ in symlinks)
+    result = backend.git(*args, cwd=target, check=False)
+    if result.returncode != 0:
+        raise ValidationError(f"cannot enumerate protected work in {target}; refusing removal")
+    if result.stdout:
+        paths = [p for p in result.stdout.split("\0") if p]
+        raise ValidationError(
+            f"worktree remove refused: {target} contains staged, unstaged, untracked "
+            f"or ignored work: {', '.join(paths)}; --force cannot discard it")
+    gitdir = Path(backend.git_capture("rev-parse", "--absolute-git-dir", cwd=target).strip())
+    co = layout.Checkout(gitdir, target, _parent_common_dir(parent, backend), "", gitdir)
+    shelf._assert_no_in_progress_op(co)
+    def empty_refs(path: Path) -> bool:
+        if path.is_symlink() or not path.is_dir():
+            return False
+        return all(empty_refs(child) for child in path.iterdir())
+
+    # Empty native refs directories are residue; any live private ref,
+    # config.worktree or unknown metadata retains this registration.
+    allowed = {"HEAD", "index", "commondir", "gitdir", "logs", "locked", "ORIG_HEAD", "refs"}
+    extra = [p.name for p in gitdir.iterdir() if p.name not in allowed or p.is_symlink()]
+    if (gitdir / "refs").exists() and not empty_refs(gitdir / "refs"):
+        extra.append("refs (private per-worktree refs)")
+    logs = gitdir / "logs"
+    if logs.exists() and (not logs.is_dir() or any(
+        p.name != "HEAD" or p.is_symlink() or not p.is_file() for p in logs.iterdir()
+    )):
+        extra.append("logs (unproven private metadata)")
+    if extra:
+        raise ValidationError(
+            f"worktree remove refused: {target} has private per-worktree Git metadata "
+            f"({', '.join(sorted(extra))}); retain it before deliberate removal")
+    tips = {backend.git_capture("rev-parse", "--verify", "HEAD", cwd=target).strip()}
+    orig = gitdir / "ORIG_HEAD"
+    if orig.exists():
+        tips.add(orig.read_text(errors="replace").strip())
+    head_log = logs / "HEAD"
+    if head_log.exists():
+        for line in head_log.read_text(errors="replace").splitlines():
+            fields = line.split()
+            if len(fields) < 2:
+                raise ValidationError(f"cannot prove {target}'s reflog is disposable; refusing removal")
+            tips.update(fields[:2])
+    for tip in tips:
+        if re.fullmatch(r"0{40}|0{64}", tip):
+            continue
+        if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", tip) is None:
+            raise ValidationError(f"cannot prove {target}'s private Git metadata survives; refusing removal")
+        refs = backend.git_capture(
+            "for-each-ref", "--contains", tip, "--format=%(refname)", cwd=parent,
+        ).splitlines()
+        if not any(ref.startswith("refs/") and not ref.startswith(
+            ("refs/worktree/", "refs/bisect/", "refs/rewritten/")) for ref in refs):
+            raise ValidationError(
+                f"worktree remove refused: {target}'s tip {tip} has no surviving shared "
+                "named ref; retain its private history on a branch or tag first")
+
+
 def cmd_worktree_remove(args, backend: GitBackend) -> int:
     """Remove a parent git worktree, guarding linked git-folder children.
 
@@ -1214,9 +1483,27 @@ def cmd_worktree_remove(args, backend: GitBackend) -> int:
         die(f"{worktree_path} contains the current working directory; "
             f"refusing to remove it")
 
+    # Refuse when the target owns gf storage removal would carry away.
+    # Unlinking protects only linked-out children; `.gf` storage inside
+    # the removed tree dies with it, and gf offers no discard mode —
+    # `--force` forwards to git's own removal force and never waives
+    # this refusal. A `.gf` holding no stores, checkouts, or state is
+    # empty residue and does not block.
+    owned = _worktree_owned_gf_storage(worktree_path, manifest_data)
+    if owned:
+        die(f"worktree remove refused: {worktree_path} owns gf storage "
+            f"removal would destroy: {', '.join(owned)} — remove or "
+            f"relocate the bindings it serves first, or run plain "
+            f"`git worktree remove` yourself (gf does not mediate a "
+            f"deliberate teardown)")
+
     # Capture the symlinks we unlink so they can be restored if
     # `git worktree remove` fails.
     symlinks = shelf.linked_git_folder_symlinks_in_worktree(worktree_path, manifest_data)
+    try:
+        _assert_removable_worktree(parent, worktree_path, symlinks, backend)
+    except GitFoldersError as e:
+        die(str(e), code=e.code)
     for child, _target in symlinks:
         os.unlink(child)
 
@@ -1362,7 +1649,21 @@ def main(argv: list[str] | None = None, backend: GitBackend | None = None) -> in
     # The trailing OSError catch is the completeness net over fs sites a
     # sweep can't exhaustively cover: a raw fs failure still dies with
     # the `gf:` envelope and exit 1 rather than a Python traceback.
+    # GF-D20: a mutating command holds the parent repository's lock
+    # from before its first planning read (the `find_parent_root` walk
+    # only stats `.git` markers — the discovery needed to name the
+    # lock's domain) through command end. The fd must be closed at
+    # command end — a raw descriptor outlives its frame otherwise, and
+    # a second in-process run of a mutating command on the same repo
+    # would deadlock on the lock its own leaked descriptor still holds
+    # (flock is per open-file-description, not per process). A killed
+    # subprocess releases it on exit either way.
+    _lock_fd = -1
     try:
+        if _mutating_command(args):
+            lock_root = manifest.find_parent_root(_logical_cwd())
+            if lock_root is not None:
+                _lock_fd = _acquire_parent_lock(lock_root, real_backend)
         if args.command == "clone":
             return cmd_clone(args, real_backend)
         elif args.command == "pull":
@@ -1394,4 +1695,7 @@ def main(argv: list[str] | None = None, backend: GitBackend | None = None) -> in
         die(str(e), code=e.code)
     except OSError as e:
         die(str(e))
+    finally:
+        if _lock_fd >= 0:
+            os.close(_lock_fd)
     return 0

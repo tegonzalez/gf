@@ -287,6 +287,10 @@ def test_worktree_remove_sweep_unlink_dies_via_main_net(tmp_path):
     up = _upstream(tmp_path, "up", {"x.txt": "x"})
     parent = _parent(tmp_path)
     _setup_gf("-C", str(parent), "clone", str(up), "vendor/lib")
+    # This witness needs a clean target to reach the unlink failure;
+    # copied uncommitted manifest edits are protected earlier by gf.
+    git("add", "gf.toml", cwd=parent)
+    git("commit", "-qm", "record git-folder", cwd=parent)
     wt2 = tmp_path / "wt2"
     _setup_gf("-C", str(parent), "worktree", "add", str(wt2),
               "-b", "feature")

@@ -48,6 +48,42 @@ UPSTREAM_FILES = {
 }
 
 
+def test_explicit_gitdir_and_retention_compare_and_swap(fs, mock_backend):
+    """A working cwd never overrides an explicit gitdir; CAS refuses
+    an already-created ref without replacing its first value."""
+    repo = mock_backend.seed("/store", bare=True)
+    mock_backend.add_commit(repo, SHA1, {"one.txt": "one"})
+    mock_backend.add_commit(repo, SHA2, {"two.txt": "two"}, parents=[SHA1])
+    repo.refs["refs/heads/master"] = SHA1
+    ref = "refs/worktree/gf-retained-commits/" + SHA1
+    created = mock_backend.git("update-ref", ref, SHA1, "0" * 40,
+                               git_dir="/store", cwd="/checkout/nested")
+    assert created.returncode == 0
+    refused = mock_backend.git("update-ref", ref, SHA2, "0" * 40,
+                               git_dir="/store", cwd="/checkout/nested", check=False)
+    assert refused.returncode != 0
+    assert repo.refs[ref] == SHA1
+    assert "/checkout/nested" not in mock_backend.repos
+
+
+def test_revision_replay_edges_and_named_ref_query(fs, mock_backend):
+    """The narrow mock verbs return actual ancestry and names rather
+    than empty success, so CLI refusal routing gets the expected input."""
+    repo = mock_backend.seed("/store", bare=True)
+    mock_backend.add_commit(repo, SHA1, {"one.txt": "one"})
+    mock_backend.add_commit(repo, SHA2, {"two.txt": "two"}, parents=[SHA1])
+    mock_backend.add_commit(repo, SHA3, {"three.txt": "three"}, parents=[SHA2])
+    repo.refs["refs/heads/master"] = SHA3
+    repo.refs["refs/tags/base"] = SHA1
+    replay = mock_backend.git("rev-list", "--reverse", SHA1 + ".." + SHA3, git_dir="/store")
+    assert replay.stdout.splitlines() == [SHA2, SHA3]
+    parents = mock_backend.git("rev-list", "--parents", "-n", "1", SHA3, git_dir="/store")
+    assert parents.stdout.split() == [SHA3, SHA2]
+    names = mock_backend.git("for-each-ref", "--contains", SHA2,
+                             "--format=%(refname)", git_dir="/store")
+    assert names.stdout.splitlines() == ["refs/heads/master"]
+
+
 def _resolve(path) -> str:
     return str(Path(path).resolve())
 

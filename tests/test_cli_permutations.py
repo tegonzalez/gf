@@ -527,7 +527,13 @@ class TestPull:
         before = len(mock_backend.calls)
         gf_inproc("-C", str(parent), "pull", "--autostash", backend=mock_backend)
         new_calls = [c[0] for c in mock_backend.calls[before:]]
-        assert ("stash", "push", "-u", "-m", "gf autostash") in new_calls
+        # `push -a`, not `-u`: ignored files are carried too, and the
+        # `:(exclude).gf` pathspec keeps the child's own gitdir out of
+        # the stash (amended gf-spec `gf pull` autostash bullet)
+        assert (
+            "stash", "push", "-a", "-m", "gf autostash",
+            "--", ":(top)", ":(top,exclude).gf",
+        ) in new_calls
         # `pop --index`: the staged/unstaged partition is part of the
         # work being preserved (gf-spec `gf pull`)
         assert ("stash", "pop", "--index") in new_calls
@@ -1050,9 +1056,19 @@ class TestWorktreeRemove:
         """Seed the parent repo with the main worktree plus a feature worktree."""
         repo = mock_backend._repo(str(parent.resolve()))
         repo.worktrees = []
+        repo.refs["refs/heads/master"] = SHA1
+        repo.refs["refs/heads/feature"] = SHA2
         mock_backend.add_worktree(repo, parent, head=SHA1, branch="master")
         feature = parent.parent / "feature"
-        mock_backend.add_worktree(repo, feature, head=SHA2, branch="feature")
+        wt = mock_backend.add_worktree(repo, feature, head=SHA2, branch="feature")
+        wt.files = {"gf.toml": (parent / "gf.toml").read_text()}
+        wt.indexed = dict(wt.files)
+        wt.worktree = dict(wt.files)
+        admin = parent / ".git" / "worktrees" / "feature"
+        admin.mkdir(parents=True, exist_ok=True)
+        (admin / "HEAD").write_text("ref: refs/heads/feature\n")
+        (admin / "commondir").write_text("../..\n")
+        wt.admin_dir = str(admin)
         return repo, feature
 
     def test_worktree_remove_unlinks_symlinks_and_calls_git(self, fs, gf_inproc, mock_backend):

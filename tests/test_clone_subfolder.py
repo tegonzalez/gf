@@ -1701,7 +1701,7 @@ def test_init_refuses_midpath_gf_segment(tmp_path):
 def test_init_refuses_midpath_gf_segment_in_child(tmp_path):
     """R12-2 child-storage pin: with `sub` a live whole-repo git-folder,
     `gf init sub/.gf/x` is refused by the same envelope — and the child's
-    `.gf` storage is byte-identical (still only `git/`): pre-fix
+    `.gf` storage is byte-identical: pre-fix
     (verified) the init exited 0 after planting a fresh gitdir at
     `sub/.gf/x/.gf/git` INSIDE the child's `.gf`, the shape
     `init_git_folder`'s new `in_gf_tree` arm covers independently of the
@@ -1709,8 +1709,8 @@ def test_init_refuses_midpath_gf_segment_in_child(tmp_path):
     lists it."""
     parent = _real_parent(tmp_path)
     gf("-C", str(parent), "init", "sub")
-    assert sorted(p.name for p in (parent / "sub" / ".gf").iterdir()
-                  ) == ["git"]
+    assert (parent / "sub" / ".gf" / "git" / "HEAD").is_file()
+    assert gf("-C", str(parent / "sub"), "git", "symbolic-ref", "HEAD").stdout.strip().startswith("refs/heads/")
     child_gf_before = _gf_tree(parent / "sub")
     manifest_before = (parent / "gf.toml").read_bytes()
 

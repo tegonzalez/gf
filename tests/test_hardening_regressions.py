@@ -543,6 +543,11 @@ def _tree_bytes(root: Path) -> dict[str, tuple[str, object]]:
         for entry in dirnames + filenames:
             p = Path(dirpath) / entry
             rel = p.relative_to(root).as_posix()
+            if rel == ".git/gf.lock":
+                # The mutating-command serialization lock (GF-D20) is an
+                # admitted write: acquisition precedes dispatch, so even a
+                # refused command leaves the lock file behind.
+                continue
             if p.is_symlink():
                 snap[rel] = ("link", os.readlink(p))
             elif p.is_dir():

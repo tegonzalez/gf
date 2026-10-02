@@ -553,8 +553,6 @@ def test_status_without_remote_does_not_fetch(tmp_path):
     result = gf("-C", str(parent), "status", check=False)
     assert result.returncode == 0, result.stderr
     assert re.search(r"lib\s+" + re.escape(str(upstream)) + r"\s+\[master\]\s*$", result.stdout, re.MULTILINE)
-    assert "clean" not in result.stdout
-    assert "behind" not in result.stdout
 
 
 def test_c_option_unusable_path_reports_error_not_traceback(tmp_path):

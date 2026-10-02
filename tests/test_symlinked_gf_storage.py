@@ -25,6 +25,24 @@ through the link so `gf ls`/`gf status` keep working under a hostile
 `realpath(gitdir) == realpath(child)/.gf/"git"` — the child's own leaf
 may legitimately be a symlink.
 
+R15-F4 follow-on (established-child swap): the resolve-to-self
+predicate originally ran only at creation-time write sites, so a
+whole-repo child whose `.gf` was swapped for a symlink AFTER the
+binding was established — `kid/.gf -> donor/.gf` — still operated
+through the link everywhere else: `update_child`'s dirty check,
+origin write, fetch and checkout ran against the donor's gitdir,
+`remove_child`'s `shutil.move` carried the donor's gitdir to
+`kid/.git` before the rmtree died on the link itself, and the
+`gf git`/`sh`/`diff`/`log` passthroughs ran with GIT_DIR pointed into
+the donor's storage — while `ls`/`status`/`drift` answered with the
+donor's HEAD/branch/porcelain as if they were the child's. The new
+predicate `layout.whole_repo_gitdir_is_real` (the same two-sided
+compare `_init_child_gitdir` used) now gates every operation on an
+established whole-repo child: `update_child` refuses ahead of the
+dirty check, `remove_child` ahead of the move, `_passthrough_target`
+fails closed, and the read paths degrade to `missing`/`?`/empty
+rather than answer through the swap.
+
 Every test drives the real `gf` CLI over local bare upstreams (no
 network, fixture-isolated). Setup/precondition failures stop through
 ``pytest.fail``; claim assertions raise ``AssertionError``.
@@ -33,11 +51,15 @@ Expected discrimination against the pre-fix code: the clone/pull
 write-through arms fail by landing storage in the outside dir (or
 exiting 0), the init arm fails on the missing "resolves through a
 symlink" wording, the teardown arms fail by deleting foreign sentinel
-files through the link. Controls (occupancy refusal on an occupied
-child, the leaf-symlink child, real `.gf` storage, `foo.gf`/`x.git`
-lookalike names, ls/status reads, and the `.gf`-points-outside-parent
-pull) are unchanged pre-fix — they pin the guard's precision and the
-read-side contract.
+files through the link, and the R15-F4 swap arms fail by operating on
+the donor — `rm` relocates the donor's gitdir into `kid/.git`, `pull`
+fetches/checks out through the link, `gf git` prints the donor's sha,
+and ls/status render the donor's identity on the kid row. Controls
+(occupancy refusal on an occupied child, the leaf-symlink child, real
+`.gf` storage, `foo.gf`/`x.git` lookalike names, ls/status reads, the
+`.gf`-points-outside-parent pull, and an ordinary established-child
+pull/rm) are unchanged pre-fix — they pin the guard's precision and
+the read-side contract.
 """
 
 import os
@@ -48,7 +70,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import gf, git
+from conftest import gf, git, push_commit
 from gf import layout, shelf
 from gf.backends import GitCliBackend
 
@@ -580,3 +602,252 @@ def test_ls_and_status_read_through_symlinked_dot_gf(tmp_path):
     assert re.search(
         rf"^api\s+{re.escape(url)}\s+\[\]\s+missing$", r.stdout, re.M), \
         r.stdout
+
+
+# ---------------------------------------------------------------------------
+# Arm 6 — `.gf` swapped for a symlink on an ESTABLISHED whole-repo child
+# (R15-F4). `kid/.gf -> donor/.gf` makes the spelled `kid/.gf/git` resolve
+# into the sibling's storage: `whole_repo_gitdir_is_real`'s two-sided
+# compare fails, so writes refuse and reads degrade. The swap moves the
+# child's own `.gf` wholly OUTSIDE its worktree — a `.gf`-sibling left
+# inside `kid` would be untracked content the through-the-link status
+# would report, changing the shape under test.
+
+
+def _whole_repo_pair(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Two whole-repo children cloned from one upstream — `kid` and
+    `donor` — inside one parent; returns (parent, kid, donor). Same
+    upstream keeps kid's worktree byte-identical to the donor's index,
+    so a through-the-link `status --porcelain` reports clean and a
+    pre-fix pull proceeds past the dirty check into the donor."""
+    up = _upstream(tmp_path, "upstream", API)
+    parent = _parent(tmp_path)
+    _setup_gf("-C", str(parent), "clone", str(up), "kid")
+    _setup_gf("-C", str(parent), "clone", str(up), "donor")
+    return parent, parent / "kid", parent / "donor"
+
+
+def _swap_dot_gf(tmp_path: Path, kid: Path, donor: Path) -> Path:
+    """Replace `kid/.gf` with a symlink to `donor/.gf`, moving the
+    child's real `.gf` aside to `tmp_path` (outside the worktree).
+    Returns the moved-aside dir."""
+    away = tmp_path / f"{kid.name}-gf-away"
+    (kid / ".gf").rename(away)
+    os.symlink(donor / ".gf", kid / ".gf")
+    return away
+
+
+def _rev_parse(gitdir: Path, *args: str) -> str:
+    return _git(f"--git-dir={gitdir}", "rev-parse", *args).stdout.strip()
+
+
+def test_rm_with_swapped_dot_gf_refuses_without_moving_donor_gitdir(
+    tmp_path,
+):
+    """`gf rm kid` with `kid/.gf` swapped to `donor/.gf` must refuse in
+    `remove_child` BEFORE the gitdir move: a clean `gf:` refusal naming
+    the `.gf` resolution, the donor's gitdir still in place and
+    untouched, `kid/.git` never created, the `kid` binding still in the
+    manifest (the die precedes `write_manifest`), and the link left as
+    planted.
+
+    Pre-fix signature (observed): `git_dir.is_dir()` resolved through
+    the link and `shutil.move(kid/.gf/git -> kid/.git)` RELOCATED the
+    donor's gitdir into `kid/.git` — the donor's `.gf/git` was gone —
+    and only the follow-up `shutil.rmtree(kid/.gf)` failed: rc 1 as
+    `cannot remove <kid>/.gf: [Errno None] None: PosixPath(...)`, the
+    wrong error for damage already done.
+    """
+    parent, kid, donor = _whole_repo_pair(tmp_path)
+    manifest_before = (parent / "gf.toml").read_bytes()
+    donor_gitdir = donor / ".gf" / "git"
+    donor_head = _rev_parse(donor_gitdir, "HEAD")
+    donor_state = (donor / ".gf" / "state").read_bytes()
+    away = _swap_dot_gf(tmp_path, kid, donor)
+
+    r = gf("-C", str(parent), "rm", "kid", check=False)
+
+    _assert_clean_refusal(r)
+    assert "resolves through a symlink" in r.stderr, r.stderr
+    assert "'kid'" in r.stderr and "(kid)" in r.stderr, r.stderr
+    # The donor's gitdir was never carried across the link.
+    assert (donor_gitdir / "HEAD").is_file()
+    assert _rev_parse(donor_gitdir, "HEAD") == donor_head
+    assert (donor / ".gf" / "state").read_bytes() == donor_state
+    # No move landed and the swap stands as planted.
+    assert not os.path.lexists(kid / ".git")
+    assert (kid / ".gf").is_symlink()
+    assert os.readlink(kid / ".gf") == str(donor / ".gf")
+    assert (away / "git" / "HEAD").is_file()
+    # The refusal precedes the manifest rewrite: kid is still bound.
+    assert (parent / "gf.toml").read_bytes() == manifest_before
+
+
+def test_pull_with_swapped_dot_gf_refuses_before_touching_donor(
+    tmp_path,
+):
+    """`gf pull kid` on the swap must refuse in `update_child` BEFORE
+    the dirty check, so nothing — not the status, the origin write, the
+    fetch, the checkout, or the state record — reaches the donor's
+    gitdir. With the upstream advanced past both clones, a through-
+    the-link pull is visible: post-fix the donor's HEAD and `.gf/state`
+    bytes are unchanged and kid's worktree never receives the new
+    commit.
+
+    Pre-fix signature: `git status` on the donor's index vs kid's
+    identical worktree reported clean, then the fetch advanced the
+    DONOR's refs/HEAD to the new upstream commit while the checkout
+    wrote the new files into kid's worktree, and `save_checkout`
+    rewrote `kid/.gf/state` — i.e. the donor's record — through the
+    link: rc 0 "Pulled kid", donor HEAD moved, `kid/b.txt` present.
+    """
+    parent, kid, donor = _whole_repo_pair(tmp_path)
+    manifest_before = (parent / "gf.toml").read_bytes()
+    donor_gitdir = donor / ".gf" / "git"
+    donor_head = _rev_parse(donor_gitdir, "HEAD")
+    donor_state = (donor / ".gf" / "state").read_bytes()
+    _swap_dot_gf(tmp_path, kid, donor)
+    # The upstream advances after the swap: a through-the-link pull
+    # moves the donor's refs and lands new files in kid's worktree.
+    push_commit(tmp_path / "upstream", "update", "update")
+
+    r = gf("-C", str(parent), "pull", "kid", check=False)
+
+    _assert_clean_refusal(r)
+    assert "resolves through a symlink" in r.stderr, r.stderr
+    # The donor never observed the pull: same HEAD, same recorded state.
+    assert _rev_parse(donor_gitdir, "HEAD") == donor_head
+    assert (donor / ".gf" / "state").read_bytes() == donor_state
+    # The new upstream commit never landed in kid's worktree either.
+    assert not (kid / "a.txt").exists()
+    assert (parent / "gf.toml").read_bytes() == manifest_before
+
+
+def test_pull_with_swapped_dot_gf_refuses_ahead_of_dirty_check(
+    tmp_path,
+):
+    """Ordering pin: the swap refusal precedes the dirty check, so a
+    dirty kid still gets the `.gf`-resolution refusal — never the
+    DirtyError a through-the-link status would raise. (Separates "gate
+    added" from "gate added after the dirty check".)
+
+    Pre-fix signature: rc 3 — `child <kid> is dirty; commit or stash
+    before pulling`, raised on the donor's index vs kid's modified
+    worktree.
+    """
+    parent, kid, donor = _whole_repo_pair(tmp_path)
+    _swap_dot_gf(tmp_path, kid, donor)
+    (kid / "docs" / "api" / "reference.md").write_text("dirty")
+
+    r = gf("-C", str(parent), "pull", "kid", check=False)
+
+    _assert_clean_refusal(r)
+    assert "resolves through a symlink" in r.stderr, r.stderr
+    assert "is dirty" not in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("op_args", [
+    ("git", "rev-parse", "HEAD"),
+    ("sh", "-c", "true"),
+    ("diff", "--name-only"),
+    ("log", "--format=%s"),
+])
+def test_passthrough_ops_refuse_when_dot_gf_resolves_to_donor(
+    tmp_path, op_args,
+):
+    """`gf git`/`sh`/`diff`/`log` inside a swapped child share
+    `_passthrough_target`'s fail-closed gate: each refuses with a clean
+    `gf:` error naming the `.gf` resolution and produces NO output —
+    the subprocess would otherwise run with GIT_DIR inside the donor's
+    storage.
+
+    Pre-fix signature: every op reached `_run_child_command` with
+    GIT_DIR resolved through the link — `git rev-parse HEAD` printed
+    the DONOR's sha (rc 0), `sh -c true` exited 0, `log` printed the
+    donor's history, `diff` answered rc 0 on the donor's index.
+    """
+    parent, kid, donor = _whole_repo_pair(tmp_path)
+    donor_head = _rev_parse(donor / ".gf" / "git", "HEAD")
+    _swap_dot_gf(tmp_path, kid, donor)
+
+    r = gf("-C", str(kid), *op_args, check=False)
+
+    _assert_clean_refusal(r)
+    assert "resolves through a symlink" in r.stderr, r.stderr
+    assert "'kid'" in r.stderr, r.stderr
+    assert r.stdout == "", (op_args, r.stdout)
+    assert donor_head not in r.stdout
+
+
+def test_status_and_ls_degrade_swapped_child_but_siblings_render(
+    tmp_path,
+):
+    """Read-side degradation: `ls`/`status`/`status --remote` still
+    exit 0 and render every row — the swapped kid degrades to the
+    missing-gitdir fallbacks (`[]` branch, `?` HEAD, `missing` drift,
+    empty porcelain) while the sibling donor row renders its real
+    `[master]`/sha/`clean`. The donor doubles as the link target, so a
+    read THROUGH the link would render the donor's identity on kid's
+    row — exactly what pre-fix does.
+
+    Pre-fix signature: kid's row carried the donor's branch and short
+    sha (`[master] <sha>`), identical to the donor's own row, and
+    `status --remote` reported `clean` for kid.
+    """
+    parent, kid, donor = _whole_repo_pair(tmp_path)
+    url = str(tmp_path / "upstream")
+    donor_head = _rev_parse(donor / ".gf" / "git", "--short", "HEAD")
+    _swap_dot_gf(tmp_path, kid, donor)
+
+    r = gf("-C", str(parent), "ls", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "Traceback" not in r.stderr
+    assert re.search(
+        rf"^kid\s+{re.escape(url)}\s+\[\]\s+\?$", r.stdout, re.M), \
+        r.stdout
+    assert re.search(
+        rf"^donor\s+{re.escape(url)}\s+\[master\]\s+"
+        rf"{re.escape(donor_head)}$", r.stdout, re.M), r.stdout
+
+    r = gf("-C", str(parent), "status", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "Traceback" not in r.stderr
+    assert re.search(
+        rf"^kid\s+{re.escape(url)}\s+\[\]$", r.stdout, re.M), r.stdout
+    assert re.search(
+        rf"^donor\s+{re.escape(url)}\s+\[master\]$", r.stdout, re.M), \
+        r.stdout
+
+    r = gf("-C", str(parent), "status", "--remote", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "Traceback" not in r.stderr
+    assert re.search(
+        rf"^kid\s+{re.escape(url)}\s+\[\]\s+missing$", r.stdout, re.M), \
+        r.stdout
+    assert re.search(
+        rf"^donor\s+{re.escape(url)}\s+\[master\]\s+clean$", r.stdout,
+        re.M), r.stdout
+
+
+def test_established_whole_repo_child_pull_and_rm_stay_green(tmp_path):
+    """Control: the new gate never fires on a real `.gf` — an ordinary
+    established whole-repo child pulls and removes normally, with rm
+    moving `.gf/git` to `.git` and dropping the binding."""
+    up = _upstream(tmp_path, "upstream", API)
+    parent = _parent(tmp_path)
+    _setup_gf("-C", str(parent), "clone", str(up), "kid")
+    kid = parent / "kid"
+    head_before = _rev_parse(kid / ".gf" / "git", "HEAD")
+
+    r = gf("-C", str(parent), "pull", "kid", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert _rev_parse(kid / ".gf" / "git", "HEAD") == head_before
+
+    r = gf("-C", str(parent), "rm", "kid", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert kid.is_dir()
+    assert (kid / ".git" / "HEAD").is_file()
+    assert _rev_parse(kid / ".git", "HEAD") == head_before
+    assert not os.path.lexists(kid / ".gf")
+    assert (kid / "docs" / "api" / "reference.md").read_text() == "api v1"
+    assert _manifest_folders(parent) == []

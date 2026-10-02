@@ -100,10 +100,10 @@ All commands accept a global `-C <path>` option, like `git -C`, to run from anot
 | -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
 | `gf clone <url> [<path>] [-n <name>] [-b <ref>] [--depth <n>] [--single-branch]`                    | Add a git-folder to the manifest and clone its child worktree        |
 | `gf init [<path>] [-b <ref>] [-n <name>] [--url <url>]`                                | Create an empty `.gf` child and add it to the manifest               |
-| `gf pull [--rebase] [--force] [--autostash] [<path>...]`                                      | Update selected children to their effective refs                     |
+| `gf pull [--rebase] [--autostash] [<path>...]`                                               | Update selected children to their effective refs, preserving local work |
 | `gf status [<path>...] [--remote]`                                                         | Show git status for selected children; `--remote` classifies drift against local remote-tracking refs (no network) |
 | `gf ls [<path>...]`                                                                          | List all git-folders in the manifest                                 |
-| `gf rm <path>... [--all]`                                                                    | Unregister git-folders and convert children back to `.git`           |
+| `gf rm <path>... [--all]`                                                                    | Unregister git-folders; whole-repo children become ordinary `.git` repos, folder bindings lose only their link |
 | `gf diff [args...]`                                                                          | Run `git diff` in a child                                            |
 | `gf log [args...]`                                                                           | Run `git log` in a child                                             |
 | `gf worktree add <path> [<commit-ish>] [-b <new-branch>] [-B <new-or-existing-branch>] [-f]` | Add a parent git worktree with git-folders symlinked from the source |

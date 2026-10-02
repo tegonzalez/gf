@@ -10,7 +10,7 @@ Row scope (verbatim): ``cmd_pull``/``shelf`` partition selected bindings
 by resolved form — whole-repo keeps existing per-child order
 (dirty-check → fetch → apply); subfolder groups by ``co.common_dir`` →
 one fetch per store (ensure-store + refspec coverage first), groups by
-checkout key → one dirty check / --force / --autostash / apply per
+checkout key → one dirty check / --autostash / apply per
 checkout → per-binding link create/retarget + state + one output line
 per binding served + "(moved with X)" marks; override repo-URL change →
 new store; key change → retarget link; retarget drops the moved binding
@@ -179,7 +179,7 @@ def _push_orphan_tag(up: Path, tmp_path: Path, tag: str) -> str:
 def _push_deleted_branch_tip(up: Path, tmp_path: Path, branch: str) -> str:
     """Push `branch` then delete it upstream; return its tip sha — a
     commit no advertised ref names (kept by upstream until gc; a local
-    upstream answers a `fetch origin <sha>` want for it)."""
+    upstream answers a `fetch --no-tags origin <sha>` want for it)."""
     work = tmp_path / f"_del_{branch}"
     _git("clone", str(up), str(work))
     _git("-C", work, "checkout", "-q", "-b", branch)
@@ -287,7 +287,7 @@ def test_pull_dirty_whole_repo_aborts_before_fetch(tmp_path, capsys):
 
 def test_pull_dirty_shared_checkout_blocks_both_bindings(tmp_path, capsys):
     """One dirty check per checkout: a dirty sibling blocks the shared
-    checkout — with no --force/--autostash both bindings abort and the
+    checkout — with no --autostash both bindings abort and the
     checkout stays put (spec L496; row item)."""
     up = _upstream(tmp_path)
     parent = _parent(tmp_path)
@@ -363,33 +363,6 @@ def test_pull_dirty_outside_mapped_subdirs_blocks_and_autostash_recovers(
     # the stash round-trips the out-of-cone dirt
     assert root_dirt.read_text() == "uncommitted at root\n"
     assert anc_dirt.read_text() == "uncommitted in docs/\n"
-
-
-def test_pull_dirty_outside_mapped_subdirs_force_proceeds(tmp_path):
-    """F-C: `--force` still proceeds — the whole-checkout dirty rule
-    gates only the unforced pull. Dirt both outside and inside the
-    mapped subdirs proves the check fires and `--force` bypasses it
-    (spec Update algorithm force rule; ruling F-C)."""
-    up = _upstream(tmp_path)
-    parent = _parent(tmp_path)
-    _clone_pair(parent, up)
-    wt = _co(parent, up, "master", "docs/api").work_tree
-    root_dirt = wt / "root-dirty.txt"
-    in_dirt = wt / "docs" / "api" / "dirty.txt"
-    root_dirt.write_text("uncommitted at root\n")
-    in_dirt.write_text("uncommitted in docs/api\n")
-    _advance(up, tmp_path, "adv")
-
-    r = gf("-C", str(parent), "pull", "--force", check=False)
-    assert r.returncode == 0, r.stderr
-    assert "Pulled api" in r.stdout
-    assert (parent / "vendor" / "api" / "x.txt").read_text().strip() == (
-        "api adv")
-    assert (parent / "vendor" / "tools" / "t.txt").read_text().strip() == (
-        "tool adv")
-    # untracked dirt survives a forced apply
-    assert root_dirt.read_text() == "uncommitted at root\n"
-    assert in_dirt.read_text() == "uncommitted in docs/api\n"
 
 
 def test_pull_dirty_inside_mapped_subdir_still_blocks(tmp_path):
@@ -852,8 +825,10 @@ def test_pull_two_missing_links_one_store_fetch(tmp_path, capsys):
 # so a tag whose commit no advertised branch reaches, or a commit no ref
 # names, is invisible to the store/child fetch. The coverage loop probes
 # the store, `ls-remote`s `refs/tags/<t>` upstream, `config --add`s the
-# tag's refspec line (append-only) so the one store fetch lands it; a
-# missing commit gets a one-shot `fetch origin <sha>`.
+# tag's NON-forced refspec line (append-only — `+` is permitted only
+# into `refs/remotes/origin/*`, and a moved tag must be declined, never
+# overwritten) so the one store fetch lands it; a missing commit gets a
+# one-shot `fetch --no-tags origin <sha>`.
 #
 # Pre-fix signatures (verified against HEAD):
 #   tag override on a store:  could not resolve ref 'v3'  (rc=1)
@@ -893,7 +868,7 @@ def test_pull_tag_override_appends_refspec_and_lands_tag(
     calls = [c[0] for c in rec.calls]
     tag_probe = ("ls-remote", str(up), "refs/tags/v3")
     tag_append = ("config", "--add", "remote.origin.fetch",
-                  "+refs/tags/v3:refs/tags/v3")
+                  "refs/tags/v3:refs/tags/v3")
     assert tag_probe in calls, calls
     assert tag_append in calls, calls
     assert calls.index(tag_probe) < calls.index(tag_append)
@@ -902,7 +877,7 @@ def test_pull_tag_override_appends_refspec_and_lands_tag(
     assert len(fetches) == 1, f"fetches: {[c[0] for c in fetches]}"
     assert _refspec_lines(store) == [
         "+refs/heads/*:refs/remotes/origin/*",
-        "+refs/tags/v3:refs/tags/v3",
+        "refs/tags/v3:refs/tags/v3",
     ]
 
     # detached `ref=v3` checkout at the tagged sha; the link retargeted
@@ -933,7 +908,7 @@ def test_pull_tag_override_appends_refspec_and_lands_tag(
     assert not writes, f"refspec writes on re-pull: {writes}"
     assert _refspec_lines(store) == [
         "+refs/heads/*:refs/remotes/origin/*",
-        "+refs/tags/v3:refs/tags/v3",
+        "refs/tags/v3:refs/tags/v3",
     ]
 
 
@@ -962,7 +937,7 @@ def test_pull_whole_repo_orphan_tag_detaches_at_tagged_sha(
 
     assert _refspec_lines(gitdir) == [
         "+refs/heads/*:refs/remotes/origin/*",
-        "+refs/tags/v6:refs/tags/v6",
+        "refs/tags/v6:refs/tags/v6",
     ]
     assert _out("--git-dir", gitdir, "rev-parse", "HEAD") == orphan_sha
     # detached HEAD (abbrev-ref prints HEAD, not a branch name)
@@ -985,7 +960,7 @@ def test_pull_whole_repo_orphan_tag_detaches_at_tagged_sha(
     assert not writes, f"refspec writes on re-pull: {writes}"
     assert _refspec_lines(gitdir) == [
         "+refs/heads/*:refs/remotes/origin/*",
-        "+refs/tags/v6:refs/tags/v6",
+        "refs/tags/v6:refs/tags/v6",
     ]
     assert _out("--git-dir", gitdir, "rev-parse", "HEAD") == orphan_sha
 
@@ -1014,7 +989,10 @@ def test_pull_whole_repo_commit_sha_fetches_sha(tmp_path, capsys):
 
     calls = [c[0] for c in rec.calls]
     probe = ("cat-file", "-e", gone_sha)
-    sha_fetch = ("fetch", "origin", gone_sha)
+    # `git fetch --no-tags origin <sha>` — no refspec line can name a
+    # bare sha, and every gf fetch carries --no-tags (spec Fetch
+    # refspecs)
+    sha_fetch = ("fetch", "--no-tags", "origin", gone_sha)
     assert probe in calls and sha_fetch in calls, calls
     assert calls.index(probe) < calls.index(sha_fetch)
 
@@ -1057,12 +1035,13 @@ def test_pull_override_unknown_tag_fails_clean(tmp_path):
 # ---------------------------------------------------------------------------
 # R6-A — mock-land mechanism pin
 #
-# The mock's `ls-remote` lists every ref regardless of its pattern, so it
-# cannot model tag-following reachability — the discriminating arms above
-# are real-git. What the mock CAN pin is the seam's argv shape: the
-# probe→append order and `config --add` (never a rewrite) of the tag's
-# refspec line, and the one-shot `fetch origin <sha>` for a missing
-# commit. `_ensure_pinned_ref` is called directly on an in-memory store.
+# The mock's `ls-remote` filters trailing ref patterns the way real git
+# does (a ref matches when it equals the pattern or ends with
+# `/<pattern>`), so the tag probe is faithfully discriminating. What the
+# mock pins here is the seam's argv shape: the probe→append order and
+# `config --add` (never a rewrite) of the tag's NON-forced refspec line,
+# and the one-shot `fetch --no-tags origin <sha>` for a missing commit.
+# `_ensure_pinned_ref` is called directly on an in-memory store.
 
 
 def test_ensure_pinned_ref_mock_argv_shape(mock_backend):
@@ -1082,7 +1061,7 @@ def test_ensure_pinned_ref_mock_argv_shape(mock_backend):
         ("show-ref", "--verify", "refs/remotes/origin/v3"),
         ("ls-remote", "/upstream", "refs/tags/v3"),
         ("config", "--add", "remote.origin.fetch",
-         "+refs/tags/v3:refs/tags/v3"),
+         "refs/tags/v3:refs/tags/v3"),
     ]
 
     # A landed tag is never re-covered: the local tag probe is the only
@@ -1101,7 +1080,7 @@ def test_ensure_pinned_ref_mock_argv_shape(mock_backend):
     shelf._ensure_pinned_ref(store, "/upstream", SHA, mock_backend)
     assert [c[0] for c in mock_backend.calls] == [
         ("cat-file", "-e", SHA),
-        ("fetch", "origin", SHA),
+        ("fetch", "--no-tags", "origin", SHA),
     ]
 
     # `latest` stays with the branch machinery: no calls at all.
@@ -1164,8 +1143,9 @@ def test_clone_single_branch_collision_adds_alongside_tag_line(
     the tag's line pre-fetch (the empty gitdir holds neither ref), so the
     narrowing must `config --add` the branch line next to the live lines
     — never a plain `config` write, which dies rc 2 `cannot overwrite
-    multiple values`. The BRANCH wins the checkout (`checkout -B x
-    origin/x`), and the wildcard, tag and branch lines coexist verbatim.
+    multiple values`. The BRANCH wins the checkout (the branch is
+    attached and `merge --ff-only` integrates `origin/x`), and the
+    wildcard, tag and branch lines coexist verbatim.
     """
     up = _upstream(tmp_path)
     branch_sha = _push_colliding_branch_tag(up, tmp_path, "x")
@@ -1180,7 +1160,7 @@ def test_clone_single_branch_collision_adds_alongside_tag_line(
     # coexist under the still-live wildcard — all append-only.
     assert _refspec_lines(gitdir) == [
         "+refs/heads/*:refs/remotes/origin/*",
-        "+refs/tags/x:refs/tags/x",
+        "refs/tags/x:refs/tags/x",
         "+refs/heads/x:refs/remotes/origin/x",
     ]
     # both upstream refs landed locally
@@ -1226,11 +1206,12 @@ def test_clone_single_branch_no_collision_still_narrows(tmp_path):
 # test_clone_subfolder (pre-fix: `could not resolve ref`); the sha arm
 # needs the backend call log — a `--filter=blob:none` store is a
 # promisor, so `worktree add`/`checkout` lazily pulls a missing object
-# even without gf's coverage, and only the gf-issued `fetch origin <sha>`
+# even without gf's coverage, and only the gf-issued
+# `fetch --no-tags origin <sha>`
 # (and the tag's probe→append→one-creating-fetch ordering) discriminates
 # the create arm (spec "Fetch refspecs": the tag's line lands with the
 # creating fetch; a needed commit sha "is fetched directly with
-# `git fetch origin <sha>`").
+# `git fetch --no-tags origin <sha>`").
 
 
 def test_clone_create_store_tag_rides_creating_fetch(tmp_path, capsys):
@@ -1254,8 +1235,9 @@ def test_clone_create_store_tag_rides_creating_fetch(tmp_path, capsys):
     calls = [c[0] for c in rec.calls]
     tag_probe = ("ls-remote", str(up), "refs/tags/v3")
     tag_append = ("config", "--add", "remote.origin.fetch",
-                  "+refs/tags/v3:refs/tags/v3")
-    create_fetch = ("fetch", "--filter=blob:none", "origin")
+                  "refs/tags/v3:refs/tags/v3")
+    create_fetch = ("fetch", "--filter=blob:none", "--no-tags",
+                    "origin")
     assert tag_probe in calls and tag_append in calls, calls
     assert create_fetch in calls, calls
     # probe → append → the one creating fetch, in that order
@@ -1267,7 +1249,7 @@ def test_clone_create_store_tag_rides_creating_fetch(tmp_path, capsys):
 
     assert _refspec_lines(store) == [
         "+refs/heads/*:refs/remotes/origin/*",
-        "+refs/tags/v3:refs/tags/v3",
+        "refs/tags/v3:refs/tags/v3",
     ]
     assert _out("--git-dir", store, "rev-parse",
                 "refs/tags/v3^{}") == orphan_sha
@@ -1281,7 +1263,8 @@ def test_clone_create_store_fetches_pinned_commit_sha(tmp_path, capsys):
     tip — a commit no refspec can cover. The store's `cat-file -e` probe
     misses (a promisor store would lazily fetch the object later anyway,
     so only the call log discriminates): the pin coverage pulls it with
-    a one-shot `fetch origin <sha>` ahead of the creating fetch, then
+    a one-shot `fetch --no-tags origin <sha>` ahead of the creating
+    fetch, then
     the checkout detaches at it. Refspec coverage stays the wildcard —
     no line can name a bare sha."""
     up = _upstream(tmp_path)
@@ -1296,7 +1279,7 @@ def test_clone_create_store_fetches_pinned_commit_sha(tmp_path, capsys):
     store = layout.repo_store(parent, str(up))
     calls = [c[0] for c in rec.calls]
     probe = ("cat-file", "-e", gone_sha)
-    sha_fetch = ("fetch", "origin", gone_sha)
+    sha_fetch = ("fetch", "--no-tags", "origin", gone_sha)
     assert probe in calls and sha_fetch in calls, calls
     assert calls.index(probe) < calls.index(sha_fetch)
 
@@ -1316,7 +1299,8 @@ def test_clone_create_store_fetches_pinned_commit_sha(tmp_path, capsys):
 # A `gf init <path> --url <up>/<subdir> -b <ref>` placeholder converted by
 # the first `gf pull` makes the PULL create the repo store. The create arm
 # needs the same pin coverage the clone path has: a tag-pinned binding's
-# `+refs/tags/<t>:refs/tags/<t>` line must be in place BEFORE the one
+# NON-forced `refs/tags/<t>:refs/tags/<t>` line must be in place BEFORE
+# the one
 # creating fetch — a store this pull created gets no second fetch, so an
 # append that lands after it is coverage no fetch ever reads. The pull
 # resolves every binding's branch/key via `_binding_branch` before the
@@ -1363,7 +1347,7 @@ def test_pull_create_store_orphan_tag_pin_rides_creating_fetch(tmp_path):
     # append-only coverage: wildcard verbatim + exactly the pin's line.
     assert _refspec_lines(store) == [
         "+refs/heads/*:refs/remotes/origin/*",
-        "+refs/tags/v3:refs/tags/v3",
+        "refs/tags/v3:refs/tags/v3",
     ]
     # the pin landed — the tag names the orphan commit in the store.
     assert _out("--git-dir", store, "rev-parse",
@@ -1383,7 +1367,8 @@ def test_pull_create_store_tag_pin_probe_append_one_fetch(
         tmp_path, capsys):
     """R7-C ordering arm: on the pull that creates the store, the tag's
     pin coverage runs inside `ensure_repo_store` — `ls-remote` probe,
-    then `config --add`, then the ONE `--filter=blob:none` creating
+    then `config --add`, then the ONE `--filter=blob:none --no-tags`
+    creating
     fetch — with no post-append top-up fetch (spec "Fetch refspecs":
     a needed tag's line lands with the creating fetch). Pre-fix the
     append ran in the coverage loop AFTER the creating fetch, and the
@@ -1402,8 +1387,9 @@ def test_pull_create_store_tag_pin_probe_append_one_fetch(
     calls = [c[0] for c in rec.calls]
     tag_probe = ("ls-remote", str(up), "refs/tags/v3")
     tag_append = ("config", "--add", "remote.origin.fetch",
-                  "+refs/tags/v3:refs/tags/v3")
-    create_fetch = ("fetch", "--filter=blob:none", "origin")
+                  "refs/tags/v3:refs/tags/v3")
+    create_fetch = ("fetch", "--filter=blob:none", "--no-tags",
+                    "origin")
     assert tag_probe in calls and tag_append in calls, calls
     assert create_fetch in calls, calls
     # probe → append → the one creating fetch, in that order
@@ -1441,7 +1427,7 @@ def test_pull_create_store_branch_and_tag_pins_one_fetch(
     assert len(fetches) == 1, f"fetches: {[c[0] for c in fetches]}"
     assert _refspec_lines(store) == [
         "+refs/heads/*:refs/remotes/origin/*",
-        "+refs/tags/v3:refs/tags/v3",
+        "refs/tags/v3:refs/tags/v3",
     ]
 
     # each binding materialized under its own checkout key
@@ -1481,7 +1467,7 @@ def test_pull_existing_store_tag_binding_still_covered(tmp_path, capsys):
     calls = [c[0] for c in rec.calls]
     tag_probe = ("ls-remote", str(up), "refs/tags/v3")
     tag_append = ("config", "--add", "remote.origin.fetch",
-                  "+refs/tags/v3:refs/tags/v3")
+                  "refs/tags/v3:refs/tags/v3")
     assert tag_probe in calls and tag_append in calls, calls
     # join arm: the append precedes the pull's ONE store fetch.
     assert calls.index(tag_probe) < calls.index(tag_append)
@@ -1491,7 +1477,7 @@ def test_pull_existing_store_tag_binding_still_covered(tmp_path, capsys):
 
     assert _refspec_lines(store) == [
         "+refs/heads/*:refs/remotes/origin/*",
-        "+refs/tags/v3:refs/tags/v3",
+        "refs/tags/v3:refs/tags/v3",
     ]
     assert _out("--git-dir", store, "rev-parse",
                 "refs/tags/v3^{}") == orphan_sha

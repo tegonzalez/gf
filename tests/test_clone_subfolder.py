@@ -905,7 +905,9 @@ def _diverged_upstream(tmp_path: Path) -> Path:
 def test_join_clone_covers_tag_on_unfetched_branch(tmp_path):
     """R6-A join arm: a `--single-branch` store covering only `master`
     cannot reach tag `v2` (pinned on the diverged `feature` tip). The
-    joining `-b v2` clone must append `+refs/tags/v2:refs/tags/v2` —
+    joining `-b v2` clone must append `refs/tags/v2:refs/tags/v2` (the
+    non-forced coverage line — `+` is permitted only into
+    `refs/remotes/origin/*`) —
     leaving the narrowed master line verbatim — land the tag with the
     same fetch, and serve a detached `ref=v2` checkout through the
     consumer link. Pre-fix the join died `could not resolve ref 'v2'`.
@@ -929,7 +931,7 @@ def test_join_clone_covers_tag_on_unfetched_branch(tmp_path):
     # the tag's line is added, never a rewrite or removal.
     assert _refspec_lines(store) == [
         "+refs/heads/master:refs/remotes/origin/master",
-        "+refs/tags/v2:refs/tags/v2",
+        "refs/tags/v2:refs/tags/v2",
     ]
 
     # the link materializes v2's tree — feature marker present, the
@@ -953,7 +955,7 @@ def test_join_clone_covers_tag_on_unfetched_branch(tmp_path):
        "vendor/c", "-b", "v2")
     assert _refspec_lines(store) == [
         "+refs/heads/master:refs/remotes/origin/master",
-        "+refs/tags/v2:refs/tags/v2",
+        "refs/tags/v2:refs/tags/v2",
     ]
     assert (parent / "vendor" / "c" / "t.txt").read_text() == (
         "tool on master")
@@ -1201,10 +1203,12 @@ def test_clone_and_init_plain_targets_unaffected(tmp_path):
 # fetch that CREATES a repo store misses a tag on an unreachable commit
 # (`--depth` truncating below it counts) or a commit no ref names. The
 # create arm must cover a pinned non-branch ref BEFORE the creating
-# fetch: a tag upstream advertises gets `+refs/tags/<t>:refs/tags/<t>`
-# appended (append-only — the wildcard line is never rewritten), so the
-# single creating fetch lands it; a missing commit gets a one-shot
-# `fetch origin <sha>` (spec "Fetch refspecs" + `gf clone` mechanics).
+# fetch: a tag upstream advertises gets `refs/tags/<t>:refs/tags/<t>`
+# appended (append-only AND non-forced — the wildcard line is never
+# rewritten and `+` is permitted only into `refs/remotes/origin/*`), so
+# the single creating fetch lands it; a missing commit gets a one-shot
+# `fetch --no-tags origin <sha>` (spec "Fetch refspecs" + `gf clone`
+# mechanics).
 #
 # Pre-fix signatures (verified against HEAD):
 #   -b v1 --depth 1 (tag below the shallow tip): could not resolve ref
@@ -1267,8 +1271,9 @@ def test_create_store_lands_tag_below_depth_boundary(tmp_path):
     it. rc 0, `refs/tags/v1` in the store, the link serves v1's tree
     from a detached `ref=v1` checkout. Pre-fix: rc 1 `could not resolve
     ref 'v1'` (spec "Fetch refspecs": a needed tag gets
-    `+refs/tags/<ref>:refs/tags/<ref>` appended so the same fetch lands
-    it; `--depth` applies only to the creating fetch)."""
+    `refs/tags/<ref>:refs/tags/<ref>` appended — non-forced — so the
+    same fetch lands it; `--depth` applies only to the creating
+    fetch)."""
     upstream = _upstream(tmp_path)
     _advance(upstream, tmp_path, "adv")  # v1 stays on the pre-advance tip
     parent = _real_parent(tmp_path)
@@ -1282,7 +1287,7 @@ def test_create_store_lands_tag_below_depth_boundary(tmp_path):
     # line is added — never a rewrite or removal.
     assert _refspec_lines(store) == [
         "+refs/heads/*:refs/remotes/origin/*",
-        "+refs/tags/v1:refs/tags/v1",
+        "refs/tags/v1:refs/tags/v1",
     ]
     assert (store / "shallow").exists()  # --depth did apply
     v1_sha = _git_out("--git-dir", store, "rev-parse", "refs/tags/v1^{}")
@@ -1319,7 +1324,7 @@ def test_create_store_covers_orphan_tag(tmp_path):
     store = _store(parent, rk)
     assert _refspec_lines(store) == [
         "+refs/heads/*:refs/remotes/origin/*",
-        "+refs/tags/v3:refs/tags/v3",
+        "refs/tags/v3:refs/tags/v3",
     ]
     assert _git_out("--git-dir", store, "rev-parse",
                     "refs/tags/v3^{}") == orphan_sha

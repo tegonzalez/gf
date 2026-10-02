@@ -170,8 +170,8 @@ def test_pull_autostash_failed_set_url_restores_stash(tmp_path):
 
 
 def test_pull_dirty_child_without_autostash_still_refuses(tmp_path):
-    """Control: without `--autostash`/`--force` the dirty check still
-    refuses rc=3 (DirtyError) BEFORE any stash — the dirt is untouched
+    """Control: without `--autostash` the dirty check still refuses
+    rc=3 (DirtyError) BEFORE any stash — the dirt is untouched
     and no stash entry was ever created."""
     parent, _up, child = _clone_lib(tmp_path)
     (child / "docs" / "api" / "x.txt").write_text("dirty change\n")

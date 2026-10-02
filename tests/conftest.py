@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 import contextlib
+import hashlib
 import io
 import os
 import shutil
@@ -163,3 +164,116 @@ def push_branch(remote: Path, branch: str, content: str) -> None:
     git("commit", "-m", f"{branch} content", cwd=work)
     git("push", "origin", branch, cwd=work)
     shutil.rmtree(work)
+
+
+# ---------------------------------------------------------------------------
+# Preservation-witness helpers (Change DC-DOC-PLAN-007).
+#
+# These probes observe a checkout's protected surface through real `git`
+# only — never through `gf` — so a witness's before/after comparison is
+# independent of the product under test (docs/gf-testing.md
+# "Preservation witness oracle"). All of them are read-only.
+
+
+# Ambient `GIT_*` names a preservation probe must never inherit — the
+# repo-pointer/index/object/config-source/init/command-path/pathspec
+# family gf-spec.md line ~346 requires gf itself to scrub. A witness
+# that ran its probes under a test-injected GIT_INDEX_FILE or GIT_DIR
+# would observe the injected target, not the checkout — the same
+# wrong-target failure mode the identity witnesses assert against.
+_GIT_PROBE_BLOCK = {
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+    "GIT_INDEX_VERSION", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_SHALLOW_FILE",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE",
+    "GIT_NAMESPACE", "GIT_PREFIX", "GIT_QUARANTINE_PATH",
+    "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS",
+    "GIT_TEMPLATE_DIR", "GIT_DEFAULT_HASH",
+    "GIT_DEFAULT_INITIAL_BRANCH_NAME",
+    "GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF",
+    "GIT_DIFF_OPTS",
+    "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS",
+    "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_WORK_TREE_CONFIG",
+}
+_GIT_PROBE_BLOCK_PREFIX = (
+    "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "GIT_TEST_")
+
+
+def git_probe_env() -> dict:
+    """The suite env minus every ambient `GIT_*` pointer/injection name
+    — what gf promises its spawned git sees, applied to the witness's
+    own probes so they always observe the named repository."""
+    return {
+        k: v for k, v in os.environ.items()
+        if not (k in _GIT_PROBE_BLOCK
+                or k.startswith(_GIT_PROBE_BLOCK_PREFIX))
+    }
+
+
+def git_out(*args, cwd: Path | None = None) -> str:
+    """Run real git, return stdout; raise on a non-zero exit."""
+    r = git_try(*args, cwd=cwd)
+    if r.returncode != 0:
+        raise AssertionError(
+            f"git {' '.join(map(str, args))} rc={r.returncode}:\n"
+            f"{r.stderr}")
+    return r.stdout
+
+
+def git_try(*args, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    """Run real git without checking the exit code."""
+    return subprocess.run(
+        ["git", *map(str, args)],
+        cwd=str(cwd) if cwd else None,
+        env=git_probe_env(),
+        capture_output=True, text=True)
+
+
+def hash_tree(root: Path) -> dict[str, str]:
+    """Map each file under `root` to the sha256 of its bytes.
+
+    Top-level `.gf`/`.git` entries are skipped: they are metadata, not
+    work bytes — a child's `.gf/git` gitdir and a linked checkout's
+    records are observed through the git probes below, not file hashes.
+    """
+    root = Path(root)
+    out: dict[str, str] = {}
+    if not root.is_dir():
+        return out
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root)
+        if rel.parts[0] in (".gf", ".git"):
+            continue
+        if path.is_symlink():
+            out[rel.as_posix()] = "symlink:" + os.readlink(path)
+        elif path.is_file():
+            out[rel.as_posix()] = hashlib.sha256(
+                path.read_bytes()).hexdigest()
+    return out
+
+
+def checkout_snapshot(gitdir: Path, work_tree: Path) -> dict:
+    """Capture the protected surface of one checkout for a preservation
+    witness (docs/gf-testing.md oracle categories): index/stash
+    partition, HEAD, and every ref — paired with a `hash_tree` pass for
+    protected bytes. `gitdir` is the checkout's own gitdir (`child/.gf/
+    git` whole-repo, `<store>/worktrees/<key>` for a shared checkout);
+    `work_tree` is the materialized tree.
+    """
+    addr = ("--git-dir", str(gitdir), "--work-tree", str(work_tree))
+    head = git_try(*addr, "rev-parse", "HEAD")
+    refs = git_try(*addr, "for-each-ref",
+                   "--format=%(refname) %(objectname)")
+    return {
+        "bytes": hash_tree(work_tree),
+        "porcelain": git_try(*addr, "status", "--porcelain").stdout,
+        "staged": git_try(*addr, "diff", "--cached", "--name-only").stdout,
+        "stash": git_try(*addr, "stash", "list").stdout,
+        "head": head.stdout.strip() if head.returncode == 0 else None,
+        "refs": dict(
+            line.split(" ", 1)
+            for line in refs.stdout.splitlines() if " " in line),
+    }

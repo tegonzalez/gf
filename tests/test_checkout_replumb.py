@@ -23,12 +23,14 @@ implementation):
   worktree; a path that exists, is not empty, and is not a git-folder
   fails; when the child directory already existed (but was not a
   git-folder) a failed clone removes only the `.gf/` directory.
-- `gf pull`: tag/commit refs run `git checkout <resolved-sha>`
-  (`--force` adds `-f`); `--rebase --force` force-recreates the local
-  branch at HEAD (`git checkout -f -B <branch> HEAD`) before the rebase;
-  `--autostash` leaves the stash in place and errors clearly when the
-  pop conflicts; relative local URLs resolve against the parent repo
-  root; a local `gf` child resolves to its inner gitdir.
+- `gf pull`: tag/commit refs run `git checkout <resolved-sha>` on a
+  clean or autostashed tree; branch refs integrate `merge --ff-only`
+  and `--rebase` runs the explicit `git rebase origin/<branch>`;
+  `--force` is gone entirely — a diverged or dirty checkout refuses
+  rather than overwriting work; `--autostash` leaves the stash in
+  place and errors clearly when the pop conflicts; relative local URLs
+  resolve against the parent repo root; a local `gf` child resolves to
+  its inner gitdir.
 - `gf status` / `gf ls`: `branch` is the current local branch, or empty
   brackets for a detached HEAD.
 - `gf status --remote`: drift is local-only; for `latest` the resolved
@@ -274,14 +276,22 @@ def test_clone_single_branch_ignored_for_tag_ref(fs, gf_inproc, mock_backend):
         "-C", str(parent), "clone", "/upstream", "lib",
         "-b", "v1", "--single-branch", backend=mock_backend,
     )
-    # --single-branch narrows only branch/latest clones; for a tag ref the
-    # wildcard fetch refspec stands.
-    refspec_writes = [
-        c[0] for c in mock_backend.calls
-        if c[0][0] == "config" and c[0][1] == "remote.origin.fetch"
-    ]
-    assert refspec_writes
-    assert refspec_writes[-1] == ("config", "remote.origin.fetch", WILDCARD_FETCH)
+    # --single-branch narrows only branch/latest clones; for a tag ref
+    # the branch refspec is never narrowed (no `+refs/heads/v1:` line).
+    # The needed tag is covered by a NON-forced
+    # `refs/tags/<ref>:refs/tags/<ref>` line appended before the fetch
+    # that lands it, and every fetch carries `--no-tags` (gf-spec.md
+    # `gf clone` + Fetch refspecs).
+    writes = [c[0][-1] for c in mock_backend.calls
+              if c[0][0] == "config" and "remote.origin.fetch" in c[0][1:]
+              and c[0][-1].startswith(("+refs/", "refs/"))]
+    assert "refs/tags/v1:refs/tags/v1" in writes, writes
+    assert not any(w.startswith("+refs/tags/") for w in writes), writes
+    assert not any(w.startswith("+refs/heads/v1:") for w in writes), \
+        writes
+    fetches = [c[0] for c in mock_backend.calls if c[0][0] == "fetch"]
+    assert fetches
+    assert all("--no-tags" in c for c in fetches), fetches
 
 
 def test_clone_depth_does_not_apply_to_later_pull_fetches(
@@ -330,19 +340,25 @@ def test_latest_uses_remote_default_branch(tmp_path):
 # --- gf pull ----------------------------------------------------------
 
 
-def test_pull_rebase_force_discards_dirty_and_updates(tmp_path):
+def test_pull_rebase_autostash_preserves_dirty_and_updates(tmp_path):
+    """`--force` is gone: the admitted way to rebase over uncommitted
+    work is `--autostash` — `git stash push -u` before the rebase and
+    `stash pop --index` restores the dirty bytes after it (gf-spec.md
+    `gf pull`: "--autostash preserves local changes across the rebase as
+    above")."""
     upstream = _real_upstream(tmp_path)
     parent = _real_parent(tmp_path)
     gf("-C", str(parent), "clone", str(upstream), "vendor/lib")
     child = parent / "vendor" / "lib"
 
-    (child / "a.txt").write_text("dirty change")  # dirty tracked file
+    (child / "local.txt").write_text("dirty change")  # untracked file
     push_commit(upstream, "update", "update")
 
-    # `checkout -f -B <branch> HEAD` discards the dirty change, then the
-    # rebase lands the remote tip.
-    gf("-C", str(parent), "pull", "--rebase", "--force")
+    r = gf("-C", str(parent), "pull", "--rebase", "--autostash",
+           check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     assert (child / "a.txt").read_text() == "update"
+    assert (child / "local.txt").read_text() == "dirty change"
 
 
 def test_pull_autostash_pop_conflict_keeps_stash(tmp_path):
@@ -405,9 +421,13 @@ def test_pull_with_parent_dir_arg_updates_all_children_below(
     assert (parent / "vendor" / "b" / "a.txt").read_text() == "update"
 
 
-def test_pull_force_on_tag_ref_uses_forced_detached_checkout(
+def test_pull_on_tag_ref_dirty_refuses_before_checkout(
     fs, gf_inproc, mock_backend
 ):
+    """For a tag/commit ref the checkout requires a clean worktree or
+    `--autostash` (gf-spec.md `gf pull`): a dirty child refuses with the
+    dirty-worktree exit before any `checkout` runs, and the dirty bytes
+    stay."""
     parent = _parent(fs)
     repo = _seed_upstream(mock_backend)
     mock_backend.tag(repo, "v1", SHA1)
@@ -418,14 +438,16 @@ def test_pull_force_on_tag_ref_uses_forced_detached_checkout(
 
     (parent / "lib" / "a.txt").write_text("dirty")
     mock_backend.calls.clear()
-    gf_inproc("-C", str(parent), "pull", "--force", backend=mock_backend)
-
-    # For a tag/commit ref --force runs `git checkout -f <sha>`.
+    r = gf_inproc("-C", str(parent), "pull",
+                  backend=mock_backend, check=False)
+    assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
+    # refused before any checkout could run; dirty bytes preserved
     checkout_calls = [
         c[0] for c in mock_backend.calls if c[0][0] == "checkout"
     ]
-    assert checkout_calls == [("checkout", "-f", SHA1)]
-    assert (parent / "lib" / "a.txt").read_text() == "hello"
+    assert not any("-f" in c or "-B" in c for c in checkout_calls)
+    assert checkout_calls == []
+    assert (parent / "lib" / "a.txt").read_text() == "dirty"
 
 
 def test_pull_rebase_on_tag_ref_uses_plain_checkout(fs, gf_inproc, mock_backend):

@@ -117,6 +117,18 @@ def _upstream(tmp_path: Path, name: str = "upstream") -> Path:
     return up
 
 
+def _advance(up: Path, tmp_path: Path, tag: str = "adv") -> None:
+    """Push one commit to upstream master so a pull has real index-
+    writing work to do."""
+    work = tmp_path / f"_adv_{tag}"
+    _git("clone", "-q", str(up), str(work))
+    (work / "docs" / "api" / "x.txt").write_text(f"api {tag}")
+    (work / "tools" / "t.txt").write_text(f"tool {tag}")
+    _git("-C", work, "add", "-A")
+    _git("-C", work, "commit", "-qm", tag)
+    _git("-C", work, "push", "-q", "origin", "master")
+
+
 def _worktree_lines(porcelain: str) -> set[str]:
     """`worktree <path>` entries of a `worktree list --porcelain` output."""
     return {
@@ -175,26 +187,33 @@ def test_worktree_list_ignores_ambient_foreign_git_dir(
 
 def test_pull_never_writes_ambient_git_index_file(tmp_path, monkeypatch):
     """An ambient GIT_INDEX_FILE retargets every index-touching git the
-    pull spawns (`status --porcelain` drift check, `checkout -B`) onto
-    the sentinel path — pre-fix the pull's checkout CREATES it. Post-fix
-    the pull runs against the checkout's own index and the sentinel
-    path never appears.
+    pull spawns (`status --porcelain` dirty check, the apply's
+    `merge --ff-only`) onto the sentinel path — pre-fix the pull's
+    checkout CREATED it. Post-fix every spawned git runs on the scrubbed
+    env, so the checkout's own index is bound and the sentinel path
+    never appears.
 
-    `--force` keeps the pull running past the drift gate: the leaked
-    path reads as a missing (empty) index, so `status` reports the whole
-    checkout dirty — a plain pull would stop at "is dirty" before ever
-    reaching the index-writing checkout this pin watches."""
+    The child is clean and strictly behind: the pull proceeds through
+    the index-writing apply without any bypass flag (the old pin needed
+    `--force`, which no longer exists — a leaked var would instead read
+    the missing sentinel as an empty index, report the whole checkout
+    dirty, and stop at the refusal before reaching the apply)."""
     up = _upstream(tmp_path)
     parent = _parent(tmp_path)
     gf("-C", str(parent), "clone", f"{up}/docs/api", "vendor/api")
+    _advance(up, tmp_path)
 
     sentinel = tmp_path / "ambient-index"
     monkeypatch.setenv("GIT_INDEX_FILE", str(sentinel))
-    r = gf("-C", str(parent), "pull", "--force")
+    r = gf("-C", str(parent), "pull")
     assert "Pulled api" in r.stdout
     assert not os.path.lexists(sentinel), (
         f"ambient GIT_INDEX_FILE was created by a pull-spawned git: "
         f"{sentinel}")
+    # the update really landed on the bound checkout through its own
+    # index — not skipped and not written at the sentinel
+    assert (parent / "vendor" / "api" / "x.txt"
+            ).read_text().strip() == "api adv"
 
 
 # ---------------------------------------------------------------------------

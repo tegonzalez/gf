@@ -400,11 +400,9 @@ def _init_child_gitdir(
     # The `.gf`/`git` components appended to the child must be literal:
     # a symlinked `.gf` would redirect the gitdir mkdir — and every later
     # gitdir write — outside the child's own tree. The child's leaf
-    # spelling may legitimately be a link, so compare against
-    # realpath(child), never the lexical child.
-    if Path(os.path.realpath(gitdir)) != (
-        Path(os.path.realpath(co.work_tree)) / layout.GF_DIR / "git"
-    ):
+    # spelling may legitimately be a link, which the two-sided compare
+    # inside `whole_repo_gitdir_is_real` already allows.
+    if not layout.whole_repo_gitdir_is_real(co):
         raise ValidationError(
             f"child gitdir path {gitdir} resolves through a symlink")
     gitdir.mkdir(parents=True, exist_ok=True)
@@ -459,6 +457,94 @@ def _resolve_remote_branch(co: layout.Checkout, branch: str, backend: GitBackend
         raise ValidationError(f"could not resolve remote branch 'origin/{branch}' in {co.work_tree}") from e
 
 
+def _retention_ref(co: layout.Checkout, backend: GitBackend) -> None:
+    """Record the outgoing HEAD under the checkout's retention ref.
+
+    Before any transition that could strand local commits — a branch
+    attach or switch, a detached move, a rebase — the outgoing HEAD is
+    written to `refs/worktree/gf-retained` (GF-D23). `refs/worktree/*`
+    is a per-worktree namespace: under a repo store each linked checkout
+    keeps its own ref inside its worktree record (`co.gitdir`), and a
+    whole-repo child's lands in its own `.gf/git`, surviving the
+    `.gf` → `.git` move. Local commits stay reachable from a live ref,
+    never only through the reflog.
+
+    An unborn HEAD has nothing to retain. A failed write refuses the
+    transition by raising before the checkout — the outgoing commits
+    would otherwise lose their last durable name.
+    """
+    head = backend.git(
+        "rev-parse", "--verify", "HEAD",
+        git_dir=co.gitdir, work_tree=co.work_tree, check=False,
+    )
+    if head.returncode != 0:
+        return
+    sha = head.stdout.strip()
+    try:
+        backend.git(
+            "update-ref", "refs/worktree/gf-retained", sha,
+            git_dir=co.gitdir, work_tree=co.work_tree,
+        )
+    except GitError as e:
+        raise GitError(
+            f"cannot record {co.work_tree}'s outgoing HEAD {sha} under "
+            f"refs/worktree/gf-retained: {e}; refusing the checkout — "
+            f"the commits it carries would be left unreachable"
+        ) from e
+
+
+def _ahead_behind(
+    co: layout.Checkout, other: str, backend: GitBackend
+) -> tuple[int, int]:
+    """`(ahead, behind)` counts of HEAD against `other`, both local.
+
+    `rev-list --left-right --count HEAD...<other>`: the left count is the
+    commits HEAD carries that `other` lacks (ahead); the right count is
+    the commits `other` carries that HEAD lacks (behind).
+    """
+    result = backend.git(
+        "rev-list", "--left-right", "--count", f"HEAD...{other}",
+        git_dir=co.gitdir, work_tree=co.work_tree, check=False,
+    )
+    if result.returncode != 0:
+        return (-1, -1)
+    parts = result.stdout.split()
+    if len(parts) != 2:
+        return (-1, -1)
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return (-1, -1)
+
+
+def _assert_no_in_progress_op(co: layout.Checkout) -> None:
+    """Refuse while a merge, rebase, or cherry-pick is in progress.
+
+    MERGE_HEAD, CHERRY_PICK_HEAD, REVERT_HEAD, and the
+    rebase-merge/rebase-apply state dirs all live in the per-worktree
+    gitdir (`co.gitdir`): a shared store keeps each checkout's
+    in-progress state separate, and a whole-repo child keeps its own.
+    Stacking a checkout, merge, or rebase on top would compound or strand
+    the interrupted operation — the user finishes or aborts it with
+    their own git first, and `gf` says so truthfully instead of
+    proceeding.
+    """
+    for marker, op, remedy in (
+        ("rebase-merge", "rebase", "git rebase --continue` or `git rebase --abort"),
+        ("rebase-apply", "rebase", "git rebase --continue` or `git rebase --abort"),
+        ("MERGE_HEAD", "merge", "git merge --continue` or `git merge --abort"),
+        ("CHERRY_PICK_HEAD", "cherry-pick",
+         "git cherry-pick --continue` or `git cherry-pick --abort"),
+        ("REVERT_HEAD", "revert",
+         "git revert --continue` or `git revert --abort"),
+    ):
+        if (co.gitdir / marker).exists():
+            raise ValidationError(
+                f"a {op} is in progress in {co.work_tree}; finish or "
+                f"abort it (`{remedy}`) before pulling — `gf` will not "
+                f"stack an update on top of it")
+
+
 def _apply_ref(
     co: layout.Checkout,
     ref: str,
@@ -466,76 +552,103 @@ def _apply_ref(
     backend: GitBackend,
     *,
     rebase: bool = False,
-    force: bool = False,
 ) -> str:
     """Apply a resolved ref to an existing checkout once. Return the resolved SHA.
 
     The single ref-application step both pull flows share (GF-D15
     composition): `_fetch_and_checkout` and `_fetch_and_rebase` call it
-    after their own `fetch origin`, and `pull_shared_bindings` calls it
-    after the grouped store's one fetch — the two update algorithms
-    differ in step order, not in the operation. `branch` is the
-    caller-resolved effective branch (`None` for a tag/commit ref).
+    after their own `fetch --no-tags origin`, and `pull_shared_bindings`
+    calls it after the grouped store's one fetch — the two update
+    algorithms differ in step order, not in the operation. `branch` is
+    the caller-resolved effective branch (`None` for a tag/commit ref).
 
-    A branch ref resolves `origin/<branch>` and checks out
-    `checkout -B <branch> origin/<branch>`; under `rebase` the local
-    branch is instead recreated at the current HEAD
-    (`checkout -B <branch> HEAD`) and rebased onto `origin/<branch>`,
-    and the returned SHA stays the pre-rebase remote tip. A non-branch
-    ref resolves `ref` locally and checks out the detached SHA. `force`
-    adds `-f` to the checkout call.
+    Preservation contract (GF-D16/GF-D23): the outgoing HEAD is recorded
+    under `refs/worktree/gf-retained` before any transition that could
+    strand it. A branch ref creates the local tracking branch at
+    `origin/<branch>` when it does not exist (`checkout -b <branch>
+    origin/<branch>`) or attaches to the existing one
+    (`checkout <branch>`) and integrates fast-forward-only
+    (`git merge --ff-only origin/<branch>`): a strictly-behind branch
+    advances, up-to-date is a no-op, strictly-ahead keeps its local
+    commits, and divergence refuses reporting the truthful ahead/behind
+    counts plus the deliberate recoveries. `rebase` runs
+    `git rebase origin/<branch>` instead of the merge — entered only by
+    the user's explicit `--rebase`. A non-branch ref checks out the
+    detached resolved SHA. `checkout -B`, `checkout -f`, `reset`, and
+    `branch -f` are never issued: an unsafe transition refuses rather
+    than falling back to a destructive one.
     """
-    # The `.gf` root-entry refusal precedes EVERY materialization arm
-    # below — `checkout -B`, the detached checkout and the rebase's
-    # recreating checkout all land the resolved tree in the worktree.
     sha = (
         _resolve_remote_branch(co, branch, backend)
         if branch
         else resolve_ref(co, ref, backend)
     )
+    # The `.gf` root-entry refusal precedes EVERY materialization arm
+    # below — the branch attach/create, the detached checkout and the
+    # rebase all land the resolved tree in the worktree.
     _assert_no_gf_root_entry(backend, co, sha)
-    if branch:
-        if rebase:
-            # Ensure HEAD is on the local branch before rebasing. Using
-            # `-B <branch> HEAD` recreates the branch at the current HEAD
-            # without moving the worktree.
-            checkout_args = ["checkout"]
-            if force:
-                checkout_args.append("-f")
-            checkout_args.extend(["-B", branch, "HEAD"])
-            backend.git(
-                *checkout_args, git_dir=co.gitdir, work_tree=co.work_tree,
-                stream=True,
-            )
-            try:
-                backend.git(
-                    "rebase", f"origin/{branch}",
-                    git_dir=co.gitdir, work_tree=co.work_tree, stream=True,
-                )
-            except GitError as e:
-                raise GitError(
-                    f"rebase of {co.work_tree} onto origin/{branch} "
-                    f"failed; resolve or abort the rebase and try again"
-                ) from e
-            return sha
-        checkout_args = ["checkout"]
-        if force:
-            checkout_args.append("-f")
-        checkout_args.extend(["-B", branch, f"origin/{branch}"])
+    # An in-progress merge/rebase refuses before anything moves —
+    # stacking a transition on top would compound or strand it.
+    _assert_no_in_progress_op(co)
+    _retention_ref(co, backend)
+    if not branch:
         backend.git(
-            *checkout_args, git_dir=co.gitdir, work_tree=co.work_tree,
-            stream=True,
+            "checkout", sha,
+            git_dir=co.gitdir, work_tree=co.work_tree, stream=True,
         )
         return sha
-    checkout_args = ["checkout"]
-    if force:
-        checkout_args.append("-f")
-    checkout_args.append(sha)
-    backend.git(
-        *checkout_args, git_dir=co.gitdir, work_tree=co.work_tree,
-        stream=True,
+    mirror = f"origin/{branch}"
+    if backend.git(
+        "show-ref", "--verify", f"refs/heads/{branch}",
+        git_dir=co.gitdir, check=False,
+    ).returncode != 0:
+        # No local tracking branch yet: create it at the mirror tip and
+        # check it out — creation, never a reset of an existing ref.
+        backend.git(
+            "checkout", "-b", branch, mirror,
+            git_dir=co.gitdir, work_tree=co.work_tree, stream=True,
+        )
+    else:
+        # Attach to the existing local branch; an existing ref is never
+        # reset or recreated.
+        backend.git(
+            "checkout", branch,
+            git_dir=co.gitdir, work_tree=co.work_tree, stream=True,
+        )
+    if rebase:
+        try:
+            backend.git(
+                "rebase", mirror,
+                git_dir=co.gitdir, work_tree=co.work_tree, stream=True,
+            )
+        except GitError as e:
+            raise GitError(
+                f"rebase of {co.work_tree} onto {mirror} failed; "
+                f"resolve or abort the rebase and try again"
+            ) from e
+        return sha
+    # Captured, not streamed: the merge's diffstat is git chatter, not
+    # `gf` output — the pull's stdout carries only `gf`'s own lines.
+    result = backend.git(
+        "merge", "--ff-only", mirror,
+        git_dir=co.gitdir, work_tree=co.work_tree, check=False,
     )
-    return sha
+    if result.returncode == 0:
+        return sha
+    # A failed fast-forward on a clean tree means the local branch and
+    # the mirror carry commits the other lacks (diverged or unrelated
+    # histories): refuse without moving anything and report the truthful
+    # state plus the deliberate recoveries.
+    ahead, behind = _ahead_behind(co, mirror, backend)
+    if ahead > 0 and behind > 0:
+        raise ValidationError(
+            f"local branch '{branch}' diverged from {mirror} (ahead "
+            f"{ahead}, behind {behind}); refusing to move it — commit or "
+            f"stash the local work and pull again, or run "
+            f"`gf pull --rebase`")
+    msg = result.stderr.strip() or result.stdout.strip()
+    raise GitError(
+        f"git merge --ff-only {mirror} failed for {co.work_tree}: {msg}")
 
 
 def _fetch_and_checkout(
@@ -543,14 +656,10 @@ def _fetch_and_checkout(
     url: str,
     ref: str,
     backend: GitBackend | None = None,
-    force: bool = False,
     depth: int | None = None,
     single_branch: bool = False,
 ) -> str:
     """Fetch `origin` and check out the resolved ref. Return the resolved SHA.
-
-    If `force` is True, the checkout uses `-f` so a dirty worktree is
-    overwritten to the checked-out files.
 
     If `depth` is given, `git fetch --depth=<n> origin` is used for a
     shallow clone.
@@ -561,23 +670,30 @@ def _fetch_and_checkout(
     only while it is the key's single value, and is `--add`ed alongside
     any other live coverage lines (a pinned tag's). It is ignored for
     tag/commit refs.
+
+    There is no force arm: `gf` has no flag that updates over
+    uncommitted work — a dirty tree is refused or autostashed by the
+    caller, and `_apply_ref` never issues `checkout -f`.
     """
     backend = backend or _default_backend()
 
+    # Unsafe legacy refspec state (`+` into user-owned refs) refuses
+    # before any coverage write or fetch runs against this gitdir.
+    _assert_safe_refspecs(co.common_dir, backend)
     # A narrowed child gitdir has the same non-branch coverage hole as a
     # narrowed repo store: cover a tag/commit `ref` before the fetch so
     # it lands the ref (the tag's appended line rides this fetch; a
-    # missing commit gets its own one-shot `fetch origin <sha>`).
-    # `_fetch_and_rebase` delegates non-branch refs here, so both
-    # whole-repo seams share the coverage.
+    # missing commit gets its own one-shot `fetch --no-tags origin
+    # <sha>`). `_fetch_and_rebase` delegates non-branch refs here, so
+    # both whole-repo seams share the coverage.
     _ensure_pinned_ref(co.common_dir, url, ref, backend)
 
-    fetch_args = ["fetch"]
+    fetch_args = ["fetch", "--no-tags"]
     if depth is not None:
         fetch_args.append(f"--depth={depth}")
     fetch_args.append("origin")
 
-    backend.git(*fetch_args, git_dir=co.common_dir, stream=True)
+    _fetch_guarded(backend, co.common_dir, *fetch_args)
 
     branch = _effective_branch(co, ref, backend)
     if branch and single_branch:
@@ -602,7 +718,7 @@ def _fetch_and_checkout(
                     git_dir=co.common_dir,
                 )
 
-    return _apply_ref(co, ref, branch, backend, force=force)
+    return _apply_ref(co, ref, branch, backend)
 
 
 def _fetch_and_rebase(
@@ -610,7 +726,6 @@ def _fetch_and_rebase(
     url: str,
     ref: str,
     backend: GitBackend | None = None,
-    force: bool = False,
 ) -> str:
     """Fetch `origin` and rebase the local branch onto the remote tracking branch.
 
@@ -622,11 +737,12 @@ def _fetch_and_rebase(
 
     branch = _effective_branch(co, ref, backend)
     if not branch:
-        return _fetch_and_checkout(co, url, ref, backend, force=force)
+        return _fetch_and_checkout(co, url, ref, backend)
 
-    backend.git("fetch", "origin", git_dir=co.common_dir, stream=True)
+    _assert_safe_refspecs(co.common_dir, backend)
+    _fetch_guarded(backend, co.common_dir, "fetch", "--no-tags", "origin")
 
-    return _apply_ref(co, ref, branch, backend, rebase=True, force=force)
+    return _apply_ref(co, ref, branch, backend, rebase=True)
 
 
 def _print_gitignore_recommendation(parent_root: Path, child: Path) -> None:
@@ -831,14 +947,12 @@ def init_git_folder(co: layout.Checkout, backend: GitBackend | None = None) -> N
             f"({layout.GF_DIR}) or repository metadata (.git)")
 
     gitdir = co.gitdir
-    # Same storage-real check as `_init_child_gitdir`, kept inline with
-    # this duplicated init block: the appended `.gf`/`git` components
-    # must be literal — a symlinked `.gf` (committed in a hostile tree or
-    # planted by hand) would redirect the mkdir and all gitdir writes
-    # outside the child's tree. The child leaf may itself be a link.
-    if Path(os.path.realpath(gitdir)) != (
-        Path(os.path.realpath(child)) / layout.GF_DIR / "git"
-    ):
+    # Same storage-real check as `_init_child_gitdir`: the appended
+    # `.gf`/`git` components must be literal — a symlinked `.gf`
+    # (committed in a hostile tree or planted by hand) would redirect
+    # the mkdir and all gitdir writes outside the child's tree. The
+    # child leaf may itself be a link.
+    if not layout.whole_repo_gitdir_is_real(co):
         raise ValidationError(
             f"child gitdir path {gitdir} resolves through a symlink")
     gitdir.mkdir(parents=True, exist_ok=True)
@@ -902,6 +1016,30 @@ def recorded_url_matches(
     return (parent_root / recorded).resolve() == Path(url).resolve()
 
 
+def _pop_autostash(co: layout.Checkout, backend: GitBackend) -> None:
+    """Restore the `gf autostash` entry, index partition included.
+
+    `stash pop --index` reapplies the staged/unstaged split the push
+    recorded. A conflicting or failed pop leaves the stash entry in the
+    stash list — the work is never dropped — and raises a named report
+    that carries the manual recovery; the caller surfaces it as the pull
+    failure itself (success path) or alongside it (failure path).
+    """
+    try:
+        backend.git(
+            "stash", "pop", "--index",
+            git_dir=co.gitdir, work_tree=co.work_tree, stream=True,
+        )
+    except GitError as e:
+        raise GitError(
+            f"autostash pop for {co.work_tree} conflicted or failed; the "
+            f"'gf autostash' stash entry was kept — recovery is manual: "
+            f"resolve conflicted paths and `git stash drop` the entry "
+            f"once its content is landed, or clear the obstruction and "
+            f"re-run `git stash pop --index` when nothing applied. {e}"
+        ) from e
+
+
 def update_child(
     co: layout.Checkout,
     url: str,
@@ -909,7 +1047,6 @@ def update_child(
     parent_root: Path,
     override: bool = False,
     rebase: bool = False,
-    force: bool = False,
     autostash: bool = False,
     backend: GitBackend | None = None,
     binding_path: str | None = None,
@@ -1022,15 +1159,37 @@ def update_child(
                 child, existed_before, was_git_folder_before, parent_root)
             raise
 
+    # Fail closed on an established whole-repo child whose `.gf`
+    # resolves through a link: `co.gitdir` then names a foreign gitdir
+    # (the donor's, typically), and everything below — the dirty-check
+    # status, `_set_child_origin`'s config write, the fetch, the
+    # checkout — would operate on the donor's storage. A store
+    # checkout's gitdir lives under the parent root's `.gf` and is
+    # guarded by its own storage-real checks, so only the whole-repo
+    # shape is tested here.
+    if not co.is_store_checkout and not layout.whole_repo_gitdir_is_real(co):
+        raise ValidationError(
+            f"child gitdir path {co.gitdir} resolves through a symlink")
+
     gitdir = co.gitdir
+    # Unscoped dirty check: a dirty child refuses exit 3 — `gf` has no
+    # flag that updates over uncommitted work (`gf pull` carries no
+    # `--force`); `--autostash` preserves it through the update instead.
     dirty = backend.git_capture(
         "status", "--porcelain", git_dir=gitdir, work_tree=co.work_tree,
     ).strip()
-    if dirty and not (force or autostash):
-        raise DirtyError(f"child {child} is dirty; commit or stash before pulling")
+    if dirty and not autostash:
+        raise DirtyError(
+            f"child {child} is dirty (uncommitted changes); commit or "
+            f"stash them first, or pull with --autostash")
+
+    # Unsafe legacy refspec state refuses before the stash and before
+    # any refspec write or fetch against this gitdir (GF-D17) — a
+    # refused pull never cycles a stash it did not need.
+    _assert_safe_refspecs(co.common_dir, backend)
 
     stashed = False
-    if dirty and autostash:
+    if dirty:
         backend.git(
             "stash", "push", "-u", "-m", "gf autostash",
             git_dir=gitdir, work_tree=co.work_tree, stream=True,
@@ -1040,29 +1199,23 @@ def update_child(
     try:
         _set_child_origin(co, resolved_url, backend)
         if rebase:
-            sha = _fetch_and_rebase(co, resolved_url, effective_ref, backend, force=force)
+            sha = _fetch_and_rebase(co, resolved_url, effective_ref, backend)
         else:
-            sha = _fetch_and_checkout(co, resolved_url, effective_ref, backend, force=force)
-    except GitFoldersError:
+            sha = _fetch_and_checkout(co, resolved_url, effective_ref, backend)
+    except Exception:
+        # The update failed AFTER a stash was taken — a failed origin URL
+        # update included — so the stash is restored on the way out too;
+        # it is never orphaned. A pop that itself fails leaves the named
+        # `gf autostash` entry in place and reports it.
         if stashed:
-            # The update failed; try to restore the stashed changes so the
-            # user is not left without their work.
             try:
-                backend.git("stash", "pop", git_dir=gitdir, work_tree=co.work_tree, stream=True)
-            except GitError:
-                pass
+                _pop_autostash(co, backend)
+            except GitError as pop_err:
+                print(f"gf: warning: {pop_err}", file=sys.stderr)
         raise
 
     if stashed:
-        try:
-            backend.git("stash", "pop", git_dir=gitdir, work_tree=co.work_tree, stream=True)
-        except GitError as e:
-            # Leave the stash in place and surface a clear error so the user
-            # can resolve the conflict and pop manually.
-            raise GitError(
-                f"autostash pop for {child} conflicted; the stash was kept. "
-                f"Resolve the conflict and run `git stash pop` manually. {e}"
-            ) from e
+        _pop_autostash(co, backend)
 
     # Record the resolved state (merge so shared-checkout keys such as
     # the sparse `bindings` list survive a pull).
@@ -1210,7 +1363,10 @@ def drift(
 ) -> str:
     """Classify the drift state of the checkout against its effective ref.
 
-    Returns one of `clean`, `behind`, `local-dirty`, `both`, or `missing`.
+    Returns one of `clean`, `ahead`, `behind`, `diverged`, or `missing`;
+    the four resolved relations gain a `-dirty` suffix when the worktree
+    has uncommitted changes, with `local-dirty` naming the matching-HEAD
+    dirty case. `missing` is never suffixed.
 
     This is a local-only operation. It never calls `git fetch`,
     `git remote`, `git ls-remote`, or any other network command. The
@@ -1221,21 +1377,29 @@ def drift(
     first to refresh those refs.
 
     - `missing`: the checkout has no `HEAD` in its gitdir, its worktree
-      directory is gone, or — for a store checkout resolved through a
+      directory is gone, a whole-repo child's `.gf` resolves through a
+      link (the spelled gitdir is foreign storage, so nothing may be
+      read from it), or — for a store checkout resolved through a
       binding's consumer path — the mapped subdirectory
       `co.work_tree/co.subdir` no longer exists (e.g. upstream removed
       the mapped directory and `pull` checked out the removal, leaving
       the consumer link dangling).
     - The effective ref is resolved to the SHA `pull` would check out
       (the remote tracking branch tip for branch/latest refs).
-    - The checkout `HEAD` SHA and `git status --porcelain` are read. An
-      unborn HEAD (a child with no commits yet) has no SHA; it never
-      matches the resolved SHA, so it reports `behind` or `both` rather
-      than raising a git error.
-    - `clean`: HEAD matches the resolved SHA and the worktree is clean.
-    - `behind`: HEAD does not match and the worktree is clean.
-    - `local-dirty`: HEAD matches and the worktree is dirty.
-    - `both`: HEAD does not match and the worktree is dirty.
+    - The checkout `HEAD` and `git status --porcelain` are read, then
+      the history relation is classified by rev-list counts
+      (`git rev-list --left-right --count HEAD...<sha>` semantics — the
+      count of commits each side carries that the other lacks). An
+      unborn HEAD (a child with no commits yet) counts as zero commits
+      ahead of anything, so it reports `behind` rather than raising a
+      git error.
+    - `clean`: neither side has commits the other lacks.
+    - `ahead`: HEAD has commits the resolved SHA lacks and the resolved
+      SHA has none HEAD lacks.
+    - `behind`: the resolved SHA has commits HEAD lacks and HEAD has
+      none the resolved SHA lacks.
+    - `diverged`: each side has commits the other lacks.
+    - `-dirty` variants: the same relations with a dirty worktree.
 
     If the effective ref cannot be resolved locally, raises
     `GitFoldersError` instead of returning a state, so `cmd_status` can
@@ -1243,7 +1407,19 @@ def drift(
     """
     backend = backend or _default_backend()
     gitdir = co.gitdir
-    if not (gitdir / "HEAD").is_file() or not co.work_tree.is_dir():
+    # Degrade, don't fail closed: a whole-repo child whose `.gf`
+    # resolves through a link has no gitdir of its own, and reading
+    # through it would report the donor's HEAD/status as this child's.
+    # A store checkout's gitdir lives under the parent's `.gf` and is
+    # unaffected by the child's own `.gf` spelling.
+    if (
+        not (gitdir / "HEAD").is_file()
+        or not co.work_tree.is_dir()
+        or (
+            not co.is_store_checkout
+            and not layout.whole_repo_gitdir_is_real(co)
+        )
+    ):
         return "missing"
     # A subfolder binding's mapped directory is part of the checkout
     # root's worktree: upstream can remove it (e.g. `git rm -r` of the
@@ -1261,8 +1437,6 @@ def drift(
 
     resolved_sha = _resolve_effective_sha_local(co, ref, backend)
 
-    # An unborn HEAD does not resolve to a commit; per the drift
-    # algorithm it cannot match the resolved ref.
     head = backend.git(
         "rev-parse", "HEAD", git_dir=gitdir, work_tree=co.work_tree,
         check=False,
@@ -1278,15 +1452,48 @@ def drift(
         # mark a clean sibling `local-dirty`.
         porcelain = scoped_porcelain(co, paths, backend).strip()
     dirty = bool(porcelain)
-    behind = head_sha != resolved_sha
 
-    if behind and dirty:
-        return "both"
-    if behind:
-        return "behind"
-    if dirty:
-        return "local-dirty"
-    return "clean"
+    if head_sha:
+        ahead, behind = _ahead_behind(co, resolved_sha, backend)
+        if ahead < 0:
+            raise GitError(
+                f"could not classify drift for {co.work_tree}: "
+                f"git rev-list HEAD...{resolved_sha} failed")
+    else:
+        # An unborn HEAD carries zero commits ahead of anything; the
+        # behind count is every commit the resolved SHA reaches — a
+        # resolved SHA names a commit, so it is always behind.
+        result = backend.git(
+            "rev-list", "--count", resolved_sha,
+            git_dir=gitdir, work_tree=co.work_tree, check=False,
+        )
+        if result.returncode != 0:
+            raise GitError(
+                f"could not classify drift for {co.work_tree}: "
+                f"git rev-list --count {resolved_sha} failed")
+        try:
+            behind = int(result.stdout.strip())
+        except ValueError:
+            raise GitError(
+                f"could not classify drift for {co.work_tree}: "
+                f"unexpected rev-list output {result.stdout.strip()!r}"
+            ) from None
+        ahead = 0
+
+    if ahead > 0 and behind > 0:
+        relation = "diverged"
+    elif ahead > 0:
+        relation = "ahead"
+    elif behind > 0:
+        relation = "behind"
+    else:
+        relation = "clean"
+
+    if not dirty:
+        return relation
+    # `local-dirty` names the matching-HEAD dirty case; `missing` is
+    # returned above and never carries a suffix.
+    return "local-dirty" if relation == "clean" else f"{relation}-dirty"
 
 
 def list_parent_worktrees(parent_root: Path, backend: GitBackend) -> list[dict]:
@@ -1449,7 +1656,16 @@ def remove_child(child: Path, parent_root: Path) -> None:
         return
 
     gf_dir = child / layout.GF_DIR
-    git_dir = layout.resolve_checkout(child).gitdir
+    co = layout.resolve_checkout(child)
+    # Fail closed — `gf rm` must never move or delete a foreign gitdir.
+    # A `.gf` swapped for a link (or a store-co-shaped resolution, whose
+    # gitdir legitimately sits under a root's `.gf/repos`) fails the
+    # compare, so the move below can never carry the donor's gitdir to
+    # `child/.git` and the rmtree cannot follow the link.
+    if not layout.whole_repo_gitdir_is_real(co):
+        raise ValidationError(
+            f"child gitdir path {co.gitdir} resolves through a symlink")
+    git_dir = co.gitdir
     if git_dir.is_dir():
         if (child / ".git").exists():
             raise GitFoldersError(f"{child} already contains a .git directory")
@@ -1485,6 +1701,66 @@ def _live_refspec_lines(store: Path, backend: GitBackend) -> list[str]:
         git_dir=store, check=False,
     )
     return [ln for ln in result.stdout.splitlines() if ln.strip()]
+
+
+def _assert_safe_refspecs(store: Path, backend: GitBackend) -> None:
+    """Refuse a live fetch refspec that can move user-owned refs.
+
+    `remote.origin.fetch` lines are append-only and a leading `+`
+    (forced update) is legitimate only on a destination inside gf's
+    remote-tracking mirror `refs/remotes/origin/*` (GF-D17): every line
+    gf itself writes lands there. A forced line whose destination sits
+    anywhere else — `refs/heads/*`, `refs/tags/*`, `HEAD` — would move
+    user-owned refs on every fetch, so it refuses before any fetch or
+    write runs against the gitdir. A colon-less refspec has no
+    destination and cannot move a ref, so it does not refuse.
+
+    The offending line is named in the refusal and never rewritten or
+    removed — repairing a hand-edited or foreign line is the user's own
+    `git config` call, not a silent migration.
+    """
+    for line in _live_refspec_lines(store, backend):
+        spec = line.strip()
+        if not spec.startswith("+") or ":" not in spec:
+            continue
+        dest = spec.split(":", 1)[1]
+        if not dest.startswith("refs/remotes/origin/"):
+            raise ValidationError(
+                f"remote.origin.fetch line '{spec}' in {store} "
+                f"force-fetches into user-owned refs (destination "
+                f"'{dest}' is outside refs/remotes/origin/*); refusing "
+                f"to fetch or write against this gitdir — repair or "
+                f"remove the line with `git config`")
+
+
+_REJECTED_REF_RE = re.compile(r"!\s+\[rejected\]\s+(\S+)\s+->")
+
+
+def _fetch_guarded(
+    backend: GitBackend, git_dir: Path, *args: str
+) -> None:
+    """`git fetch` with a rejected ref update surfaced as a refusal.
+
+    A non-forced `refs/tags/<ref>` coverage line makes the fetch decline
+    a tag that upstream moved — git prints `! [rejected] <name> ->
+    <name>  (would clobber existing tag)` and exits nonzero. That is a
+    divergence refusal (exit 1), not a transport failure (exit 2): the
+    local ref is preserved untouched and the user resolves the move
+    deliberately. Any other fetch failure propagates unchanged as the
+    `GitError` it already is.
+    """
+    try:
+        backend.git(*args, git_dir=git_dir, stream=True)
+    except GitError as e:
+        hits = _REJECTED_REF_RE.findall(str(e))
+        if hits:
+            raise ValidationError(
+                f"fetch into {git_dir} declined a moved ref: upstream's "
+                f"{', '.join(hits)} differs from the local copy, which "
+                f"was preserved — resolve it deliberately (inspect, "
+                f"rename, delete, or re-point it with your own git) and "
+                f"pull again") from e
+        raise
 
 
 def _ensure_branch_coverage(
@@ -1539,7 +1815,8 @@ def _ensure_pinned_ref(
             "cat-file", "-e", ref, git_dir=store, check=False,
         ).returncode != 0:
             backend.git(
-                "fetch", "origin", ref, git_dir=store, stream=True,
+                "fetch", "--no-tags", "origin", ref,
+                git_dir=store, stream=True,
             )
         return
     if backend.git(
@@ -1554,9 +1831,12 @@ def _ensure_pinned_ref(
         ).returncode == 0:
             return
     if _upstream_has_tag(repo_url, ref, backend):
+        # Non-forced: a tag must never be re-pointed by a fetch — a moved
+        # upstream tag is a refusal condition for the caller, not
+        # something `gf` silently tracks (GF-D17).
         backend.git(
             "config", "--add", "remote.origin.fetch",
-            f"+refs/tags/{ref}:refs/tags/{ref}",
+            f"refs/tags/{ref}:refs/tags/{ref}",
             git_dir=store,
         )
 
@@ -1572,18 +1852,22 @@ def _fetch_store(
     """
     shallow = [f"--depth={depth}"] if depth else []
     try:
-        backend.git(
-            "fetch", "--filter=blob:none", *shallow, "origin",
-            git_dir=store, stream=True,
+        _fetch_guarded(
+            backend, store,
+            "fetch", "--filter=blob:none", "--no-tags", *shallow, "origin",
         )
         return
+    except ValidationError:
+        # A moved-ref rejection is not a filter refusal: surface it,
+        # do not burn the fallback retry on it.
+        raise
     except GitError:
         print(
             "gf: warning: remote refused a filtered fetch; "
             "falling back to a full fetch",
             file=sys.stderr,
         )
-    backend.git("fetch", *shallow, "origin", git_dir=store, stream=True)
+    _fetch_guarded(backend, store, "fetch", "--no-tags", *shallow, "origin")
 
 
 def _assert_store_origin(
@@ -1676,6 +1960,10 @@ def ensure_repo_store(
     if not (store / "HEAD").is_file():
         store.mkdir(parents=True, exist_ok=True)
         backend.git("init", "--bare", git_dir=store)
+        # `init --bare` preserves a pre-existing config: a store dir that
+        # predates this call can carry a hostile `remote.origin.fetch`
+        # line, which refuses before gf writes its own coverage.
+        _assert_safe_refspecs(store, backend)
         backend.git(
             "config", "remote.origin.url", _resolved_git_url(url),
             git_dir=store,
@@ -1710,8 +1998,10 @@ def ensure_repo_store(
         return
     # Join arm only: the store must still be the one this binding's
     # resolution configured — refuse before any refspec write or fetch
-    # runs against a retargeted origin.
+    # runs against a retargeted origin — and a pre-existing forced
+    # refspec into user-owned refs refuses the same way (GF-D17).
     _assert_store_origin(backend, store, url)
+    _assert_safe_refspecs(store, backend)
     if branch:
         _ensure_branch_coverage(store, branch, backend)
     elif ref is not None:
@@ -1867,10 +2157,12 @@ def ensure_checkout(
     `git worktree add --no-checkout --detach`, verifies the worktree record
     under `<store>/worktrees/` by its `gitdir` file, applies
     `sparse-checkout set --cone` to the union of the checkout's recorded
-    binding subdirs plus `co.subdir`, attaches `checkout -B` for a branch
-    ref or a detached HEAD for a tag/commit ref, removes the `.git`
-    gitfile, locks the worktree idempotently, and writes the per-checkout
-    state record including its `bindings` list.
+    binding subdirs plus `co.subdir`, then runs `_apply_ref` — the single
+    ref-application operation (`checkout -b` / attach + `merge --ff-only`
+    for a branch ref, a detached checkout for a tag/commit ref, never
+    `-B`/`-f`) — removes the `.git` gitfile, locks the worktree
+    idempotently, and writes the per-checkout state record including its
+    `bindings` list.
 
     A checkout path occupied by anything without its matching worktree
     record is an error — gf never rebuilds over existing files. On failure
@@ -1902,7 +2194,38 @@ def ensure_checkout(
     wt = co.work_tree
 
     branch = ref if is_branch(co, ref, backend) else None
-    sha = resolve_ref(co, ref, backend)
+    try:
+        sha = resolve_ref(co, ref, backend)
+        resolved = True
+    except ValidationError:
+        resolved = False
+    if not resolved or (
+        not branch
+        and backend.git(
+            "cat-file", "-e", sha, git_dir=store, check=False,
+        ).returncode != 0
+    ):
+        # `--no-tags` fetches never auto-follow: a tag/commit the store's
+        # live refspecs do not cover (created for a different binding's
+        # ref, or narrowed by --single-branch) stays unresolvable until
+        # covered — the same `_ensure_pinned_ref` + one-fetch coverage
+        # the clone and pull seams run. A ref upstream does not
+        # advertise as a tag or a named commit keeps the resolve's own
+        # `could not resolve ref` error — unchanged.
+        if branch or ref in ("latest", ""):
+            sha = resolve_ref(co, ref, backend)
+        else:
+            url = backend.git(
+                "remote", "get-url", "origin", git_dir=store, check=False,
+            )
+            if url.returncode != 0:
+                sha = resolve_ref(co, ref, backend)
+            else:
+                _assert_safe_refspecs(store, backend)
+                _ensure_pinned_ref(store, url.stdout.strip(), ref, backend)
+                _fetch_guarded(
+                    backend, store, "fetch", "--no-tags", "origin")
+                sha = resolve_ref(co, ref, backend)
     # The `.gf` root-entry refusal precedes BOTH materialization arms:
     # the create arm's `worktree add` + checkout and the existing-record
     # arm's `_sparse_union` cone rebuild (it materializes files from the
@@ -1917,6 +2240,7 @@ def ensure_checkout(
 
     if _checkout_record_valid(co):
         # Existing checkout: widen the sparse cone and refresh the record.
+        recreated = False
         if not wt.is_dir():
             if os.path.lexists(wt):
                 raise GitFoldersError(
@@ -1924,7 +2248,21 @@ def ensure_checkout(
                     f"remove it or restore the checkout, then retry"
                 )
             wt.mkdir(parents=True, exist_ok=True)
+            recreated = True
         bindings = _sparse_union(co, backend)
+        if recreated:
+            # The record's checkout dir was gone and this call recreated
+            # it empty: nothing user-owned can exist inside a dir `gf`
+            # just mkdir'd, so the index's missing entries are `gf`'s own
+            # vanished materialization, not deletions to preserve.
+            # `sparse-checkout set` only moves skip-worktree bits — it
+            # never rewrites index entries already marked present — so
+            # write the cone back out of the index with
+            # `checkout-index` (skip-worktree entries stay absent).
+            backend.git(
+                "checkout-index", "-f", "-a",
+                git_dir=co.gitdir, work_tree=wt,
+            )
         gitfile = wt / ".git"
         if os.path.lexists(gitfile):
             os.unlink(gitfile)
@@ -1958,16 +2296,7 @@ def ensure_checkout(
                 f"record {admin} for checkout {wt}"
             )
         bindings = _sparse_union(co, backend)
-        if branch:
-            backend.git(
-                "checkout", "-B", branch, f"origin/{branch}",
-                git_dir=admin, work_tree=wt, stream=True,
-            )
-        else:
-            backend.git(
-                "checkout", "--detach", sha,
-                git_dir=admin, work_tree=wt, stream=True,
-            )
+        _apply_ref(co, ref, branch, backend)
         gitfile = wt / ".git"
         if os.path.lexists(gitfile):
             os.unlink(gitfile)
@@ -2465,7 +2794,6 @@ def pull_shared_bindings(
     parent_root: Path,
     *,
     rebase: bool = False,
-    force: bool = False,
     autostash: bool = False,
     backend: GitBackend | None = None,
 ) -> list[str]:
@@ -2493,9 +2821,10 @@ def pull_shared_bindings(
     `remote set-head` re-probe. Per checkout key:
     `ensure_checkout` per binding (record check + cone-union widening +
     gitfile/lock), one unscoped dirty check over the materialized
-    checkout — `--force` / `--autostash` apply to the whole checkout
-    and a dirty shared checkout blocks every binding it serves — then
-    a single ref apply. Per binding:
+    checkout — `--autostash` applies to the whole checkout, a dirty
+    shared checkout blocks every binding it serves, and there is no
+    force flag that would update over uncommitted work — then a single
+    ref apply. Per binding:
     `ensure_consumer_link` create/retarget to `<checkout>/<subdir>` plus a
     merged `save_checkout` that also records the binding's effective `url`
     in the `binding_urls` map keyed by its manifest `path`; a retarget
@@ -2546,7 +2875,11 @@ def pull_shared_bindings(
                 # here: refuse before the coverage loop below writes
                 # refspec lines or fetches through a store whose
                 # origin no longer matches this binding's resolution.
+                # A pre-existing forced refspec into user-owned refs
+                # refuses the same way (GF-D17) — before any coverage
+                # write or the store fetch.
                 _assert_store_origin(backend, store, repo_url)
+                _assert_safe_refspecs(store, backend)
             if not store_existed:
                 # The clone path's pattern, grouped: resolve every
                 # binding's branch/key BEFORE the store exists —
@@ -2700,18 +3033,21 @@ def pull_shared_bindings(
                 # git's report to materialized paths, so an
                 # unscoped status sees dirt the subdir union would
                 # miss (e.g. a root-level file cone mode
-                # materializes).
+                # materializes). A dirty shared checkout blocks every
+                # binding it serves — there is no force flag that would
+                # update over uncommitted work.
                 dirty = backend.git_capture(
                     "status", "--porcelain",
                     git_dir=co.gitdir, work_tree=co.work_tree,
                 ).strip()
-                if dirty and not (force or autostash):
+                if dirty and not autostash:
                     raise DirtyError(
-                        f"checkout {co.work_tree} is dirty; commit or "
-                        f"stash before pulling")
+                        f"checkout {co.work_tree} is dirty (uncommitted "
+                        f"changes); commit or stash them first, or pull "
+                        f"with --autostash")
 
                 stashed = False
-                if dirty and autostash:
+                if dirty:
                     backend.git(
                         "stash", "push", "-u", "-m", "gf autostash",
                         git_dir=co.gitdir, work_tree=co.work_tree,
@@ -2721,31 +3057,24 @@ def pull_shared_bindings(
                 try:
                     if existed:
                         sha = _apply_ref(
-                            co, ref, branch, backend,
-                            rebase=rebase, force=force)
+                            co, ref, branch, backend, rebase=rebase)
                     else:
                         # `ensure_checkout` already applied the ref when it
                         # created the checkout.
                         sha = resolve_ref(co, branch or ref, backend)
-                except GitFoldersError:
+                except Exception:
+                    # Restore on the way out: a stash taken for this
+                    # update is never orphaned by a failure inside it.
                     if stashed:
                         try:
-                            backend.git(
-                                "stash", "pop", git_dir=co.gitdir,
-                                work_tree=co.work_tree, stream=True)
-                        except GitError:
-                            pass
+                            _pop_autostash(co, backend)
+                        except GitError as pop_err:
+                            print(
+                                f"gf: warning: {pop_err}",
+                                file=sys.stderr)
                     raise
                 if stashed:
-                    try:
-                        backend.git(
-                            "stash", "pop", git_dir=co.gitdir,
-                            work_tree=co.work_tree, stream=True)
-                    except GitError as e:
-                        raise GitError(
-                            f"autostash pop for {co.work_tree} conflicted; "
-                            f"the stash was kept. Resolve the conflict and "
-                            f"run `git stash pop` manually. {e}") from e
+                    _pop_autostash(co, backend)
             except GitFoldersError as e:
                 e.folder = lead["folder"]
                 e.lines = lines

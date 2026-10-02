@@ -35,6 +35,7 @@ Real git over local bare upstreams via `gf clone`; `gf` subprocess only.
 import os
 import re
 import subprocess
+import threading
 import tomllib
 from pathlib import Path
 
@@ -1169,3 +1170,192 @@ def test_pull_via_worktree_readable_owning_manifest_still_prunes(
         dev_wt / "docs" / "api").resolve()
     assert (parent / "vendor" / "lib" / "l.txt").read_text() == \
         "lib payload\n"
+
+
+# ---------------------------------------------------------------------------
+# R15-F5 — `worktree add` must not read a non-regular manifest SOURCE
+#
+# `_worktree_link_folders` copies `gf.toml`/`gf.local.toml` from the source
+# worktree into the added one. The pre-fix source gate `not src.exists()`
+# follows links, so a source `gf.local.toml` that is a symlink — here to a
+# FIFO — satisfied it, and `src.read_text()` either blocked on the fifo
+# forever or, once a writer fed it, planted the injected bytes at
+# `<wt>/gf.local.toml`, where the next `gf` command inside the worktree
+# parses them as the local override manifest. A dangling or other
+# non-regular source was read the same way. The gate is now
+# `src.is_symlink() or not src.is_file()`: only a regular, non-symlink
+# source propagates (spec `gf worktree add`: "only a regular non-symlink
+# source file is propagated: a source that is itself a link or a special
+# file is skipped rather than read through").
+#
+# Pre-fix signature (verified): with a feeder thread ending the fifo read,
+# the add still plants the injected invalid TOML at `wt2/gf.local.toml`,
+# and the first wt2 command that parses the local manifest (`gf status`)
+# dies rc=1 `gf: corrupt git-folders manifest at <wt2>/gf.local.toml:
+# Invalid statement`; without the feeder the add blocks in the fifo read.
+
+
+def _fifo_feeder(
+        fifo: Path, payload: bytes, stop: threading.Event
+        ) -> threading.Thread:
+    """Feed `payload` into `fifo` the moment a reader opens it.
+
+    `O_WRONLY | O_NONBLOCK` fails ENXIO while no reader holds the fifo,
+    so the feeder polls until `stop` fires: post-fix nothing ever opens
+    the source and the daemon exits when the test ends it; pre-fix
+    `src.read_text()` blocks inside `open()` until this writer pairs,
+    then receives `payload` plus EOF — the bytes that reach
+    `wt2/gf.local.toml`.
+    """
+    def _run() -> None:
+        while not stop.is_set():
+            try:
+                fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError:
+                stop.wait(0.01)
+                continue
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
+            return
+
+    feeder = threading.Thread(target=_run, daemon=True)
+    feeder.start()
+    return feeder
+
+
+def test_add_skips_source_local_manifest_symlinked_to_fifo(tmp_path):
+    """R15-F5 source arm — a source `gf.local.toml` that is a symlink to
+    a FIFO is skipped rather than read through: the add succeeds, the
+    worktree is listed, and no `gf.local.toml` is planted at the
+    destination — the bytes a writer would pipe through the link never
+    reach the new worktree.
+
+    Pre-fix signature (verified): the `src.exists()` gate followed the
+    link and `src.read_text()` pulled the feeder's invalid-TOML bytes
+    into `wt2/gf.local.toml`; `gf -C wt2 status` then died rc=1 `gf:
+    corrupt git-folders manifest at <wt2>/gf.local.toml`. Without the
+    feeder the same run hung inside the fifo read.
+    """
+    up = _upstream(tmp_path)
+    parent = _parent(tmp_path)
+    gf("-C", str(parent), "clone", str(up / "docs/api"), "vendor/api")
+
+    fifo = tmp_path / "gf-local-source.fifo"
+    os.mkfifo(fifo)
+    os.symlink(fifo, parent / "gf.local.toml")
+    # premise: the old `src.exists()` gate admitted this source (the
+    # fifo target exists) while the new gate rejects it (a link, and
+    # not a regular file) — the discriminating condition this pin holds
+    src = parent / "gf.local.toml"
+    assert src.exists() and src.is_symlink() and not src.is_file()
+
+    stop = threading.Event()
+    feeder = _fifo_feeder(fifo, b"injected = [unterminated\n", stop)
+    wt2 = tmp_path / "wt2"
+    try:
+        gf("-C", str(parent), "worktree", "add", str(wt2))
+    finally:
+        stop.set()
+        feeder.join(timeout=5)
+
+    # the add completed — the worktree is registered and the managed
+    # child link was placed exactly as with a regular local manifest
+    r = gf("-C", str(parent), "worktree", "list")
+    assert str(wt2) in r.stdout
+    assert (wt2 / "vendor" / "api").is_symlink()
+
+    # the pin: nothing was planted at `wt2/gf.local.toml` — the first
+    # command that parses the worktree's local manifest reads nothing
+    # and stays clean. Pre-fix this is where the injected bytes surface:
+    # rc=1, `gf: corrupt git-folders manifest at <wt2>/gf.local.toml`.
+    r = gf("-C", str(wt2), "status", check=False)
+    assert r.returncode == 0, r.stderr
+    assert not os.path.lexists(wt2 / "gf.local.toml")
+
+
+def test_add_replaces_checked_out_local_symlink_without_writing_through(
+        tmp_path):
+    """R15-F5 destination arm — upstream HEAD commits `gf.local.toml` as
+    a symlink to a victim OUTSIDE the repo; `git worktree add`
+    materializes the link at `wt2/gf.local.toml`, and the manifest copy
+    must unlink it and plant the parent's real local file — never write
+    through the link into the victim.
+
+    This side was hardened before F5 (`dst.is_symlink() → unlink`); the
+    arm stays as coverage so the source-side gate cannot regress into a
+    pair that still writes through checked-out content. It is green both
+    before and after the fix — the source arm is the discriminator.
+    """
+    victim = tmp_path / "victim.txt"
+    victim.write_text("VICTIM ORIGINAL\n")
+
+    up = tmp_path / "upstream"
+    _git("init", "--bare", str(up))
+    seed = tmp_path / "_seed_local_link"
+    _git("clone", str(up), str(seed))
+    (seed / "gf.toml").write_text("# git-folders manifest\n")
+    os.symlink(str(victim), seed / "gf.local.toml")
+    _git("-C", seed, "add", "-A")
+    _git("-C", seed, "commit", "-qm", "seed")
+    _git("-C", seed, "push", "origin", "master")
+
+    parent = tmp_path / "parent"
+    _git("clone", str(up), str(parent))
+    # the parent's own local manifest is a real file — the checked-out
+    # symlink is replaced in the working tree (uncommitted; HEAD still
+    # carries the link the new worktree will materialize)
+    (parent / "gf.local.toml").unlink()
+    local_text = "# parent-local overrides\n"
+    (parent / "gf.local.toml").write_text(local_text)
+    # premise: HEAD really carries `gf.local.toml` as a symlink (mode
+    # 120000), so `git worktree add` materializes the link at the
+    # destination before the copy runs — the replace is exercised, not
+    # vacuous
+    mode = _git("-C", parent, "ls-tree", "HEAD", "--",
+                "gf.local.toml").stdout.split()[0]
+    assert mode == "120000"
+
+    wt2 = tmp_path / "wt2"
+    gf("-C", str(parent), "worktree", "add", str(wt2))
+
+    # the checkout materialized the committed link, and the copy replaced
+    # it with a regular file carrying the parent's content — the victim
+    # was never opened for writing
+    dst = wt2 / "gf.local.toml"
+    assert dst.is_file() and not dst.is_symlink()
+    assert dst.read_text() == local_text
+    assert victim.read_text() == "VICTIM ORIGINAL\n"
+
+    r = gf("-C", str(parent), "worktree", "list")
+    assert str(wt2) in r.stdout
+
+
+def test_add_propagates_regular_manifest_files(tmp_path):
+    """R15-F5 control — ordinary real-file propagation is unchanged: a
+    regular `gf.toml` and a regular `gf.local.toml` in the source
+    worktree both land in the added worktree as regular files carrying
+    the source bytes, alongside the usual consumer link — and the
+    propagated local manifest still parses for commands inside wt2."""
+    up = _upstream(tmp_path)
+    parent = _parent(tmp_path)
+    gf("-C", str(parent), "clone", str(up / "docs/api"), "vendor/api")
+    local_text = ('# parent-local overrides\n'
+                  '[[git_folder_override]]\nname = "api"\nref = "master"\n')
+    (parent / "gf.local.toml").write_text(local_text)
+
+    wt2 = tmp_path / "wt2"
+    gf("-C", str(parent), "worktree", "add", str(wt2))
+
+    dst_manifest = wt2 / "gf.toml"
+    dst_local = wt2 / "gf.local.toml"
+    assert dst_manifest.is_file() and not dst_manifest.is_symlink()
+    assert dst_manifest.read_text() == (parent / "gf.toml").read_text()
+    assert dst_local.is_file() and not dst_local.is_symlink()
+    assert dst_local.read_text() == local_text
+    assert (wt2 / "vendor" / "api").is_symlink()
+    # the propagated local manifest parses — a command reading it inside
+    # the worktree stays clean
+    r = gf("-C", str(wt2), "status", check=False)
+    assert r.returncode == 0, r.stderr

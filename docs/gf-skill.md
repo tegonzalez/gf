@@ -30,7 +30,8 @@ gf -C vendor/libfoo git status
 gf -C vendor/libfoo git log --oneline
 gf -C vendor/libfoo git commit -m "local work"
 
-# Sync with upstream (branch refs; resets the local branch to the remote tip)
+# Sync with upstream: attach the local tracking branch, then fast-forward it;
+# local commits and worktree changes are preserved, never reset
 gf pull
 
 # Sync with upstream while rebasing any local commits
@@ -44,24 +45,30 @@ gf rm vendor/libfoo
 
 | Command                                          | Purpose                                                                           |
 | ---                                              | ---                                                                               |
-| `gf init [<path>] [-b <ref>]`                    | Create an empty placeholder child and add it to `gf.toml`                         |
-| `gf clone <url> [<path>] [-n <name>] [-b <ref>]` | Clone a git-folder and add it to the manifest                                     |
-| `gf pull [--rebase] [<path>...]`                 | Update selected children to their effective refs                                  |
-| `gf status [<path>...]`                          | Show `git status --porcelain` for selected children                               |
+| `gf init [<path>] [-b <ref>] [-n <name>] [--url <url>]`                    | Create an empty placeholder child and add it to `gf.toml`                         |
+| `gf clone <url> [<path>] [-n <name>] [-b <ref>] [--depth <n>] [--single-branch]` | Clone a git-folder and add it to the manifest                                     |
+| `gf pull [--rebase] [--autostash] [<path>...]`                 | Update selected children to their effective refs                                  |
+| `gf status [<path>...] [--remote]`                          | Show `git status --porcelain` for selected children                               |
 | `gf ls [<path>...]`                              | List git-folders and current refs                                                 |
-| `gf rm <path>...`                                | Unregister a git-folder and convert `child/.gf/git` to `child/.git`               |
+| `gf rm <path>... [--all]`                                | Unregister a git-folder; a whole-repo child becomes a usable `.git` repo (registered worktrees included), a folder binding loses only its link |
 | `gf git [args...]`                               | Run any `git` command in the current child with `GIT_DIR` and `GIT_WORK_TREE` set |
-| `gf sh [-c <cmd>]`                               | Open a shell or run a command with the child git environment                      |
+| `gf sh [command...]`                               | Open a shell or run a command with the child git environment                      |
 
 ## Rules of thumb
 
 - `gf` never creates commits in the parent for you. Add child paths to the
   parent's `.gitignore` after `clone` or `init`; for a folder binding, add its
   path without a trailing slash and the parent's `.gf/` store directory.
-- `gf rm` on a folder binding removes only the link; `gf clone` with the same
+- `gf rm` on a whole-repo child converts `child/.gf/git` into a usable
+  `child/.git` — history, index, refs, and registered `git worktree`s included;
+  on a folder binding it removes only the link, and `gf clone` with the same
   URL brings it back with any uncommitted work.
 - `gf ls` and `gf status` do not access the network.
-- `gf pull` refuses to run if a child has uncommitted changes.
+- `gf pull` refuses to run if a child has uncommitted changes; pass
+  `--autostash` to stash, update, and restore them.
+- `gf` has no force or discard mode. A diverged branch refuses and reports the
+  ahead/behind state — commit, stash, or `gf pull --rebase` are the deliberate
+  recoveries; deleting work is your own `git` action.
 - `gf pull --rebase` only makes sense for branch refs; for tags or commits it
-  falls back to a normal checkout.
+  is ignored.
 - `gf git` is the escape hatch for any git operation `gf` does not wrap.

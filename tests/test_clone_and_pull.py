@@ -79,7 +79,11 @@ def test_pull_rebase_keeps_local_commits(tmp_path):
     assert (child / "b.txt").read_text() == "local"
 
 
-def test_pull_force_updates_dirty_child(tmp_path):
+def test_pull_dirty_then_autostash_preserves_work(tmp_path):
+    """The dirty gate refuses a plain pull; `--autostash` is the
+    admitted way to update over uncommitted work — the dirty bytes are
+    stashed and restored, never discarded (gf-spec.md `gf pull`: `gf`
+    has no flag that updates over uncommitted work)."""
     upstream = tmp_path / "upstream"
     upstream.mkdir()
     git("init", "--bare", cwd=upstream)
@@ -95,17 +99,19 @@ def test_pull_force_updates_dirty_child(tmp_path):
     gf("-C", str(parent), "clone", str(upstream), "vendor/lib")
     child = parent / "vendor" / "lib"
 
-    # Dirty the child and advance the remote.
-    (child / "a.txt").write_text("dirty change")
+    # Dirty the child (untracked, so the restore cannot conflict) and
+    # advance the remote.
+    (child / "local.txt").write_text("dirty change")
     push_commit(upstream, "update", "update")
 
     # Plain pull aborts because the child is dirty.
     with pytest.raises(AssertionError):
         gf("-C", str(parent), "pull")
 
-    # --force overwrites the dirty file with the remote content.
-    gf("-C", str(parent), "pull", "--force")
+    # --autostash lands the update AND the dirty bytes survive.
+    gf("-C", str(parent), "pull", "--autostash")
     assert (child / "a.txt").read_text() == "update"
+    assert (child / "local.txt").read_text() == "dirty change"
 
 
 def test_pull_autostash_restores_local_changes(tmp_path):

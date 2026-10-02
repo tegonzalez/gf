@@ -45,6 +45,10 @@ class Worktree:
     indexed: dict[str, str] = field(default_factory=dict)    # cone-filtered
     worktree: dict[str, str] = field(default_factory=dict)   # disk model
     stashes: list[dict] = field(default_factory=list)
+    # Per-worktree refs — the refs/worktree/* hierarchy (e.g.
+    # refs/worktree/gf-retained) is per-worktree in a linked-checkout
+    # store, shared-dir refs stay on Repo.
+    refs: dict[str, str] = field(default_factory=dict)
     checked_out: bool = False
 
 
@@ -161,6 +165,38 @@ class MockGitBackend(GitBackend):
             if sha in repo.commits:
                 return repo.commits[sha]
         raise GitError(f"unknown sha {sha}")
+
+    def _ancestors(self, sha: str) -> set[str]:
+        """All commits reachable from `sha`, including itself."""
+        seen: set[str] = set()
+        stack = [sha]
+        while stack:
+            s = stack.pop()
+            if s in seen:
+                continue
+            try:
+                commit = self._find_commit(s)
+            except GitError:
+                continue
+            seen.add(s)
+            stack.extend(commit.parents)
+        return seen
+
+    def _is_ancestor(self, maybe_ancestor: str, tip: str) -> bool:
+        if not maybe_ancestor or not tip:
+            return False
+        return maybe_ancestor in self._ancestors(tip)
+
+    def _ref_value(self, repo: Repo, wt: Worktree | None, ref: str) -> str | None:
+        """Look up a ref, consulting per-worktree refs first for a
+        worktree-bound call (refs/worktree/* lives on the checkout)."""
+        if wt is not None and ref in wt.refs:
+            return wt.refs[ref]
+        if ref in repo.symrefs:
+            resolved = repo.symrefs[ref]
+            if resolved in repo.refs:
+                return repo.refs[resolved]
+        return repo.refs.get(ref)
 
     def _find_worktree(self, repo: Repo, target: str) -> Worktree | None:
         for wt in repo.worktrees:
@@ -428,16 +464,29 @@ class MockGitBackend(GitBackend):
             return GitResult(0, "", "")
 
         if cmd == "ls-remote":
-            url = next((a for a in args[1:] if not a.startswith("-")), None)
+            rest = [a for a in args[1:] if not a.startswith("-")]
+            url = rest[0] if rest else None
             if url is None:
                 raise GitError("usage: git ls-remote <url>")
             source = self._target_repo(url)
+            # Trailing non-flag args are ref patterns: git matches a ref
+            # when it equals the pattern or ends with `/<pattern>` (a
+            # tail match beginning at a / boundary). HEAD lists only
+            # when it matches a pattern too.
+            patterns = rest[1:]
+
+            def _wants(ref: str) -> bool:
+                return not patterns or any(
+                    ref == p or ref.endswith("/" + p)
+                    for p in patterns)
+
             lines = []
             head_sha = source.refs.get(source.head_ref, source.head_sha or "")
-            if head_sha:
+            if head_sha and _wants("HEAD"):
                 lines.append(f"{head_sha}\tHEAD")
             for ref in sorted(source.refs):
-                lines.append(f"{source.refs[ref]}\t{ref}")
+                if _wants(ref):
+                    lines.append(f"{source.refs[ref]}\t{ref}")
             return GitResult(0, "\n".join(lines) + "\n" if lines else "", "")
 
         if cmd == "ls-tree":
@@ -457,7 +506,7 @@ class MockGitBackend(GitBackend):
             return GitResult(0, "", "")
 
         if cmd == "config":
-            if len(args) >= 3 and args[1] == "--get":
+            if len(args) >= 3 and args[1] in ("--get", "--get-all"):
                 key = f"{args[2]}.{args[3]}" if len(args) == 4 else args[2]
                 if key.startswith("remote.") and key.endswith(".url"):
                     # `config --get remote.<name>.url` answers the remote
@@ -481,8 +530,10 @@ class MockGitBackend(GitBackend):
                 return GitResult(0, "", "")
 
         if cmd == "fetch":
-            # fetch origin  (or fetch --prune origin / fetch --filter=... origin)
-            remote_name = args[-1]
+            # fetch [--no-tags|--filter=...|--depth=N|--prune] <remote> [<ref-or-sha>...]
+            pos = [a for a in args[1:] if not a.startswith("-")]
+            remote_name = pos[0] if pos else ""
+            targeted = pos[1:]
             remote_url = self._remote_url(repo, remote_name)
             if remote_url:
                 source = self._target_repo(remote_url)
@@ -510,6 +561,20 @@ class MockGitBackend(GitBackend):
                         if "HEAD" not in repo.refs:
                             repo.refs["HEAD"] = head_target
                         repo.refs[f"refs/remotes/{remote_name}/HEAD"] = head_target
+                for spec in targeted:
+                    # Targeted fetch — `fetch --no-tags origin <sha>`
+                    # lands the named commit's history without writing
+                    # a tracking ref (a commit sha is what no refspec
+                    # line can name).
+                    try:
+                        sha = source.resolve(spec)
+                    except GitError:
+                        sha = spec
+                    if sha not in source.commits:
+                        raise GitError(
+                            f"fatal: couldn't find remote ref {spec}")
+                    for anc in self._ancestors(sha):
+                        repo.commits[anc] = self._find_commit(anc)
             return GitResult(0, "", "")
 
         if cmd == "remote":
@@ -571,7 +636,9 @@ class MockGitBackend(GitBackend):
                 return GitResult(0, out + "\n", "")
             ref = args[-1]
             # strip trailing ^{} for tag peel display; resolve handles it
-            sha = repo.resolve(ref.replace("^{}", ""))
+            ref = ref.replace("^{}", "")
+            wt_sha = wt.refs.get(ref) if wt is not None else None
+            sha = wt_sha or repo.resolve(ref)
             out = sha[:12] if "--short" in args else sha
             return GitResult(0, out + "\n", "")
 
@@ -590,6 +657,9 @@ class MockGitBackend(GitBackend):
         if cmd == "show-ref":
             if "--verify" in args:
                 ref = args[-1]
+                wt_sha = wt.refs.get(ref) if wt is not None else None
+                if wt_sha:
+                    return GitResult(0, wt_sha + " " + ref + "\n", "")
                 resolved = None
                 if ref in repo.symrefs:
                     resolved = repo.symrefs[ref]
@@ -599,19 +669,78 @@ class MockGitBackend(GitBackend):
                     return GitResult(0, repo.refs[ref] + " " + ref + "\n", "")
                 return GitResult(1, "", "")
 
+        if cmd == "update-ref":
+            # update-ref [-d] <ref> [<sha>]
+            pos = self._positionals(args[1:], value_flags=())
+            if not pos:
+                raise GitError("usage: git update-ref <ref> [<sha>]")
+            ref = pos[0]
+            target = (
+                wt.refs
+                if wt is not None and ref.startswith("refs/worktree/")
+                else repo.refs)
+            if "-d" in args:
+                target.pop(ref, None)
+                return GitResult(0, "", "")
+            if len(pos) < 2:
+                raise GitError("usage: git update-ref <ref> <sha>")
+            sha = repo.resolve(pos[1].replace("^{}", ""))
+            target[ref] = sha
+            return GitResult(0, "", "")
+
+        if cmd == "rev-list" and "--left-right" in args:
+            # rev-list --left-right --count <a>...<b> — the drift
+            # algorithm's pair-count (commits each side has that the
+            # other lacks).
+            spec = next((a for a in args[1:] if "..." in a), None)
+            if spec is None:
+                raise GitError("usage: rev-list --left-right <a>...<b>")
+            a_ref, b_ref = spec.split("...", 1)
+            a_sha = repo.resolve(a_ref.replace("^{}", ""))
+            b_sha = repo.resolve(b_ref.replace("^{}", ""))
+            left = self._ancestors(a_sha) - self._ancestors(b_sha)
+            right = self._ancestors(b_sha) - self._ancestors(a_sha)
+            return GitResult(0, f"{len(left)}\t{len(right)}\n", "")
+
+        if cmd == "merge-base" and "--is-ancestor" in args:
+            pos = self._positionals(args[1:], value_flags=())
+            if len(pos) < 2:
+                raise GitError("usage: merge-base --is-ancestor <a> <b>")
+            a_sha = repo.resolve(pos[0].replace("^{}", ""))
+            b_sha = repo.resolve(pos[1].replace("^{}", ""))
+            if self._is_ancestor(a_sha, b_sha):
+                return GitResult(0, "", "")
+            return GitResult(1, "", "")
+
         if cmd == "checkout":
             if "-B" in args:
+                # `checkout -B` stays in the vocabulary only so CLI-shape
+                # tests can assert no producer issues it — under GF-D16
+                # a producer emitting it is a defect.
                 branch = args[args.index("-B") + 1]
-                start_ref = args[args.index("-B") + 2]
+                i = args.index("-B") + 2
+                start_ref = args[i] if i < len(args) else "HEAD"
                 sha = repo.resolve(start_ref.replace("^{}", ""))
             elif "-b" in args:
                 branch = args[args.index("-b") + 1]
-                start_ref = args[args.index("-b") + 2]
+                i = args.index("-b") + 2
+                start_ref = args[i] if i < len(args) else "HEAD"
                 sha = repo.resolve(start_ref.replace("^{}", ""))
             else:
                 branch = None
-                # Skip flags like -f to find the commit-ish.
-                sha = next(a for a in args[1:] if not a.startswith("-"))
+                # Skip flags like -f to find the commit-ish, then
+                # resolve it — a plain `checkout <branch>` ATTACHES to
+                # an existing local branch (it does not detach).
+                target = next(
+                    (a for a in args[1:] if not a.startswith("-")), None)
+                if target is None:
+                    raise GitError("fatal: checkout requires a target")
+                sha = repo.resolve(target.replace("^{}", ""))
+                if (
+                    "--detach" not in args and "-d" not in args
+                    and f"refs/heads/{target}" in repo.refs
+                ):
+                    branch = target
             if branch and wt is not None:
                 # One checkout per branch per common dir.
                 conflict = self._branch_in_use(repo, branch, exclude=wt)
@@ -630,11 +759,15 @@ class MockGitBackend(GitBackend):
             ref = args[args.index("--ff-only") + 1]
             target_sha = repo.resolve(ref)
             cur_sha = self._head_sha(repo, wt) if wt is not None else repo.head_sha
-            if target_sha == cur_sha:
+            # Real ancestry: an up-to-date or strictly-ahead HEAD is a
+            # no-op ("Already up to date"), a strictly-behind HEAD
+            # fast-forwards, and anything else refuses.
+            if target_sha == cur_sha or self._is_ancestor(
+                    target_sha, cur_sha):
                 return GitResult(0, "Already up to date.\n", "")
             commit = self._find_commit(target_sha)
             repo.commits[target_sha] = commit
-            if cur_sha and cur_sha not in commit.parents:
+            if cur_sha and not self._is_ancestor(cur_sha, target_sha):
                 return GitResult(1, "", "merge: not fast-forward")
             self._apply_commit(
                 repo, wt, commit, target_sha, self._head_branch(repo, wt),
@@ -836,11 +969,19 @@ class MockGitBackend(GitBackend):
             stashes = wt.stashes if wt is not None else repo.stashes
             cone = wt.cone if wt is not None else repo.cone
             root = self._work_root(wt, work_tree)
+            if sub == "list":
+                out = "".join(
+                    f"stash@{{{i}}}: On {self._head_branch(repo, wt) or 'HEAD'}:"
+                    f" {entry.get('message', 'WIP')}\n"
+                    for i, entry in enumerate(stashes))
+                return GitResult(0, out, "")
             if sub == "push":
                 # stash push -u -m <msg>
                 # Snapshot only the dirty/untracked files from disk so the
                 # pop reapplies local changes on top of the updated worktree
                 # without clobbering files the update changed.
+                msg = (args[args.index("-m") + 1] if "-m" in args
+                       else "WIP")
                 snapshot: dict[str, str] = {}
                 if root is not None:
                     for name in indexed:
@@ -862,7 +1003,9 @@ class MockGitBackend(GitBackend):
                             continue
                         if rel not in known:
                             snapshot[rel] = entry.read_text()
-                stashes.append({"worktree": snapshot, "indexed": dict(indexed)})
+                stashes.append({"worktree": snapshot,
+                                "indexed": dict(indexed),
+                                "message": msg})
                 # Reset tracked files to indexed (clean) state and remove the
                 # now-stashed untracked files.
                 workmap.clear()
@@ -886,6 +1029,10 @@ class MockGitBackend(GitBackend):
                         p = root / name
                         p.parent.mkdir(parents=True, exist_ok=True)
                         p.write_text(content)
+                if "--index" in args:
+                    # `pop --index` also restores the index partition —
+                    # the staged/unstaged split is part of the work.
+                    indexed.update(entry["indexed"])
                 return GitResult(0, "", "")
             raise GitError(f"unmocked git command: {' '.join(args)}")
 

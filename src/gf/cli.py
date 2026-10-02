@@ -411,7 +411,6 @@ def cmd_pull(args, backend: GitBackend) -> int:
                     it["co"], it["url"], it["ref"], it["anchor"],
                     override=manifest.override_active(folder, overrides),
                     rebase=args.rebase,
-                    force=args.force,
                     autostash=args.autostash,
                     backend=backend,
                     binding_path=folder["path"],
@@ -445,7 +444,6 @@ def cmd_pull(args, backend: GitBackend) -> int:
         for line in shelf.pull_shared_bindings(
             pending, folders, parent,
             rebase=args.rebase,
-            force=args.force,
             autostash=args.autostash,
             backend=backend,
         ):
@@ -518,6 +516,20 @@ def cmd_rm(args, backend: GitBackend) -> int:
     return 0
 
 
+def _gitdir_usable(co: layout.Checkout) -> bool:
+    """True when `co.gitdir` names this checkout's own storage.
+
+    A whole-repo child whose `.gf` resolves through a link has no gitdir
+    of its own — the spelled `child/.gf/git` reaches a foreign gitdir,
+    whose HEAD/branch/status would render as this child's. Read-side
+    callers degrade to their missing-gitdir fallbacks rather than die.
+    A store checkout's gitdir lives under the parent's `.gf` storage
+    (guarded at write sites by `layout.storage_is_real`), so only the
+    whole-repo shape is tested here.
+    """
+    return co.is_store_checkout or layout.whole_repo_gitdir_is_real(co)
+
+
 def _head(co: layout.Checkout, backend: GitBackend) -> str:
     """Short HEAD SHA; "?" when the gitdir has no HEAD or HEAD is unborn.
 
@@ -525,7 +537,7 @@ def _head(co: layout.Checkout, backend: GitBackend) -> str:
     fallbacks (pre-clone path); a `--short` failure after HEAD verifies
     is a genuine git failure and propagates.
     """
-    if not (co.gitdir / "HEAD").is_file():
+    if not _gitdir_usable(co) or not (co.gitdir / "HEAD").is_file():
         return "?"
     if backend.git(
         "rev-parse", "--verify", "HEAD",
@@ -545,7 +557,7 @@ def _branch(co: layout.Checkout, backend: GitBackend) -> str:
     empty brackets rather than the symbolic-ref target. A failure after
     HEAD verifies is a genuine git failure and propagates.
     """
-    if not (co.gitdir / "HEAD").is_file():
+    if not _gitdir_usable(co) or not (co.gitdir / "HEAD").is_file():
         return ""
     if backend.git(
         "rev-parse", "--verify", "HEAD",
@@ -563,7 +575,11 @@ def _porcelain(
     backend: GitBackend,
     paths: list[str] | None = None,
 ) -> str:
-    if not (co.gitdir / "HEAD").is_file() or not co.work_tree.is_dir():
+    if (
+        not _gitdir_usable(co)
+        or not (co.gitdir / "HEAD").is_file()
+        or not co.work_tree.is_dir()
+    ):
         return ""
     if paths is not None:
         return shelf.scoped_porcelain(co, paths, backend)
@@ -799,7 +815,19 @@ def _passthrough_target(op: str) -> tuple[layout.Checkout, Path]:
 
     co = layout.resolve_checkout(target)
     git_dir = co.gitdir.resolve()
-    if not (git_dir / "HEAD").is_file():
+    # A whole-repo child whose `.gf` resolves through a link has no
+    # gitdir of its own: `co.gitdir` then reaches a foreign gitdir and
+    # the subprocess would run inside the donor's storage — fail closed
+    # like a missing gitdir, naming the `.gf` resolution. A store
+    # checkout's gitdir legitimately lives under the parent's `.gf`, so
+    # only the whole-repo shape is tested.
+    gitdir_real = (
+        co.is_store_checkout or layout.whole_repo_gitdir_is_real(co))
+    if not gitdir_real or not (git_dir / "HEAD").is_file():
+        reason = (
+            f"child gitdir path {co.gitdir} resolves through a symlink"
+            if not gitdir_real
+            else "not inside a git-folder child")
         folder = None
         if parent is not None and os.path.lexists(
                 parent / manifest.MANIFEST):
@@ -807,9 +835,8 @@ def _passthrough_target(op: str) -> tuple[layout.Checkout, Path]:
                 parent, cwd, manifest.read_manifest(parent))
         if folder is not None:
             die(folder_error(
-                folder["name"], folder["path"], op,
-                "not inside a git-folder child"))
-        die("not inside a git-folder child")
+                folder["name"], folder["path"], op, reason))
+        die(reason)
     return co, Path(os.path.realpath(cwd))
 
 
@@ -947,7 +974,7 @@ def _worktree_link_folders(
     for manifest_name in (manifest.MANIFEST, manifest.LOCAL):
         src = parent / manifest_name
         dst = new_parent / manifest_name
-        if not src.exists():
+        if src.is_symlink() or not src.is_file():
             continue
         if dst.is_symlink():
             # A checked-out symlink (e.g. a committed `gf.toml -> /abs`)
@@ -1255,7 +1282,6 @@ def main(argv: list[str] | None = None, backend: GitBackend | None = None) -> in
     p_pull = sub.add_parser("pull", help="pull selected children")
     p_pull.add_argument("path", nargs="*")
     p_pull.add_argument("--rebase", action="store_true", dest="rebase", default=False, help="rebase the local branch after fetching")
-    p_pull.add_argument("--force", action="store_true", dest="force", default=False, help="allow updating a dirty child (checkout -f)")
     p_pull.add_argument("--autostash", action="store_true", dest="autostash", default=False, help="stash, pull, and restore local changes")
 
     p_rm = sub.add_parser("rm", help="remove selected children")
@@ -1264,7 +1290,7 @@ def main(argv: list[str] | None = None, backend: GitBackend | None = None) -> in
 
     p_status = sub.add_parser("status", help="show git porcelain status")
     p_status.add_argument("path", nargs="*")
-    p_status.add_argument("--remote", action="store_true", default=False, help="classify drift against local remote-tracking refs (clean/behind/local-dirty/both/missing)")
+    p_status.add_argument("--remote", action="store_true", default=False, help="classify drift against local remote-tracking refs (clean/ahead/behind/diverged/missing, -dirty when the tree is dirty)")
 
     p_ls = sub.add_parser("ls", help="list git-folders")
     p_ls.add_argument("path", nargs="*")
@@ -1315,6 +1341,18 @@ def main(argv: list[str] | None = None, backend: GitBackend | None = None) -> in
         cmd_idx = argv.index(args.command)
         args.git_args = list(argv[cmd_idx + 1:])
     elif unknown:
+        # `pull --force` was removed rather than repurposed: `gf` offers
+        # no flag that waives preservation — a dirty tree is committed,
+        # stashed, or carried through the update by --autostash. Name the
+        # removal instead of a bare "unrecognized arguments" so a user
+        # who learned the old flag gets the recovery, not just a refusal.
+        if args.command == "pull" and any(
+            a == "--force" or a.startswith("--force=") for a in unknown
+        ):
+            parser.error(
+                "gf pull has no --force: updating over uncommitted work "
+                "is never offered — commit or stash the work first, or "
+                "pull with --autostash")
         parser.error(f"unrecognized arguments: {' '.join(unknown)}")
 
     # GitFoldersError escaping a command (e.g. a manifest error raised by

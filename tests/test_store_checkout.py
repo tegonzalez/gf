@@ -13,7 +13,8 @@ Real-git pins for the machinery layer (no new command behavior):
   store's default symref cannot claim a branch.
 * ``shelf.ensure_checkout`` — ``worktree add --no-checkout --detach``;
   record verification (admin dir + gitdir file); ``sparse-checkout set
-  --cone`` union; ``checkout -B`` (branch) or detached (tag/commit); ``.git``
+  --cone`` union; the ref apply (attach + ``merge --ff-only`` for a
+  branch, detached for tag/commit); ``.git``
   gitfile removal; idempotent ``worktree lock``; teardown of only what the
   call created — never the store.
 * ``shelf.ensure_consumer_link`` — relative symlink; retarget; rollback pair.
@@ -162,8 +163,12 @@ def test_ensure_repo_store_bare_origin_wildcard_refspec(root, upstream, store):
     ]
     master = _out("--git-dir", upstream, "rev-parse", "refs/heads/master")
     assert _sha(store, "refs/remotes/origin/master") == master
-    assert _sha(store, "refs/tags/v1") == _out(
-        "--git-dir", upstream, "rev-parse", "refs/tags/v1")
+    # GF-D17 / Fetch refspecs: every gf-issued fetch carries --no-tags,
+    # so upstream's v1 is never auto-followed into the store — a tag
+    # lands only through the appended non-forced line when a binding's
+    # effective ref names it.
+    assert _git("--git-dir", store, "rev-parse", "--verify",
+                "refs/tags/v1", check=False).returncode != 0
 
 
 def test_ensure_repo_store_single_branch_first_refspec(root, upstream):
@@ -263,8 +268,8 @@ def test_ensure_repo_store_falls_back_to_full_fetch(root, upstream, capfd):
 
 def test_ensure_repo_store_head_not_claiming_a_branch(store):
     """Store HEAD is repointed to refs/remotes/origin/HEAD (resolves
-    through the remote symref — never under refs/heads/) so
-    ``checkout -B master`` in a linked checkout is not refused
+    through the remote symref — never under refs/heads/) so a linked
+    checkout's ``checkout master`` / ref apply is not refused
     (spec Checkout integrity paragraph; row receiving item)."""
     head = _out("--git-dir", store, "symbolic-ref", "HEAD")
     assert not head.startswith("refs/heads/")
@@ -277,7 +282,7 @@ def test_ensure_repo_store_head_not_claiming_a_branch(store):
 
 def test_ensure_checkout_record_gitfile_removed_locked(root, store, co_docs):
     """worktree add --no-checkout --detach → record at
-    <store>/worktrees/<key> with gitdir file → sparse cone → checkout -B →
+    <store>/worktrees/<key> with gitdir file → sparse cone → ref apply →
     .git gitfile removed → worktree lock (spec Checkout integrity;
     GF-D8/D12; constraint gitfile)."""
     shelf.ensure_checkout(co_docs, "master")

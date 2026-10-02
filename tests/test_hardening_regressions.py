@@ -20,8 +20,8 @@ Authorities (docs/gf-spec.md unless noted):
   deterministic non-zero exit when the effective ref cannot be resolved
   locally. Ruling U1 fixes the unborn child's rendering: `[]` for the
   branch bracket and `?` for the hash; when the effective ref does
-  resolve locally, drift reports `behind` or `both` — an unborn HEAD
-  can never match the resolved SHA.
+  resolve locally, drift reports `behind` or `behind-dirty` — an
+  unborn HEAD can never match the resolved SHA.
 - Subfolder-to-whole-repo url switch: Repo store / Checkout terminology,
   "A whole-repo binding and subfolder bindings of the same repository do
   not share object storage", "a changed repo URL selects a different repo
@@ -284,7 +284,8 @@ def test_status_remote_unborn_init_child_reports_unresolvable_ref(tmp_path):
     assert "latest" in err, err
     assert "scratch" in err, err
     assert not re.search(
-        r"^scratch\s.*\b(clean|behind|local-dirty|both|missing)$",
+        r"^scratch\s.*\b(clean|ahead|behind|diverged|missing|"
+        r"local-dirty|ahead-dirty|behind-dirty|diverged-dirty)$",
         r.stdout, re.M), r.stdout
 
 
@@ -294,9 +295,9 @@ def test_status_remote_unborn_init_child_with_resolvable_ref_reports_behind(
     resolve locally reports a drift state instead of a git error. After
     `latest` resolves (remote configured, upstream fetched into the
     child's gitdir) the unborn HEAD can never match the resolved SHA, so
-    `gf status --remote` reports `behind` on a clean worktree and `both`
-    once the child has local changes (spec `gf status`, Drift
-    algorithm)."""
+    `gf status --remote` reports `behind` on a clean worktree and
+    `behind-dirty` once the child has local changes (spec `gf status`,
+    Drift algorithm)."""
     up = _upstream(tmp_path, "upstream", API)
     parent = _parent(tmp_path)
     _setup_gf("-C", str(parent), "init", "scratch")
@@ -332,7 +333,7 @@ def test_status_remote_unborn_init_child_with_resolvable_ref_reports_behind(
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     row = re.search(scratch_row, r.stdout, re.M)
     assert row, r.stdout
-    assert row.group(1) == "both", r.stdout
+    assert row.group(1) == "behind-dirty", r.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -1198,12 +1199,14 @@ def test_pull_retargets_dangling_consumer_link(tmp_path):
 
 def test_pull_recreated_checkout_heals_dangling_consumer_link(tmp_path):
     """Heal pin, second arm: deleting the shared checkout leaves the
-    consumer link dangling; `gf pull --force` recreates the worktree
-    (its admin record survives — `ensure_checkout`'s existing-checkout
-    arm) so the untouched link resolves again and serves the mapping.
-    `--force` answers the recreated checkout's transient ` D` porcelain
-    — the fresh worktree reads deleted against the surviving index
-    before the ref apply repopulates it."""
+    consumer link dangling; a plain `gf pull` re-materializes the
+    worktree from the binding's recorded identity (its admin record
+    survives — `ensure_checkout`'s existing-checkout arm) so the
+    untouched link resolves again and serves the mapping (gf-spec.md
+    `gf pull`: "a consumer link, a checkout, a gitdir — from that
+    identity"). A checkout gf itself just recreated carries no user
+    work — its transient ` D` porcelain is gf's own mid-operation
+    artifact, not a dirty-worktree refusal."""
     up = _upstream(tmp_path, "upstream", API)
     parent = _occupied_parent(tmp_path)
     _setup_gf("-C", str(parent), "clone", f"{up}/docs/api", "vendor/api")
@@ -1214,7 +1217,7 @@ def test_pull_recreated_checkout_heals_dangling_consumer_link(tmp_path):
     if link.exists() or not link.is_symlink():
         pytest.fail("setup: consumer link not left dangling")
 
-    r = gf("-C", str(parent), "pull", "--force", check=False)
+    r = gf("-C", str(parent), "pull", check=False)
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     assert "Pulled api" in r.stdout, r.stdout
     assert link.is_symlink() and link.exists(), "link still dangling"

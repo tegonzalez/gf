@@ -337,10 +337,20 @@ class TestClone:
             "-C", str(parent), "clone", "/upstream", "lib",
             "-b", "feature", "--single-branch", backend=mock_backend,
         )
-        config_calls = [c for c in mock_backend.calls if c[0][0] == "config" and c[0][1] == "remote.origin.fetch"]
-        assert config_calls
-        last = config_calls[-1][0]
-        assert last[2] == "+refs/heads/feature:refs/remotes/origin/feature"
+        # refspec VALUES written — the write may be a plain `config`
+        # narrowing set or a `config --add` coverage append; both are
+        # admitted spellings. `config --get-all` reads carry no value.
+        writes = [c[0][-1] for c in mock_backend.calls
+                  if c[0][0] == "config" and "remote.origin.fetch" in c[0][1:]
+                  and c[0][-1].startswith(("+refs/", "refs/"))]
+        assert writes
+        # narrowed to the resolved branch; `+` stays inside the
+        # refs/remotes/origin/* mirror namespace (gf-spec Fetch refspecs)
+        assert writes[-1] == \
+            "+refs/heads/feature:refs/remotes/origin/feature"
+        # `feature` is a branch upstream — no tag coverage is needed and
+        # no forced line may land outside the mirror namespace
+        assert not any(w.startswith("+refs/tags/") for w in writes)
 
 
 class TestPull:
@@ -462,7 +472,11 @@ class TestPull:
         child = parent / "lib"
         assert (child / "a.txt").read_text() == "update"
 
-    def test_pull_force_updates_dirty_child(self, fs, gf_inproc, mock_backend):
+    def test_pull_force_flag_is_rejected(self, fs, gf_inproc, mock_backend):
+        """`gf pull --force` does not exist (gf-spec `gf pull`): updating
+        over uncommitted work is never offered — the flag is rejected
+        with a nonzero exit before any git work, and the dirty child's
+        bytes stay untouched."""
         parent = _parent(fs)
         upstream_repo = mock_backend.seed("/upstream", bare=True, mirror=False)
         mock_backend.add_commit(upstream_repo, SHA1, {"a.txt": "hello"})
@@ -471,28 +485,16 @@ class TestPull:
 
         gf_inproc("-C", str(parent), "clone", "/upstream", "lib", backend=mock_backend)
 
-        # Dirty the child and advance the remote.
-        (parent / "lib" / "a.txt").write_text("dirty")
-        mock_backend.add_commit(upstream_repo, SHA2, {"a.txt": "update"}, parents=[SHA1])
-        upstream_repo.refs["refs/heads/master"] = SHA2
-
-        r = gf_inproc("-C", str(parent), "pull", "--force", backend=mock_backend)
-        assert r.returncode == 0, r.stderr
-        # Force checkout overwrites the dirty file with the remote content.
-        assert (parent / "lib" / "a.txt").read_text() == "update"
-
-    def test_pull_force_uses_checkout_f(self, fs, gf_inproc, mock_backend):
-        parent = _parent(fs)
-        _upstream(mock_backend, files={"a.txt": "hello"})
-        gf_inproc("-C", str(parent), "clone", "/upstream", "lib", backend=mock_backend)
-
         (parent / "lib" / "a.txt").write_text("dirty")
 
         before = len(mock_backend.calls)
-        gf_inproc("-C", str(parent), "pull", "--force", backend=mock_backend)
-        checkout_calls = [c for c in mock_backend.calls[before:] if c[0][0] == "checkout"]
-        assert checkout_calls
-        assert "-f" in checkout_calls[0][0]
+        r = gf_inproc("-C", str(parent), "pull", "--force",
+                      backend=mock_backend, check=False)
+        assert r.returncode != 0
+        assert "--force" in r.stderr or "force" in r.stderr
+        # rejected before any git call could touch the child
+        assert mock_backend.calls[before:] == []
+        assert (parent / "lib" / "a.txt").read_text() == "dirty"
 
     def test_pull_autostash_restores_dirty_changes(self, fs, gf_inproc, mock_backend):
         parent = _parent(fs)
@@ -526,7 +528,9 @@ class TestPull:
         gf_inproc("-C", str(parent), "pull", "--autostash", backend=mock_backend)
         new_calls = [c[0] for c in mock_backend.calls[before:]]
         assert ("stash", "push", "-u", "-m", "gf autostash") in new_calls
-        assert ("stash", "pop") in new_calls
+        # `pop --index`: the staged/unstaged partition is part of the
+        # work being preserved (gf-spec `gf pull`)
+        assert ("stash", "pop", "--index") in new_calls
 
     def test_pull_without_force_or_autostash_aborts_dirty(self, fs, gf_inproc, mock_backend):
         parent = _parent(fs)
@@ -649,7 +653,7 @@ class TestStatus:
         assert r.returncode == 0, r.stderr
         assert re.search(r"lib\s+/upstream\s+\[master\]\s+local-dirty", r.stdout)
 
-    def test_status_remote_both(self, fs, gf_inproc, mock_backend):
+    def test_status_remote_behind_dirty(self, fs, gf_inproc, mock_backend):
         parent = _parent(fs)
         upstream_repo = mock_backend.seed("/upstream", bare=True, mirror=False)
         mock_backend.add_commit(upstream_repo, SHA1, {"a.txt": "hello"})
@@ -672,7 +676,11 @@ class TestStatus:
 
         r = gf_inproc("-C", str(parent), "status", "--remote", backend=mock_backend)
         assert r.returncode == 0, r.stderr
-        assert re.search(r"lib\s+/upstream\s+\[master\]\s+both", r.stdout)
+        # `behind-dirty`: the rev-list relation is behind (the remote
+        # tip has commits HEAD lacks) and the worktree is dirty —
+        # gf-spec.md Drift algorithm vocabulary.
+        assert re.search(r"lib\s+/upstream\s+\[master\]\s+behind-dirty",
+                         r.stdout)
 
     def test_status_remote_does_not_fetch(self, fs, gf_inproc, mock_backend):
         """`gf status --remote` is local-only: no git fetch/remote/ls-remote."""
@@ -753,7 +761,10 @@ class TestStatus:
         new_calls = [c[0][0] for c in mock_backend.calls[before:]]
         assert "fetch" not in new_calls
         # Non-remote output format is unchanged: no drift state column.
-        assert not re.search(r"\[(master|HEAD)\]\s+(clean|behind|local-dirty|both)", r.stdout)
+        assert not re.search(
+            r"\[(master|HEAD)\]\s+(clean|ahead|behind|diverged|missing|"
+            r"local-dirty|ahead-dirty|behind-dirty|diverged-dirty)",
+            r.stdout)
 
 
 class TestInit:

@@ -22,8 +22,10 @@ Common issues and resolutions for `git-folders` users.
 | GF-TRB-8 | 2026-09-25T20:12:46Z | diagnostics-deferral | A trailing-slash `.gitignore` pattern does not match a subfolder binding's consumer symlink, so the parent lists the link as untracked.                                                                                                                                                                  | [gf-spec.md](gf-spec.md)       | unseeded | documented  | ignore the consumer path without a trailing slash, as `gf` recommends                                                   |
 | GF-TRB-9 | 2026-09-30T03:56:00Z | diagnostics-deferral | `gf clone` of a subfolder whose directory name starts with `!` (e.g. `app/!foo`) died on git ≥ 2.36 — `git sparse-checkout set --cone` rejected a `!`-leading operand while `gf` added `--skip-checks` only for names containing `*?[]\`; git 2.35's cone mode has no operand check and accepts the name. | [gf-spec.md](gf-spec.md)       | unseeded | **fixed** | absorbed: the member predicate now flags a `!`-bearing operand (operand-leading or a `!`-leading `/` segment) for `--skip-checks`, covering git's full sanitize set |
 | GF-TRB-10 | 2026-09-30T06:22:35Z | diagnostics-deferral | `gf log`/`gf diff` suppress the subfolder scope when a separately spelled option value looks pathspec-like — `--grep fix.*` (a space between flag and value) is mistaken for a path operand and drops the `-- .` default, while `--grep=fix.*` stays scoped; there is no option-arity table for passthrough commands | [gf-spec.md](gf-spec.md) | unseeded | documented | spell values carrying `*?[`, a leading `:`, or naming an existing path with `=` (`--grep=fix.*`), or separate options from paths with an explicit `--` (`gf log -- <paths>`) |
-| GF-TRB-11 | 2026-09-30T12:22:52Z | diagnostics-deferral | `gf` takes no inter-process lock: concurrent invocations on one parent interleave store, manifest, and state writes last-writer-wins; a losing clone/pull's store rollback keeps any store holding worktree records, but an earlier interleaving window can still wedge a join against `refusing to rebuild over existing files`; concurrent `clone`/`init`/`rm` invocations also race the `gf.toml` rewrite itself — a completed clone can leave its store, checkout, and consumer link fully materialized while its `git_folder` entry is silently dropped, invisible to `ls`/`status`/`rm` | [gf-spec.md](gf-spec.md) | unseeded | documented | run one `gf` command at a time per parent repo; after a concurrent failure, re-run; a dropped binding is recovered by re-running its `gf clone`/`gf init` — the add rejoins the orphaned storage with uncommitted work intact |
+| GF-TRB-11 | 2026-09-30T12:22:52Z | diagnostics-deferral | `gf` took no inter-process lock: concurrent invocations on one parent interleaved store, manifest, and state writes last-writer-wins — a completed clone could leave its store, checkout, and consumer link fully materialized while its `git_folder` entry was silently dropped, invisible to `ls`/`status`/`rm`. | [gf-spec.md](gf-spec.md) | unseeded | documented | closed by the admitted `GF-D20` design ([gf-arch.md](gf-arch.md#decision-register)): mutating commands serialize on `flock` of `<git common dir>/gf.lock` — the lock lands with the P3 phase; until it does, run no concurrent mutating `gf` commands on one parent |
 | GF-TRB-12 | 2026-09-30T23:51:04Z | diagnostics-deferral | A parent repository that tracks `.gf` lets the parent's own `git pull` rewrite gf-managed store plumbing beyond hooks and origin — committed `.gf` content lands over repo-store config, refs, or objects, which the bound-upstream root-`.gf` refusal, `core.hooksPath=/dev/null`, and the store-origin match do not cover. | [gf-spec.md](gf-spec.md) | unseeded | documented | the precondition is the documented must-not — do not track `.gf` in the parent (keep the `.gf/` `.gitignore` recommendation); full closure needs a tracked-`.gf` refusal, e.g. a `git ls-files .gf` probe at parent operations |
+| GF-TRB-13 | 2026-10-01T02:28:05Z | diagnostics-deferral | A whole-repo `gf rm` reconciles each registered linked-worktree gitfile to the moved `child/.git` before the move and refuses when one cannot be reconciled; a post-move rewrite failure reports the exact path and leaves a straggler gitfile pointing at the old `.gf/git` location. | [gf-spec.md](gf-spec.md) | unseeded | documented | recover a straggler with `git worktree repair <worktree-path>` in the converted child; retires if reconciliation covers post-move failures |
+| GF-TRB-14 | 2026-10-01T02:28:05Z | diagnostics-deferral | A pre-existing `+`-forced `remote.origin.fetch` line whose destination lands outside `refs/remotes/origin/*` — legacy state an older `gf` could write, such as a forced tag line — refuses a fetch or store operation as unsafe rather than being rewritten or executed. | [gf-spec.md](gf-spec.md) | unseeded | documented | the user repairs the line deliberately with their own `git config` in that gitdir; retires if a `gf` repair path is admitted |
 
 ## `gf clone <url>` says `url` is required
 
@@ -35,7 +37,7 @@ The git-folder `url` is a local placeholder from `gf init`. `gf pull` skips plac
 
 ## `gf ls` shows `[]` for branch
 
-The child is in a detached `HEAD`. This is expected for tag or commit refs. A child with no commits yet, for example one just created by `gf init`, also shows `[]`; that is a normal state, not a detached `HEAD`. For `latest` or branch refs, ensure `init_child`/`update_child` uses `git checkout -B <branch> origin/<branch>`. If the remote has no default branch, the clone may be empty.
+The child is in a detached `HEAD`. This is expected for tag or commit refs. A child with no commits yet, for example one just created by `gf init`, also shows `[]`; that is a normal state, not a detached `HEAD`. For `latest` or branch refs the checkout should be attached to a local tracking branch — `gf` creates it at `origin/<branch>` when absent and integrates `origin/<branch>` fast-forward-only when it exists; `gf` never uses `checkout -B` or `checkout -f`, so a branch ref left detached is a defect to report. If the remote has no default branch, the clone may be empty.
 
 ## `gf status` is empty
 
@@ -43,7 +45,15 @@ The child is in a detached `HEAD`. This is expected for tag or commit refs. A ch
 
 ## `gf rm` deleted my worktree
 
-For a whole-repo child, `gf rm` must only move `child/.gf/git` to `child/.git`. If it deletes more, file a bug. It should preserve all user files.
+For a whole-repo child, `gf rm` must only move `child/.gf/git` to `child/.git` — an immediately usable repository with `HEAD`, index, refs, config, and `origin` intact, and any `git worktree` entries registered in it reconciled to the new path. If it deletes more, file a bug. It should preserve all user files.
+
+## `gf rm` left a `.gf` directory behind
+
+On a whole-repo `gf rm`, `gf` removes only provably `gf`-owned `.gf` content — its `state` bookkeeping — after moving `child/.gf/git` to `child/.git`, and removes `.gf` itself only when nothing remains. Anything else under `.gf` is foreign content: it is retained and reported, never swept. Inspect what remains and delete it yourself once it is unwanted.
+
+## `gf rm` refuses over a registered worktree
+
+A whole-repo child's gitdir can have `git worktree` entries registered under `worktrees/<n>/`. Before moving `child/.gf/git` to `child/.git`, `gf` reconciles each record's external `.git` gitfile — it must be writable and currently name the old `.gf/git/worktrees/<n>` path — and refuses before the move when a record cannot be reconciled, leaving the binding gf-managed and nothing moved. Make the named gitfile writable or remove the stale registration (`gf git worktree prune`, or `gf git worktree remove` — plain `git` inside the child sees the parent, not the `.gf/git` gitdir), then re-run `gf rm`. If the move itself succeeded but a post-move rewrite failed, `gf` reports the exact unresolved path; run `git worktree repair <worktree-path>` in the converted child — now an ordinary repository — to fix the straggler.
 
 ## My subfolder disappeared after `gf rm`
 
@@ -60,6 +70,10 @@ For a subfolder binding, `gf rm` removes only the link at the consumer path and 
 ## `git worktree prune` ran against a repo store
 
 `gf` locks every checkout under `.gf/wt`, so `git worktree prune` skips them and the checkouts survive. If a checkout was unlocked, the next `gf pull` locks it again. If a checkout was unlocked and then pruned, git no longer has its worktree record; `gf pull` stops with an error for that checkout rather than rebuilding over its files. Save any work in that directory, delete it, and run `gf pull` to create a fresh checkout.
+
+## `gf` refuses an unsafe fetch refspec
+
+A fetch may move only `gf`'s remote-tracking mirror: force (`+`) is permitted only on a `remote.origin.fetch` line whose destination is `refs/remotes/origin/*`. A pre-existing `+` line landing outside that namespace — a forced tag or branch line an older `gf` could write into a child gitdir (`<child>/.gf/git/config`) or a repo store (`.gf/repos/<repo-key>/git/config`) — would move user-owned refs on every fetch, so `gf` refuses before fetching and reports the unsafe line. `gf` never rewrites the line itself: repair it deliberately with your own `git config` in that gitdir — for example `git --git-dir <gitdir> config --unset-all remote.origin.fetch`, then `--add` the replacement coverage (`+refs/heads/*:refs/remotes/origin/*` or a per-branch mirror line; tag coverage carries no `+`: `refs/tags/<t>:refs/tags/<t>`) — and re-run the command.
 
 ## `gf clone <url>/<dir>` fails with `fatal: couldn't fetch ...`
 
@@ -79,11 +93,11 @@ Fixed: the member predicate now flags a `!`-bearing operand — operand-leading 
 
 For a subfolder binding, `gf` appends `-- .` to `log`/`diff` unless the trailing args contain `--` or a pathspec-like operand (an existing path under the mapped directory, or one carrying `*`, `?`, `[`, or a leading `:`). The scan reads tokens, not options: a separately spelled value such as `gf log --grep 'fix.*'` occupies its own token, carries `*`, and disables the default scope, so the command runs over the whole repository. The `=` spelling (`--grep=fix.*`) keeps the value inside the option token and stays scoped. There is deliberately no option-arity table for passthrough commands — when a value must be spelled separately and looks pathspec-like, end options with an explicit `--` (`gf log --grep 'fix.*' -- <paths>`), or scope explicitly with `gf log -- <paths>`.
 
-## `gf` commands run concurrently on one parent
+## `gf` commands run concurrently on one parent (documented)
 
-`gf` takes no inter-process lock: two invocations on one parent interleave store, manifest, and state writes last-writer-wins. A losing clone's or pull's store rollback keeps any store that already holds worktree records, so it no longer deletes `store/worktrees/<key>` records a concurrent join just committed — but an earlier interleaving window can still wedge a join against `refusing to rebuild over existing files` or leave a half-updated manifest or state file.
+Admitted fix, landing with the P3 phase: mutating `gf` commands — `clone`, `init`, `pull`, `rm`, `worktree add`, `worktree remove` — serialize on a `flock` of `<git common dir>/gf.lock` (`GF-D20`), held exclusively from before the first planning read through command end. One lock covers every worktree of the parent. A second writer waits on the blocking lock; when the lock cannot be acquired at all, the command fails fast and names the contended resource. The lock is descriptor-held, so a killed `gf` releases it — no stale lock file survives. Read commands (`status`, `ls`, `worktree list`) and the passthroughs (`sh`, `git`, `diff`, `log`) take no lock.
 
-Concurrent `gf clone`/`init`/`rm` invocations also race the `gf.toml` rewrite itself: each invocation snapshots the manifest it read and rewrites it atomically at the end, so the last writer wins. A completed clone can leave its repo store, checkout, and consumer link fully materialized while its `git_folder` entry is silently dropped — the orphaned binding is invisible to `gf ls`, `gf status`, and `gf rm`. To recover a dropped binding, re-run its `gf clone`/`gf init`: the add finds the existing child or store checkout and re-records the binding, rejoining the orphaned storage with any uncommitted work intact; if the orphan is unwanted instead, remove `.gf/repos/<repo-key>` and `.gf/wt/<repo-key>` by hand. Run one `gf` command at a time per parent repo; after a concurrent failure, re-run the command.
+Was: `gf` took no inter-process lock, so two invocations on one parent interleaved store, manifest, and state writes last-writer-wins; a completed clone could leave its repo store, checkout, and consumer link fully materialized while its `git_folder` entry was silently dropped — invisible to `gf ls`, `gf status`, and `gf rm`. That remains the installed baseline until P3 lands the lock: the workaround is to run no concurrent mutating `gf` commands on one parent. A binding orphaned by a pre-lock race is still recovered by re-running its `gf clone`/`gf init`: the add rejoins the orphaned storage with uncommitted work intact; if the orphan is unwanted instead, remove `.gf/repos/<repo-key>` and `.gf/wt/<repo-key>` by hand.
 
 ## A subfolder link shows up in `git status` of the parent
 
@@ -91,10 +105,26 @@ A subfolder binding's consumer path is a symlink, and a `.gitignore` pattern wit
 
 ## `gf pull` aborts on dirty worktree
 
-`gf pull` aborts by default to avoid overwriting local changes. You can:
-- commit or stash the child changes first,
-- use `gf pull --autostash` to stash, pull, and restore changes,
-- or use `gf pull --force` to discard local worktree changes and check out the resolved ref.
+`gf pull` refuses to update over uncommitted work — the refusal exits `3` and discards nothing. You can:
+- commit the child changes first, or stash them yourself (`gf -C <child> git commit`, `gf -C <child> git stash`),
+- use `gf pull --autostash` to `stash push -u`, update, and `stash pop --index` the changes back — the index partition (staged versus unstaged) is restored too — the restore runs after a successful update and after every failure that follows the stash,
+- or, when the changes are genuinely unwanted, discard them yourself with `gf git`/`gf sh`. `gf` has no discard mode: there is no `gf pull --force`.
+
+## `gf pull` refuses a diverged branch
+
+When the local tracking branch and `origin/<branch>` each carry commits the other lacks, `gf pull` refuses (exit `1`) without moving anything and reports the truthful ahead/behind state. Resolve the diverged histories with an explicit `gf pull --rebase` or with Git integration you control; Git's rebase conflict handling applies, and `git rebase --abort` unwinds a rebase while retaining the original local history. Committing or stashing prepares dirty worktrees, but does not resolve already diverged history. A strictly-ahead branch is not a refusal: `gf pull` leaves its local commits untouched. `--rebase` is meaningless for a tag or commit ref and is ignored there.
+
+## `gf pull --autostash` could not restore my changes
+
+`--autostash` stashes with `git stash push -u -m "gf autostash"` before the update and restores with `git stash pop --index` afterwards — on success and on every update failure that follows the stash, so a taken stash is never orphaned. When the pop itself conflicts or fails, `gf` keeps the named stash entry and reports the state rather than dropping the work. Recover by resolving the conflicted paths and running `gf git stash pop --index` inside the child, or drop the entry deliberately once its content is safe elsewhere.
+
+## `gf pull` reports commits would be stranded
+
+Before any checkout that would move `HEAD` off commits the new position cannot reach — attaching or switching branches, detaching at a tag or commit, a rebase — `gf` records the outgoing `HEAD` under the checkout's `refs/worktree/gf-retained` ref so those commits stay durably reachable, never only through the reflog. When `gf` cannot establish that durable reachability it refuses before the checkout and reports the commits that would be stranded. To recover commits a transition left there, inspect `gf git log refs/worktree/gf-retained` and keep them under an ordinary ref — `gf git branch <name> refs/worktree/gf-retained` — or cherry-pick them.
+
+## `gf pull` was interrupted
+
+A killed or failed `gf pull` retains its partial effects instead of sweeping them: children already updated stay updated, manifest and state writes are atomic renames so nothing is torn, and the error report names which bindings were updated, skipped, or refused. Re-running `gf pull` is the recovery — the next run classifies what it finds: a missing link or checkout is re-materialized under the binding's recorded identity, a mid-operation merge or rebase refuses a stacked operation until you finish or abort it (`gf git rebase --continue`/`--abort`, `gf git merge --abort`), and a `gf autostash` entry left in the stash list is restored with `gf git stash pop --index`.
 
 ## `gf clone github.com/cursor/plugins` creates `https://github.com/cursor/plugins`
 
@@ -110,11 +140,11 @@ The `tmp_path` fixture is overridden in `conftest.py`. If a test writes outside 
 
 ## Undoing common operations
 
-`gf` tries to clean up partial side effects when a command fails, but some operations leave the workspace in an intermediate state. The safe undo for each command is:
+`gf` keeps partial side effects recoverable when a command fails: rollback removes only artifacts that invocation provably created, and anything pre-existing, foreign, or unprovable is retained and reported. The safe undo for each command is:
 
-- `gf clone` that fails before completion: the child directory is removed. If it was not removed, delete `child/` and run `git checkout gf.toml` to restore the manifest.
+- `gf clone` that fails before completion: `gf` removes only what that invocation provably created — a fresh child directory, or the `.gf/` it added to an existing child. Anything pre-existing or unprovable is retained and reported; if a leftover child directory is unwanted, delete `child/` and run `git checkout gf.toml` to restore the manifest.
 - `gf init` that fails before completion: the `.gf/` directory is removed from the child. If the manifest was written, run `git checkout gf.toml`.
-- `gf rm`: the child is converted back to a normal git worktree (`child/.git` replaces `child/.gf/git`). If the manifest change was not applied, re-add the git-folder.
+- `gf rm`: a whole-repo child is converted back to a normal git worktree (`child/.git` replaces `child/.gf/git`, with `HEAD`, index, refs, `origin`, and registered `git worktree` entries intact); a subfolder binding loses only its consumer link. If the manifest change was not applied, re-add the git-folder.
 - `gf worktree add` that fails after the parent worktree is created: the just-created worktree is removed automatically (`git worktree remove --force`, retried as `--force --force` on failure — a locked worktree needs the doubled force); fix the reported cause and re-run. When even the doubled removal reports failure, `gf` re-checks the worktree's registration and prints the true remedy — nothing extra when the worktree is actually gone, `git worktree prune` when it is still registered but its path is gone, or `git worktree remove --force <path>` when it is still on disk. `-f` replaces a leftover link or file at a child path but refuses a real directory — such as tracked content materialized at a `gf init` consumer path — which must be moved, untracked, or given another `path` before the add can succeed.
-- `gf pull` of an existing child that fails mid-checkout: the child worktree may be partially updated. Run `gf sh git status` to inspect, and `gf sh git checkout` to reset.
+- `gf pull` of an existing child that fails mid-checkout: partial effects are retained, not swept — the child worktree may be partially updated, an in-progress merge or rebase is left for you to finish or abort (`gf git rebase --abort`, `gf git merge --abort`), a stranded `gf autostash` stays in the stash list until `gf git stash pop --index`, and commits a transition would have orphaned remain reachable at `refs/worktree/gf-retained`. Inspect with `gf git status` and `gf git log`, then re-run `gf pull` to let it classify the state.
 - A `gf.toml` that fails validation — unreadable, invalid TOML, a wrong-shaped entry, or a `path` that violates the manifest path rules (must be relative, non-empty, normalized not `.`/`..`/`../`-leading, no `.gf` or `.git` segment) — blocks every `gf` command, `gf rm` included: the check fails closed. Restore the manifest with `git checkout gf.toml` or fix the offending entry, then re-run; `gf rm` cannot unregister around it.

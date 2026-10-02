@@ -47,6 +47,10 @@ Use `_resolve(cwd)` in every command. Commands must not discover `gf.toml` indep
 
 `gf init` writes a local placeholder `url`. `gf pull` must skip when the effective URL resolves to the child itself, and must not attempt to clone the placeholder as a remote.
 
+## Preserve work first, refuse second
+
+When implementing or extending a `gf`-owned operation, carry the preserve-then-refuse ordering: keep the user's staged, unstaged, untracked, ignored, committed, and stashed work reachable through the operation, and where it cannot be preserved, implement a refusal that reports the true state. Never substitute a destructive or guessing fallback, and never add a flag that waives preservation — `gf` has no discard mode. Verify a preservation claim with the real-git witness style in `docs/gf-testing.md`, not a mock-only claim.
+
 ## Make output generic and aligned
 
 For tabular commands (`ls`, `status`), collect all rows first, then align columns with a shared helper. Do not hard-code per-command padding.

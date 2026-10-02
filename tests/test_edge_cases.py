@@ -401,9 +401,11 @@ def test_gf_git_runs_git_status_in_child(tmp_path):
 
 
 def test_status_remote_classifies_drift(tmp_path):
-    """`gf status --remote` is local-only and classifies children as
-    clean/behind/local-dirty/both/missing using the local remote-tracking
-    refs already present after a `gf pull` or `gf git fetch`."""
+    """`gf status --remote` is local-only and classifies children with
+    the admitted drift vocabulary — clean / behind / local-dirty /
+    <relation>-dirty / missing — using the local remote-tracking refs
+    already present after a `gf pull` or `gf git fetch` (gf-spec.md
+    Drift algorithm)."""
     upstream = tmp_path / "upstream"
     upstream.mkdir()
     git("init", "--bare", cwd=upstream)
@@ -440,13 +442,14 @@ def test_status_remote_classifies_drift(tmp_path):
     assert result.returncode == 0, result.stderr
     assert re.search(r"lib\s+" + re.escape(str(upstream)) + r"\s+\[master\]\s+local-dirty", result.stdout)
 
-    # Both: advance remote again, refresh the tracking ref, while the
-    # child is still dirty.
+    # behind-dirty: advance remote again, refresh the tracking ref,
+    # while the child is still dirty — the -dirty suffix composes with
+    # the truthful relation.
     push_commit(upstream, "another", "another")
     gf("-C", str(parent / "vendor" / "lib"), "git", "fetch", "origin")
     result = gf("-C", str(parent), "status", "--remote", check=False)
     assert result.returncode == 0, result.stderr
-    assert re.search(r"lib\s+" + re.escape(str(upstream)) + r"\s+\[master\]\s+both", result.stdout)
+    assert re.search(r"lib\s+" + re.escape(str(upstream)) + r"\s+\[master\]\s+behind-dirty", result.stdout)
 
 
 def test_status_remote_does_not_fetch(tmp_path):

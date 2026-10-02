@@ -147,15 +147,38 @@ def storage_is_real(path: Path) -> bool:
     at least one component resolves through a link (the path may not
     exist; realpath resolves missing tails lexically).
 
-    Write-side predicate only — never a read gate: layout outputs must
-    keep resolving hostile storage for `resolve_checkout`,
-    `owns_consumer_link`, `in_gf_wt` and discovery, so ls/status keep
-    working under a hostile `.gf`. Callers compare the two-sided
-    `realpath(gitdir) == realpath(child)/GF_DIR/"git"` form instead when
-    the anchor leaf itself may legitimately be a symlink (whole-repo
-    child).
+    Write-side predicate only — never a read gate on its own: layout
+    outputs must keep resolving hostile storage for `resolve_checkout`,
+    `owns_consumer_link`, `in_gf_wt` and discovery, so `ls`/`status` can
+    still enumerate bindings under a hostile `.gf`. Whole-repo-child
+    reads pair it with `whole_repo_gitdir_is_real` — the two-sided form
+    for when the anchor leaf itself may legitimately be a symlink — and
+    degrade to `missing`/`?` rather than answering through the swap.
     """
     return Path(os.path.realpath(path)) == path
+
+
+def whole_repo_gitdir_is_real(co: Checkout) -> bool:
+    """True when `co`'s spelled `.gf/git` IS its physical location.
+
+    The whole-repo form of the storage-real invariant: `co.gitdir` is
+    spelled `<work_tree>/.gf/git`, and the two sides are realpath'd
+    separately so the child's own leaf may legitimately be a link while
+    the appended `.gf`/`git` components must be literal. False means an
+    appended component resolved through a link — e.g. `.gf` swapped for
+    a symlink into a sibling's `.gf` — so the spelled gitdir is foreign
+    storage: reads through it answer with the donor's HEAD and
+    writes/moves land in the donor's tree.
+
+    Meaningful only for a whole-repo `Checkout`: a store checkout's
+    gitdir legitimately lives under `<root>/.gf/repos/<key>/worktrees`,
+    never at `work_tree/.gf/git`, so every caller either exempts
+    `is_store_checkout` first or deliberately fails closed on the
+    mismatch (as `remove_child` does).
+    """
+    return Path(os.path.realpath(co.gitdir)) == (
+        Path(os.path.realpath(co.work_tree)) / GF_DIR / "git"
+    )
 
 
 def _gf_wt_root(rp: Path) -> Path | None:

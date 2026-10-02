@@ -242,9 +242,11 @@ def test_rm_refuses_manifest_path_spelling_gf_interior(tmp_path):
     r = gf("-C", str(parent), "rm", "api", check=False)
 
     assert r.returncode != 0
-    # refusal envelope names the binding + operation
+    # refusal names the binding + the gf storage the path reached into:
+    # manifest-read validation fails closed before rm ever dispatches
+    # (remove_child's own guard stays as the in-depth layer)
     err = r.stderr + r.stdout
-    assert "api" in err and "rm" in err
+    assert "api" in err and "gf-managed storage" in err
     # constraints L19: nothing under <root>/.gf is modified — the
     # checkout (incl. the mapped subdir the corrupt path spelled), the
     # worktree record, and the repo store are byte-identical

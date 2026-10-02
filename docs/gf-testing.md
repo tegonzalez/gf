@@ -68,6 +68,24 @@ A host whose git defaults to `main`, with the default-branch pin absent or overr
 | `tests/test_env_guard.py`        | Environment guard: git itself refuses non-local transports in the suite                                                                                                   |
 | `tests/test_mock_git.py`         | Self-tests for the in-memory git model in `tests/mock_git.py`                                                                                                             |
 | `tests/test_hardening_regressions.py` | Regression pins for confirmed defects, strict-xfail until each fix lands                                                                                               |
+| `tests/test_consumer_path_containment.py` | Consumer-path containment: `.gf`/`.git` segment refusals, mid-path symlink anchoring, hostile-manifest read gates                                                     |
+| `tests/test_forged_root_adoption.py` | Owning-root adoption: forged `.gf/wt`-shaped realpaths cannot redirect storage outside the workspace                                                                      |
+| `tests/test_manifest_atomic.py`    | Atomic `gf.toml` writes: temp-write-and-replace, no partial manifests                                                                                                     |
+| `tests/test_manifest_errors.py`    | Manifest and override error envelopes: shape validation, clean `gf:` failures                                                                                             |
+| `tests/test_non_utf8_envelope.py`  | Non-UTF-8 `gf.toml`/`gf.local.toml`/`.state` files die inside the envelope, never a `UnicodeDecodeError` traceback                                                        |
+| `tests/test_non_utf8_worktree_record.py` | A corrupt or non-UTF-8 checkout `gitdir` record counts as invalid — `gf pull` dies `refusing to rebuild over existing files` over a populated checkout, never a traceback |
+| `tests/test_oserror_envelope.py`   | `OSError` at filesystem sites (unlink/rmdir/mkdir/replace/state IO) exits `1` as a `gf:` error                                                                            |
+| `tests/test_pull_recovery.py`      | Pull-side recovery: wiped `.gf` store/checkout rebuilt on pull; store retention/removal on rollback; retry after a failed creating fetch                                    |
+| `tests/test_pull_binding_urls.py`  | Recorded `binding_urls`: per-binding effective URL resolution in checkout state                                                                                           |
+| `tests/test_pull_autostash_recovery.py` | `gf pull --autostash` restores the stash on every update failure, including a failed `origin` update                                                              |
+| `tests/test_sparse_dir_names.py`   | Sparse-cone member names needing `--skip-checks` (`*?[]\`, leading `!` segments)                                                                                          |
+| `tests/test_symlinked_gf_storage.py` | `.gf`-rooted storage must resolve to itself: symlinked components refuse writes and never rmtree through                                                                |
+| `tests/test_ambient_env_scrub.py`  | Ambient `GIT_*` scrubbing: repo-pointer/index/config-injection variables cannot retarget spawned `git`                                                                    |
+| `tests/test_chdir_logical_cwd.py`  | `gf -C` preserves the operand's logical spelling in `PWD`; lexical binding tiebreak sees it                                                                               |
+| `tests/test_joined_checkout_rollback.py` | Joined-checkout rollback removes only checkouts the invocation created                                                                                              |
+| `tests/test_runner_non_utf8.py`    | Captured `git` output decodes with replacement; malformed bytes surface as U+FFFD inside the error                                                                        |
+| `tests/test_worktree_add_rollback.py` | `gf worktree add` removes the new worktree on post-add failure                                                                                                       |
+| `tests/test_worktree_add_rollback_unexpected.py` | Rollback covers unexpected exceptions, not just `gf` and OS errors                                                                                         |
 
 ## Mock backend contract
 

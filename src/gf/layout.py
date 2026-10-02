@@ -49,7 +49,14 @@ class Checkout:
 
 
 def _normalize_url(url: str) -> str:
-    """Expand a bare host/path URL; mirrors `cli._normalize_url`."""
+    """Expand a bare host/path URL; the resolved-input subset of
+    `cli._normalize_url`.
+
+    Inputs here are already-resolved repo urls (recorded resolutions,
+    store keys), never a raw user spelling, so the `<repo>.git/<subdir>`
+    existence guard does not apply — a dotted first segment is host
+    shorthand.
+    """
     if "://" in url or url.startswith("git@"):
         return url
     if "/" in url:
@@ -60,8 +67,22 @@ def _normalize_url(url: str) -> str:
 
 
 def repo_key(repo_url: str) -> str:
-    """Derive `<basename>-<first 8 hex of sha1(normalized repo URL)>`."""
-    url = _normalize_url(repo_url).rstrip("/").removesuffix(".git")
+    """Derive `<basename>-<first 8 hex of sha1(normalized repo URL)>`.
+
+    The trailing `.git` alias holds only for remote spellings — a
+    transport convention, so `https://h/r` ≡ `https://h/r.git` share one
+    store. Local resolved paths never alias: `…/repo` and `…/repo.git`
+    are distinct real directories and must not collapse into one
+    store/checkout (the first binding's content would silently serve
+    both). Migration: a binding whose local repo path ends `.git`
+    derives a NEW key — its first pull re-resolves into a fresh
+    store+checkout and retargets the consumer link, leaving the old
+    store orphaned on disk (never deleted — uncommitted work survives,
+    same class as GF-TRB-3 leftovers).
+    """
+    url = _normalize_url(repo_url).rstrip("/")
+    if "://" in url or url.startswith("git@"):
+        url = url.removesuffix(".git")
     base = url.replace(":", "/").rsplit("/", 1)[-1] or "repo"
     digest = hashlib.sha1(url.encode()).hexdigest()[:8]
     return f"{base}-{digest}"
@@ -114,6 +135,29 @@ def repo_store(root: Path, repo_url: str) -> Path:
     return root / GF_DIR / "repos" / repo_key(repo_url) / "git"
 
 
+def storage_is_real(path: Path) -> bool:
+    """True when `path`'s spelling IS its own realpath.
+
+    The root-anchored storage invariant: `repo_store`/`subfolder_checkout`
+    realpath the root but append `.gf`/`repos`/`wt` segments lexically, so
+    a symlink planted at any appended component (`.gf`, `repos`, `wt`, a
+    repo-key or checkout-key dir, or a committed `.gf` link in a hostile
+    tree) makes the spelling and the physical location disagree — writes
+    through it would land outside the parent root's custody. False means
+    at least one component resolves through a link (the path may not
+    exist; realpath resolves missing tails lexically).
+
+    Write-side predicate only — never a read gate: layout outputs must
+    keep resolving hostile storage for `resolve_checkout`,
+    `owns_consumer_link`, `in_gf_wt` and discovery, so ls/status keep
+    working under a hostile `.gf`. Callers compare the two-sided
+    `realpath(gitdir) == realpath(child)/GF_DIR/"git"` form instead when
+    the anchor leaf itself may legitimately be a symlink (whole-repo
+    child).
+    """
+    return Path(os.path.realpath(path)) == path
+
+
 def _gf_wt_root(rp: Path) -> Path | None:
     """The `<root>/.gf/wt/<repo-key>/<checkout-key>` ancestor of realpath `rp`."""
     for anc in reversed([rp, *rp.parents]):
@@ -147,6 +191,21 @@ def in_gf_tree(path: Path) -> bool:
     """
     rp = Path(os.path.realpath(path))
     return any(a.name == GF_DIR for a in (rp, *rp.parents))
+
+
+def in_git_tree(path: Path) -> bool:
+    """True when `path`'s realpath is a `.git` dir or lies inside one.
+
+    `.git` roots a repository's private metadata — objects, refs, and
+    the hooks git executes on checkout — never content a consumer
+    spelling may resolve into: a consumer link planted under
+    `.git/hooks` runs as a hook on the parent repo's next `git
+    checkout`. Exact segments only — `x.git` or `libfoo.git` spellings
+    stay legal. Kept separate from `in_gf_tree`: the two reject
+    different storages, and callers choose which apply.
+    """
+    rp = Path(os.path.realpath(path))
+    return any(a.name == ".git" for a in (rp, *rp.parents))
 
 
 def owns_consumer_link(root: Path, link: Path) -> bool:
@@ -193,8 +252,32 @@ def owning_root(co: Checkout) -> Path | None:
     operate on (commands through symlinked children resolve to the
     source). A whole-repo checkout has no `.gf/wt` ancestor and returns
     None: the binding belongs to whichever root is operating on it.
+
+    The shape match alone never adopts. `_gf_wt_root` matches lexically
+    over `os.path.realpath`, which resolves nonexistent components
+    lexically, so a committed mid-path symlink can spell a
+    `.gf/wt/<r>/<k>` ancestor under a root that has no gf storage at
+    all. Adoption requires the derived root to prove real:
+
+    - a `.git` entry — `find_parent_root`'s own marker (dir, gitfile,
+      or symlink), which covers normal parents, dead-link recovery with
+      a wiped `.gf`, and worktree-add chains, and cannot be committed
+      into a git tree; or
+    - the matching repo store `<root>/.gf/repos/<repo-key>/git` with a
+      `HEAD` — a root whose `.git` is gone but whose `.gf` storage is
+      real.
+
+    A root inside a `.gf` tree is never adopted, and `gf.toml` presence
+    is no proof — the manifest is committable content.
     """
     anc = _gf_wt_root(Path(os.path.realpath(co.work_tree)))
     if anc is None:
         return None
-    return anc.parent.parent.parent.parent
+    root = anc.parent.parent.parent.parent
+    if in_gf_tree(root):  # never a root inside .gf
+        return None
+    if (root / ".git").exists() or (
+        root / GF_DIR / "repos" / anc.parent.name / "git" / "HEAD"
+    ).is_file():
+        return root
+    return None

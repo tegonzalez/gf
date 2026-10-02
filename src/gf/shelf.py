@@ -5,6 +5,8 @@ import os
 import re
 import shutil
 import sys
+import tomllib
+from collections.abc import Iterable
 from pathlib import Path
 
 from .backends import GitBackend, GitCliBackend
@@ -309,7 +311,13 @@ def _effective_branch(
                 "symbolic-ref", "refs/remotes/origin/HEAD",
                 git_dir=gitdir,
             ).strip()
-            return head.split("/")[-1]
+            # Strip the whole `refs/remotes/origin/` prefix so a
+            # slash-named default (feature/main) resolves as
+            # `origin/feature/main` — the same prefix strip
+            # `_store_default_branch` does. A symref outside the
+            # prefix passes through unchanged and fails downstream
+            # resolution honestly rather than being silently truncated.
+            return head.removeprefix("refs/remotes/origin/")
         except GitError:
             return "master"
 
@@ -389,6 +397,16 @@ def _init_child_gitdir(
     """Create a .gf/git gitdir in the checkout's worktree."""
     backend = backend or _default_backend()
     gitdir = co.gitdir
+    # The `.gf`/`git` components appended to the child must be literal:
+    # a symlinked `.gf` would redirect the gitdir mkdir — and every later
+    # gitdir write — outside the child's own tree. The child's leaf
+    # spelling may legitimately be a link, so compare against
+    # realpath(child), never the lexical child.
+    if Path(os.path.realpath(gitdir)) != (
+        Path(os.path.realpath(co.work_tree)) / layout.GF_DIR / "git"
+    ):
+        raise ValidationError(
+            f"child gitdir path {gitdir} resolves through a symlink")
     gitdir.mkdir(parents=True, exist_ok=True)
 
     # Initialize a fresh gitdir at .gf/git with this worktree.
@@ -401,6 +419,31 @@ def _init_child_gitdir(
     patterns.add(layout.GF_DIR)
     patterns.discard("")
     exclude.write_text("\n".join(sorted(patterns)) + "\n")
+
+
+def _assert_no_gf_root_entry(
+    backend: GitBackend, co: layout.Checkout, sha: str
+) -> None:
+    """Refuse to materialize `sha` when its tree carries a root `.gf`.
+
+    `.gf` is gf-managed storage: a committed root entry of ANY kind —
+    blob, tree, symlink, or gitlink (a submodule named `.gf`) — collides
+    with the private layout checkout materialization must never create
+    (a whole-repo child's own `.gf/git` lives there; a linked checkout's
+    cone would place it under the worktree root). A symlink or gitlink
+    additionally redirects later gf storage writes outside the root.
+    `git ls-tree <sha> .gf` lists only the ROOT entry, so a nested
+    `sub/.gf` stays legal while every root kind produces output and
+    refuses. Probing `co.common_dir` covers both checkout kinds: the
+    child's own gitdir for a whole-repo child, the shared repo store
+    for a linked one.
+    """
+    if backend.git_capture(
+        "ls-tree", sha, layout.GF_DIR, git_dir=co.common_dir,
+    ).strip():
+        raise ValidationError(
+            f"refusing to check out {sha}: its root tree carries a "
+            f"'{layout.GF_DIR}' entry — .gf is gf-managed storage")
 
 
 def _resolve_remote_branch(co: layout.Checkout, branch: str, backend: GitBackend | None = None) -> str:
@@ -442,8 +485,16 @@ def _apply_ref(
     ref resolves `ref` locally and checks out the detached SHA. `force`
     adds `-f` to the checkout call.
     """
+    # The `.gf` root-entry refusal precedes EVERY materialization arm
+    # below — `checkout -B`, the detached checkout and the rebase's
+    # recreating checkout all land the resolved tree in the worktree.
+    sha = (
+        _resolve_remote_branch(co, branch, backend)
+        if branch
+        else resolve_ref(co, ref, backend)
+    )
+    _assert_no_gf_root_entry(backend, co, sha)
     if branch:
-        sha = _resolve_remote_branch(co, branch, backend)
         if rebase:
             # Ensure HEAD is on the local branch before rebasing. Using
             # `-B <branch> HEAD` recreates the branch at the current HEAD
@@ -476,7 +527,6 @@ def _apply_ref(
             stream=True,
         )
         return sha
-    sha = resolve_ref(co, ref, backend)
     checkout_args = ["checkout"]
     if force:
         checkout_args.append("-f")
@@ -626,10 +676,63 @@ def init_child(
 ) -> None:
     backend = backend or _default_backend()
     child = co.work_tree
+    # The recorded binding path must be segment-clean BEFORE the
+    # existing-child early return below can wave it through:
+    # `binding_path` is the manifest `rel` about to be recorded, and a
+    # `.gf` or `.git` segment anywhere in its spelled parts names
+    # managed storage — the `.gf` form is exactly what manifest
+    # read-validation then refuses on every later command, a wedge
+    # until the manifest is hand-edited. The realpath refusal below
+    # cannot carry this check: a live consumer link's realpath
+    # legitimately sits inside `.gf/wt`, so only the recorded spelling
+    # is segment-tested — a live link's own `rel` is always clean.
+    managed = next(
+        (
+            seg
+            for seg in Path(binding_path).parts
+            if seg in (layout.GF_DIR, ".git")
+        ),
+        None,
+    ) if binding_path is not None else None
+    if managed is not None:
+        owner = "gf" if managed == layout.GF_DIR else "git"
+        raise ValidationError(
+            f"child path {binding_path} reaches inside {owner}-managed "
+            f"storage ({managed})")
     if _is_git_folder_child(co):
         return  # already a git-folder; clone is just an add to the manifest
 
+    # A consumer path resolving into `.gf` storage is never a bindable
+    # child — the live-link re-add above stays the only store-checkout
+    # add. A dead checkout's link (its record removed from the store's
+    # `worktrees/`) or any other spelling landing under `.gf` must not
+    # get a fresh gitdir planted at `co.gitdir`. `in_git_tree` adds the
+    # `.git` sibling: a child inside the parent's repository metadata —
+    # a `.git`-segment spelling or a leaf/mid-path link resolving
+    # there — would hand git a path it reads as config or executes as
+    # a hook.
+    if (
+        co.is_store_checkout
+        or layout.in_gf_tree(child)
+        or layout.in_git_tree(child)
+    ):
+        raise ValidationError(
+            f"child path {child} resolves inside gf-managed storage "
+            f"({layout.GF_DIR}) or repository metadata (.git)")
+
     effective_ref = ref or "latest"
+    # A dangling symlink is occupancy, not a crash: `Path.exists()` is
+    # False for one, so the non-empty check below and `child.mkdir`'s
+    # exist_ok both misread it as absent and `os.mkdir` raises EEXIST.
+    # Refuse it up front (the same `lexists` formula ensure_consumer_link
+    # uses). A link to a real directory keeps falling through to the
+    # non-empty check's write-through semantics.
+    if os.path.lexists(child) and not child.exists():
+        raise ValidationError(f"child path {child} is a dangling symlink")
+    # An existing non-directory occupant (a plain file, or a link to one)
+    # passes `child.exists()` yet crashes `iterdir` with NotADirectoryError.
+    if child.exists() and not child.is_dir():
+        raise ValidationError(f"child path {child} exists and is not a directory")
     if child.exists() and any(child.iterdir()):
         raise ValidationError(f"child path {child} already exists and is not empty")
 
@@ -664,7 +767,10 @@ def init_child(
     # clone invoked from a subdirectory would anchor at the cwd and
     # fetch the wrong — or a decoy — repository).
     resolved_url = _resolved_git_url(repo_url)
-    existed_before = child.exists()
+    # `lexists`, not `exists`: a dangling link occupant counts as
+    # pre-existing so failure cleanup preserves it rather than treating
+    # the path as ours to remove.
+    existed_before = os.path.lexists(child)
     was_git_folder_before = False
 
     try:
@@ -706,7 +812,35 @@ def init_git_folder(co: layout.Checkout, backend: GitBackend | None = None) -> N
     if _is_git_folder_child(co) or (child / ".git").exists():
         raise ValidationError(f"{child} is already a git or git-folder directory")
 
+    # A store checkout's `co.gitdir` is the repo store's worktree-record
+    # area, never a fresh child gitdir — initializing there plants a
+    # recordless gitdir that wedges the checkout key. `in_gf_tree` adds
+    # the same guard `init_child`/`update_child` carry: a leaf link into
+    # any `.gf` tree, or any other spelling whose realpath lands inside
+    # gf-managed storage, is never a fresh child either. `in_git_tree`
+    # is the `.git` sibling — a fresh gitdir planted inside the parent's
+    # repository metadata would wedge the repo's own gitdir, and under
+    # `hooks/` it is executable content.
+    if (
+        co.is_store_checkout
+        or layout.in_gf_tree(child)
+        or layout.in_git_tree(child)
+    ):
+        raise ValidationError(
+            f"{child} resolves inside gf-managed storage "
+            f"({layout.GF_DIR}) or repository metadata (.git)")
+
     gitdir = co.gitdir
+    # Same storage-real check as `_init_child_gitdir`, kept inline with
+    # this duplicated init block: the appended `.gf`/`git` components
+    # must be literal — a symlinked `.gf` (committed in a hostile tree or
+    # planted by hand) would redirect the mkdir and all gitdir writes
+    # outside the child's tree. The child leaf may itself be a link.
+    if Path(os.path.realpath(gitdir)) != (
+        Path(os.path.realpath(child)) / layout.GF_DIR / "git"
+    ):
+        raise ValidationError(
+            f"child gitdir path {gitdir} resolves through a symlink")
     gitdir.mkdir(parents=True, exist_ok=True)
     backend.git("init", git_dir=gitdir, work_tree=co.work_tree)
 
@@ -782,6 +916,15 @@ def update_child(
 ) -> None:
     backend = backend or _default_backend()
     child = co.work_tree
+    # Anchor containment as a shelf-layer invariant: the resolved child
+    # must stay inside the root that owns the binding (`parent_root` is
+    # the pull planner's anchor), or the mkdir/rmtree writes below land
+    # outside the workspace.
+    if not Path(os.path.realpath(child)).is_relative_to(
+        Path(os.path.realpath(parent_root))
+    ):
+        raise ValidationError(
+            f"child path {child} resolves outside {parent_root}")
     effective_ref = ref or "latest"
     resolved_url = _resolved_git_url(url)
     if recorded_url_matches(recorded_url(co), url, parent_root):
@@ -831,10 +974,33 @@ def update_child(
         resolved_url = repo_url
 
     if not _is_git_folder_child(co):
+        # Same `.gf`-storage refusal as `init_child`: this arm plants a
+        # fresh gitdir at `co.gitdir` — for a store checkout the repo
+        # store's worktree-record area — so a consumer path resolving
+        # into `.gf` is never bindable here. `in_git_tree` refuses the
+        # `.git` sibling: a binding path reaching the parent's
+        # repository metadata (`hooks/` executes on checkout). Only the
+        # whole-repo arm refuses: the `subdir` arms above legitimately
+        # resolve `child` into `.gf/wt`.
+        if (
+            co.is_store_checkout
+            or layout.in_gf_tree(child)
+            or layout.in_git_tree(child)
+        ):
+            raise ValidationError(
+                f"child path {child} resolves inside gf-managed storage "
+                f"({layout.GF_DIR}) or repository metadata (.git)")
+        # Same occupancy gates as `init_child`: a dangling symlink is
+        # occupancy (refuse cleanly rather than crash `child.mkdir`), and
+        # a non-directory occupant precedes `iterdir`.
+        if os.path.lexists(child) and not child.exists():
+            raise ValidationError(f"child path {child} is a dangling symlink")
+        if child.exists() and not child.is_dir():
+            raise ValidationError(f"child path {child} exists and is not a directory")
         if child.exists() and any(child.iterdir()):
             raise ValidationError(f"child path {child} exists and is not a git-folder")
 
-        existed_before = child.exists()
+        existed_before = os.path.lexists(child)
         was_git_folder_before = False
         try:
             child.mkdir(parents=True, exist_ok=True)
@@ -871,9 +1037,8 @@ def update_child(
         )
         stashed = True
 
-    _set_child_origin(co, resolved_url, backend)
-
     try:
+        _set_child_origin(co, resolved_url, backend)
         if rebase:
             sha = _fetch_and_rebase(co, resolved_url, effective_ref, backend, force=force)
         else:
@@ -1195,6 +1360,21 @@ def linked_git_folder_symlinks_in_worktree(
     links: list[tuple[Path, str]] = []
     for folder in manifest_data.get("git_folder", []):
         child = worktree_path / folder["path"]
+        # A mid-path symlink the checkout materialized (a committed
+        # `vendor -> /abs` link) puts the leaf outside the worktree:
+        # skip it — worktree removal proceeds with outside leaves
+        # untouched. A leaf whose parent chain lands inside `.git`
+        # metadata is skipped the same way: unlinking there would edit
+        # the repo's own config/hooks. The leaf's own realpath is never
+        # tested here; a live consumer link resolves into `.gf/wt`
+        # legitimately.
+        child_parent = Path(os.path.realpath(child.parent))
+        if (
+            not child_parent.is_relative_to(
+                Path(os.path.realpath(worktree_path)))
+            or layout.in_git_tree(child_parent)
+        ):
+            continue
         if not child.is_symlink():
             continue
         target = os.readlink(child)
@@ -1252,7 +1432,11 @@ def remove_child(child: Path, parent_root: Path) -> None:
         )
     if child.is_symlink():
         if layout.owns_consumer_link(parent_root, child):
-            child.unlink()
+            try:
+                child.unlink()
+            except OSError as e:
+                raise ValidationError(
+                    f"cannot remove consumer link {child}: {e}") from e
             return
         raise GitFoldersError(
             f"{child} is a symlinked child; remove it from the owning worktree instead"
@@ -1270,11 +1454,19 @@ def remove_child(child: Path, parent_root: Path) -> None:
         if (child / ".git").exists():
             raise GitFoldersError(f"{child} already contains a .git directory")
         import shutil
-        shutil.move(str(git_dir), str(child / ".git"))
+        try:
+            shutil.move(str(git_dir), str(child / ".git"))
+        except OSError as e:
+            raise ValidationError(
+                f"cannot move {git_dir} to {child / '.git'}: {e}") from e
 
     if gf_dir.is_dir():
         import shutil
-        shutil.rmtree(gf_dir)
+        try:
+            shutil.rmtree(gf_dir)
+        except OSError as e:
+            raise ValidationError(
+                f"cannot remove {gf_dir}: {e}") from e
 
 
 # --- shared store / checkout / consumer-link machinery ----------------------
@@ -1394,12 +1586,48 @@ def _fetch_store(
     backend.git("fetch", *shallow, "origin", git_dir=store, stream=True)
 
 
+def _assert_store_origin(
+    backend: GitBackend, store: Path, repo_url: str
+) -> None:
+    """Refuse an existing repo store whose origin is not this binding's.
+
+    `remote.origin.url` was written once at store creation from the
+    binding's resolved URL, and no legitimate gf path rewrites it
+    (whole-repo children re-set their own child origin each pull, never
+    the shared store's). A rewritten origin — a hand edit, a foreign
+    repo-key directory, a store copied over another binding's — means
+    every refspec write and `fetch origin` below would run against
+    storage gf never configured.
+
+    The comparison is `repo_key` equality — "spellings gf keys to one
+    store" — not textual equality: a repository legitimately joins its
+    store under sibling spellings the store keeps only one of (the
+    `…/r` ≡ `…/r.git` transport alias, or the creating spelling versus
+    this binding's). Any origin that keys differently names a different
+    repository and refuses.
+    """
+    result = backend.git(
+        "config", "--get", "remote.origin.url",
+        git_dir=store, check=False,
+    )
+    expected = _resolved_git_url(repo_url)
+    actual = result.stdout.strip()
+    if result.returncode != 0 or (
+        layout.repo_key(actual) != layout.repo_key(expected)
+    ):
+        raise ValidationError(
+            f"repo store {store} remote.origin.url '{actual}' no longer "
+            f"matches the binding's recorded resolution '{expected}' — "
+            f"refusing storage gf did not configure")
+
+
 def ensure_repo_store(
     store: Path,
     url: str,
     *,
     branch: str | None = None,
     ref: str | None = None,
+    pins: Iterable[str] = (),
     single_branch: bool = False,
     depth: int | None = None,
     backend: GitBackend | None = None,
@@ -1412,9 +1640,12 @@ def ensure_repo_store(
     other URL resolution and keying normalization stay the caller's
     job), writes the first fetch refspec — the branch's line for
     `--single-branch`, else the wildcard — covers a pinned non-branch
-    `ref` via `_ensure_pinned_ref` when no branch was resolved (a tag's
-    refspec line is `--add`ed so the creating fetch lands it, a missing
-    commit pulls its own one-shot `fetch origin <sha>`), fetches
+    `ref` via `_ensure_pinned_ref` when no branch was resolved, and then
+    every ref in `pins` the same way (`pins` is the grouped pull's
+    extension of the single `ref` slot: several bindings share the one
+    creating fetch, so each of their non-branch refs gets the coverage —
+    a tag's refspec line is `--add`ed so the creating fetch lands it, a
+    missing commit pulls its own one-shot `fetch origin <sha>`), fetches
     blob-filtered with a full-fetch fallback (`depth` applies only to
     this creating fetch), and
     repoints the store's `HEAD` at `refs/remotes/origin/HEAD` so the bare
@@ -1427,7 +1658,20 @@ def ensure_repo_store(
     non-branch `ref` (tag/commit) via `_ensure_pinned_ref`, then runs
     one `git fetch --filter=blob:none origin` (full-fetch fallback) before
     the caller resolves the effective ref; a join never skips the fetch.
+    `pins` is create-arm only — join-side coverage for grouped bindings
+    stays in the caller's coverage loop.
     """
+    # `.gf`, `repos`, the repo-key dir and `git` must all be literal:
+    # `repo_store` realpaths the root but appends those segments
+    # lexically, so a symlink planted at any of them redirects the mkdir,
+    # `git init` and every fetch through the link — a committed or
+    # hand-placed `.gf` link would write the store outside the root.
+    # Refuse before the HEAD probe so both create and join arms are
+    # covered; read-side resolution paths keep working under a hostile
+    # `.gf` by design.
+    if not layout.storage_is_real(store):
+        raise ValidationError(
+            f"repo store path {store} resolves through a symlink")
     backend = backend or _default_backend()
     if not (store / "HEAD").is_file():
         store.mkdir(parents=True, exist_ok=True)
@@ -1448,6 +1692,8 @@ def ensure_repo_store(
         # silently replace it.
         if not branch and ref:
             _ensure_pinned_ref(store, url, ref, backend)
+        for pin in pins:
+            _ensure_pinned_ref(store, url, pin, backend)
         _fetch_store(store, backend, depth=depth)
         try:
             backend.git(
@@ -1462,6 +1708,10 @@ def ensure_repo_store(
             # Best-effort; the remote's default branch may be unfetchable.
             pass
         return
+    # Join arm only: the store must still be the one this binding's
+    # resolution configured — refuse before any refspec write or fetch
+    # runs against a retargeted origin.
+    _assert_store_origin(backend, store, url)
     if branch:
         _ensure_branch_coverage(store, branch, backend)
     elif ref is not None:
@@ -1474,9 +1724,16 @@ def _checkout_record_valid(co: layout.Checkout) -> bool:
     checkout: the admin dir's `gitdir` file names `<work_tree>/.git`
     (never trust the admin dir's name alone)."""
     gitdir_file = co.gitdir / "gitdir"
-    return gitdir_file.is_file() and Path(
-        gitdir_file.read_text().strip()
-    ) == co.work_tree / ".git"
+    if not gitdir_file.is_file():
+        return False
+    try:
+        text = gitdir_file.read_text().strip()
+    except (OSError, ValueError):
+        # An unreadable or non-UTF-8 record cannot prove it names this
+        # checkout — count it absent (the same refusal envelope a
+        # missing record gets) rather than escaping as a traceback.
+        return False
+    return Path(text) == co.work_tree / ".git"
 
 
 def _checkout_record_dir(co: layout.Checkout) -> Path | None:
@@ -1603,7 +1860,7 @@ def ensure_checkout(
     ref: str,
     *,
     backend: GitBackend | None = None,
-) -> None:
+) -> bool:
     """Ensure the shared linked checkout `co` exists, widened to its union.
 
     Creates `<root>/.gf/wt/<repo-key>/<key>` via
@@ -1619,7 +1876,26 @@ def ensure_checkout(
     record is an error — gf never rebuilds over existing files. On failure
     only the artifacts this call created are torn down; the repo store is
     never removed.
+
+    Returns True only when this call completed the create arm (worktree
+    add + record verify + cone + gitfile/lock + state); False when the
+    join arm ran — the checkout already existed and belongs to the call
+    or process that created it, so a caller may tear the checkout down
+    on its own later failure only when this returned True. A raise
+    inside this function never reaches the caller's flag: the create
+    arm self-cleans and the join arm leaves a foreign checkout alone.
     """
+    # Work tree and worktree record must be literal paths under the real
+    # root: `subfolder_checkout` appends `.gf`/`wt`/`worktrees` segments
+    # lexically after realpath'ing the root, so a symlink at any of them
+    # (a committed `.gf` link in a worktree-add tree included) would
+    # redirect `worktree add`, record writes and the state file outside
+    # the root. Refuse before the branch/sha store probes so create and
+    # join arms are covered.
+    for path in (co.work_tree, co.gitdir):
+        if not layout.storage_is_real(path):
+            raise ValidationError(
+                f"checkout storage path {path} resolves through a symlink")
     backend = backend or _default_backend()
     store = co.common_dir
     admin = co.gitdir
@@ -1627,6 +1903,17 @@ def ensure_checkout(
 
     branch = ref if is_branch(co, ref, backend) else None
     sha = resolve_ref(co, ref, backend)
+    # The `.gf` root-entry refusal precedes BOTH materialization arms:
+    # the create arm's `worktree add` + checkout and the existing-record
+    # arm's `_sparse_union` cone rebuild (it materializes files from the
+    # resolved tree the same way a checkout does). A branch ref probes
+    # `origin/<branch>` as well: the create arm materializes that tip,
+    # which a stale `refs/heads/<branch>` or a same-named tag can
+    # shadow in `resolve_ref`.
+    _assert_no_gf_root_entry(backend, co, sha)
+    if branch:
+        _assert_no_gf_root_entry(
+            backend, co, _resolve_remote_branch(co, branch, backend))
 
     if _checkout_record_valid(co):
         # Existing checkout: widen the sparse cone and refresh the record.
@@ -1643,7 +1930,7 @@ def ensure_checkout(
             os.unlink(gitfile)
         _lock_worktree(co, backend)
         _save_checkout_state(co, ref, sha, bindings)
-        return
+        return False
 
     if os.path.lexists(wt):
         if wt.is_dir() and not any(wt.iterdir()):
@@ -1698,10 +1985,11 @@ def ensure_checkout(
             shutil.rmtree(wt, ignore_errors=True)
         raise
     _save_checkout_state(co, ref, sha, bindings)
+    return True
 
 
 def ensure_consumer_link(
-    link: Path, target: Path
+    link: Path, target: Path, root: Path | None = None
 ) -> tuple[str, str | None] | None:
     """Ensure `link` is a relative symlink to `target`.
 
@@ -1710,30 +1998,59 @@ def ensure_consumer_link(
     later failure can undo exactly it via `rollback_consumer_link`.
     Existing non-link content is never destroyed: an empty directory is
     replaced; anything else is an error.
+
+    When `root` is given it bounds every write below (unlink/rmdir/
+    mkdir/symlink): the spelled `link` must normalize inside `root`, and
+    `link`'s realpath PARENT must stay inside `root`, outside `.gf`
+    storage, and outside `.git` metadata — a committed mid-path symlink
+    must not redirect the unlink/replace outside the owning root, and a
+    landing inside `.git` would put the link where the parent's own git
+    operations read it (`hooks/` executes on checkout). The leaf's own
+    realpath is never tested: a live consumer link resolves into
+    `.gf/wt` legitimately.
     """
+    if root is not None:
+        link_parent = Path(os.path.realpath(link.parent))
+        if not (
+            Path(os.path.normpath(link)).is_relative_to(
+                Path(os.path.normpath(root)))
+            and link_parent.is_relative_to(Path(os.path.realpath(root)))
+            and not layout.in_gf_tree(link_parent)
+            and not layout.in_git_tree(link_parent)
+        ):
+            raise ValidationError(
+                f"consumer path {link} escapes {root} or reaches into "
+                f"gf-managed storage ({layout.GF_DIR}) or repository "
+                f"metadata (.git); refusing to link")
     if link.is_symlink():
         if Path(os.path.realpath(link)) == Path(os.path.realpath(target)):
             return None
-        old = os.readlink(link)
-        link.unlink()
         try:
-            _place_consumer_link(link, target)
-        except Exception:
-            os.symlink(old, link, target_is_directory=True)
-            raise
-        return ("retargeted", old)
-    if os.path.lexists(link):
-        if link.is_dir() and not any(link.iterdir()):
-            link.rmdir()
-            replaced = True
+            old = os.readlink(link)
+            link.unlink()
+            try:
+                _place_consumer_link(link, target)
+            except Exception:
+                os.symlink(old, link, target_is_directory=True)
+                raise
+            return ("retargeted", old)
+        except OSError as e:
+            raise ValidationError(f"consumer path {link}: {e}") from e
+    try:
+        if os.path.lexists(link):
+            if link.is_dir() and not any(link.iterdir()):
+                link.rmdir()
+                replaced = True
+            else:
+                raise ValidationError(
+                    f"consumer path {link} exists and is not a symlink or "
+                    f"empty directory"
+                )
         else:
-            raise ValidationError(
-                f"consumer path {link} exists and is not a symlink or "
-                f"empty directory"
-            )
-    else:
-        replaced = False
-    _place_consumer_link(link, target)
+            replaced = False
+        _place_consumer_link(link, target)
+    except OSError as e:
+        raise ValidationError(f"consumer path {link}: {e}") from e
     return ("replaced-dir" if replaced else "created", None)
 
 
@@ -1741,8 +2058,15 @@ def _place_consumer_link(link: Path, target: Path) -> None:
     """Create the relative symlink, reporting fs errors as ValidationError."""
     try:
         link.parent.mkdir(parents=True, exist_ok=True)
+        # The leaf lands at link.parent's REALPATH — a committed in-root
+        # mid-path symlink (sub -> deep/nested/a) redirects it there — so
+        # the relative target must be computed from the real base, not the
+        # spelled parent. The target is realpath'd too so a `.gf`-interior
+        # symlink component cannot steer the spelling.
         os.symlink(
-            os.path.relpath(target, link.parent), link,
+            os.path.relpath(
+                os.path.realpath(target), os.path.realpath(link.parent)),
+            link,
             target_is_directory=True,
         )
     except OSError as e:
@@ -1756,12 +2080,16 @@ def rollback_consumer_link(
     if not action:
         return
     name, old = action
-    if link.is_symlink():
-        link.unlink()
-    if name == "retargeted" and old is not None:
-        os.symlink(old, link, target_is_directory=True)
-    elif name == "replaced-dir":
-        link.mkdir(parents=True, exist_ok=True)
+    try:
+        if link.is_symlink():
+            link.unlink()
+        if name == "retargeted" and old is not None:
+            os.symlink(old, link, target_is_directory=True)
+        elif name == "replaced-dir":
+            link.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise ValidationError(
+            f"cannot restore consumer path {link}: {e}") from e
 
 
 def _remote_default_branch(url: str, backend: GitBackend) -> str | None:
@@ -1849,7 +2177,18 @@ def _remove_checkout(co: layout.Checkout, backend: GitBackend) -> None:
     `git worktree remove --force` already deletes the record the
     checkout's `.git` gitfile names; the conditional rmtree covers what
     git refuses (a locked record) or never made.
+
+    Rollback must never delete through a hostile `.gf` symlink: a
+    non-real work-tree or record spelling means the ensure step refused
+    before anything landed, so every step below — `worktree remove`, the
+    record rmtree, the checkout rmtree, the state unlink — could only
+    reach foreign content and is skipped.
     """
+    if not (
+        layout.storage_is_real(co.work_tree)
+        and layout.storage_is_real(co.gitdir)
+    ):
+        return
     backend.git(
         "worktree", "remove", "--force", str(co.work_tree),
         git_dir=co.common_dir, check=False,
@@ -1870,9 +2209,33 @@ def _remove_repo_store(store: Path) -> None:
     `store` is `<root>/.gf/repos/<repo-key>/git`; the store tree — with
     any worktree records and state this call left under it — is removed
     and the `<repo-key>` ancestry dir pruned when empty. Never call this
-    for a pre-existing or serving store; the caller's `store_created`
-    flag is the discriminator.
+    for a pre-existing or serving store; the caller's
+    `store_created`/`store_existed` flag is the discriminator. Guarded:
+    a store that gained worktree records under `<store>/worktrees/`
+    since that flag was taken is serving another binding — a concurrent
+    join whose checkout completed — and is kept. Any record present at
+    removal time is foreign: the failing call's own record is already
+    gone (`ensure_shared_binding`'s except path removes it through
+    `_remove_checkout`, and the `pull_shared_bindings` site removes only
+    on a store-phase failure before its own `ensure_checkout`).
+
+    A non-real `store` spelling (a symlink at `.gf`, `repos`, the
+    repo-key dir or `git`) names foreign content — `ensure_repo_store`
+    refused it before anything was created — so rollback leaves the
+    resolved tree and its `<repo-key>` ancestry untouched rather than
+    rmtree through a hostile `.gf` link.
     """
+    if not layout.storage_is_real(store):
+        return
+    records = store / "worktrees"
+    try:
+        if records.is_dir() and any(records.iterdir()):
+            return
+    except OSError:
+        # A listing race (the store is already going away) falls
+        # through to the best-effort rmtree; this failure path keeps
+        # the original error.
+        pass
     shutil.rmtree(store, ignore_errors=True)
     try:
         store.parent.rmdir()
@@ -1935,12 +2298,20 @@ def ensure_shared_binding(
             if branch else layout.checkout_key_for_ref(ref)
         )
         co = layout.subfolder_checkout(parent_root, repo_url, key, subdir)
-        checkout_existed = _checkout_record_valid(co)
-        ensure_checkout(co, branch or ref, backend=backend)
+        # `created` — returned by ensure_checkout, not a pre-call record
+        # probe — is the only sound destructive-rollback trigger below: a
+        # snapshot taken here goes stale the moment a concurrent process's
+        # record appears between the probe and the join arm, and that
+        # process's live checkout must survive this call's later
+        # link/state failure. A raise inside ensure_checkout never reaches
+        # the flag: its create arm self-cleans and its join arm leaves a
+        # foreign checkout alone.
+        created = ensure_checkout(co, branch or ref, backend=backend)
 
         action = None
         try:
-            action = ensure_consumer_link(child, co.work_tree / co.subdir)
+            action = ensure_consumer_link(
+                child, co.work_tree / co.subdir, root=parent_root)
             rec = state.load_checkout(co)
             rec.update({"url": url, "override": override})
             if binding_path is not None:
@@ -1952,7 +2323,13 @@ def ensure_shared_binding(
             state.save_checkout(co, rec)
         except Exception:
             rollback_consumer_link(child, action)
-            if not checkout_existed:
+            # created=False (this call joined an existing checkout)
+            # means a concurrent creator's checkout survives our failure.
+            # Residual: once THIS call did create the checkout, a
+            # still-later joiner can be torn down by our failure —
+            # inherent under no inter-process locking; subsumed by
+            # GF-TRB-11.
+            if created:
                 _remove_checkout(co, backend)
             raise
     except Exception:
@@ -2003,12 +2380,23 @@ def _vacate_checkout(
     while its consumer path still resolves here — a vacated binding's
     recorded url does not linger. The worktree's files — tracked and
     uncommitted — are never touched.
+
+    Pruning requires a successfully parsed owning manifest: an absent,
+    non-regular, unreadable or corrupt `gf.toml` cannot prove which
+    bindings are still live, so the record is left untouched rather than
+    emptied — a wiped record would un-materialize still-linked siblings
+    on the next `_sparse_union` cone rebuild and drop their recorded
+    urls.
     """
     if not _checkout_record_valid(old_co):
         return
-    mf = {}
-    if (parent_root / _manifest.MANIFEST).is_file():
+    if not (parent_root / _manifest.MANIFEST).is_file():
+        return
+    try:
         mf = _manifest.read_manifest(parent_root)
+    except (OSError, GitFoldersError, tomllib.TOMLDecodeError,
+            UnicodeDecodeError):
+        return
     folders = mf.get("git_folder", [])
     live = set()
     live_paths = set()
@@ -2088,16 +2476,19 @@ def pull_shared_bindings(
     checkout lives under `<root>/.gf/wt/...`, so a pull invoked through a
     `gf worktree add` link chain operates on the SOURCE worktree's store,
     checkout and consumer link; an unresolved binding materializes under
-    `parent_root`. Per repo store: `ensure_repo_store` coverage (creating
-    the store with
-    wildcard refspec + fetch when missing; an uncovered explicit branch
-    that upstream advertises gets its refspec line appended — append-only,
-    probed by one `ls-remote`; a `latest` whose store origin/HEAD is
-    missing or dangles probes the remote's default the same way and
-    repoints the symref; a tag/commit ref gets `_ensure_pinned_ref`
-    coverage — a tag's refspec line when upstream advertises it, or a
-    one-shot `fetch origin <sha>` for a missing commit) followed by
-    exactly one store fetch.
+    `parent_root`. Per repo store: `ensure_repo_store` coverage — when
+    the store is missing, each binding's branch/key resolves via
+    `_binding_branch` BEFORE creation (its store probes tolerate the
+    missing store) and every non-branch binding's `ref` goes in as a
+    `pins` entry, so each pin's `_ensure_pinned_ref` coverage lands with
+    the one creating fetch; on a pre-existing store an uncovered
+    explicit branch that upstream advertises gets its refspec line
+    appended — append-only, probed by one `ls-remote`; a `latest` whose
+    store origin/HEAD is missing or dangles probes the remote's default
+    the same way and repoints the symref; a tag/commit ref gets
+    `_ensure_pinned_ref` coverage — a tag's refspec line when upstream
+    advertises it, or a one-shot `fetch origin <sha>` for a missing
+    commit — followed by exactly one store fetch.
     Resolution is otherwise recorded/local — no other `ls-remote`/
     `remote set-head` re-probe. Per checkout key:
     `ensure_checkout` per binding (record check + cone-union widening +
@@ -2140,12 +2531,58 @@ def pull_shared_bindings(
         repo_url = sitems[0]["repo_url"]
         store_existed = (store / "HEAD").is_file()
         try:
+            # The same storage-real invariant `ensure_repo_store`
+            # enforces: an existing store bypasses that function, so a
+            # symlinked `.gf`/`repos`/repo-key/`git` component must be
+            # refused here before the coverage loop writes refspec
+            # lines, fetches, or repoints origin/HEAD through the link
+            # into foreign storage.
+            if not layout.storage_is_real(store):
+                raise ValidationError(
+                    f"repo store path {store} resolves through a symlink")
+            if store_existed:
+                # An existing store bypasses ensure_repo_store's
+                # creation-time origin write, so check the binding
+                # here: refuse before the coverage loop below writes
+                # refspec lines or fetches through a store whose
+                # origin no longer matches this binding's resolution.
+                _assert_store_origin(backend, store, repo_url)
             if not store_existed:
+                # The clone path's pattern, grouped: resolve every
+                # binding's branch/key BEFORE the store exists —
+                # `_binding_branch`'s store probes tolerate the missing
+                # store — and feed each non-branch binding's `ref` into
+                # the create step as a pin so its `_ensure_pinned_ref`
+                # coverage lands with the one creating fetch. Covering a
+                # pin after that fetch would append a tag's refspec line
+                # that no fetch ever reads.
+                for it in sitems:
+                    ref = it["ref"]
+                    try:
+                        branch = _binding_branch(
+                            store, repo_url, ref, backend)
+                    except GitFoldersError as e:
+                        e.folder = it["folder"]
+                        raise
+                    it["branch"] = branch
+                    it["key"] = (
+                        layout.checkout_key_for_branch(branch)
+                        if branch
+                        else layout.checkout_key_for_ref(ref or "latest")
+                    )
                 # A store created here already fetched inside
                 # ensure_repo_store — it gets no second fetch below.
-                ensure_repo_store(store, repo_url, backend=backend)
+                ensure_repo_store(
+                    store, repo_url,
+                    pins=[it["ref"] for it in sitems
+                          if it["branch"] is None],
+                    backend=backend,
+                )
                 lines.append(f'add "{layout.GF_DIR}/" to .gitignore')
-            for it in sitems:
+            # A store this pull created resolved its bindings and pin
+            # coverage above; the coverage loop below serves only a
+            # pre-existing store.
+            for it in (sitems if store_existed else ()):
                 ref = it["ref"]
                 try:
                     if ref in ("latest", ""):
@@ -2226,10 +2663,18 @@ def pull_shared_bindings(
         # the OWNING root's own — the invoking worktree's copied
         # `folders` can lag it (a binding cloned in after `worktree add`
         # snapshotted the copy), and `_vacate_checkout`/`_siblings_served`
-        # must not miss a link that still resolves here.
+        # must not miss a link that still resolves here. An unreadable or
+        # corrupt owning manifest degrades to no served siblings: it only
+        # drives cosmetic `(moved with ...)` lines, and `_vacate_checkout`
+        # already skips pruning under the same condition — degrading
+        # beats aborting a valid pull.
         mf = {}
         if (owning_root / _manifest.MANIFEST).is_file():
-            mf = _manifest.read_manifest(owning_root)
+            try:
+                mf = _manifest.read_manifest(owning_root)
+            except (OSError, GitFoldersError, tomllib.TOMLDecodeError,
+                    UnicodeDecodeError):
+                mf = {}
         owning_folders = mf.get("git_folder", [])
 
         by_key: dict[str, list[dict]] = {}
@@ -2312,7 +2757,8 @@ def pull_shared_bindings(
                 link = owning_root / it["folder"]["path"]
                 try:
                     action = ensure_consumer_link(
-                        link, it_co.work_tree / it_co.subdir)
+                        link, it_co.work_tree / it_co.subdir,
+                        root=owning_root)
                     old_co = it["co"]
                     if old_co.is_store_checkout and (
                         old_co.common_dir != store

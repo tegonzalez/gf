@@ -23,6 +23,13 @@ created (a leaked half-made store keeps `HEAD` on `refs/heads/master`,
 which the retry's checkout `worktree add` reports as already used),
 while the same failure joining a pre-existing store leaves it in place.
 
+R10-3 seam pins (unit level, direct `shelf._remove_repo_store` calls on
+fixture stores — no git needed): the removal keeps a store whose
+`worktrees/` holds any record — a concurrent join's completed checkout
+cannot be wiped by a losing rollback — while a record-free store still
+removes: empty `worktrees/` dir, partial store without `worktrees/`,
+and a `worktrees` path that is a plain file all still remove.
+
 Real git over a local bare upstream via the `gf` subprocess.
 Designed-red while the rebuild half of F4 lands.
 """
@@ -31,7 +38,9 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from conftest import gf, git
+from gf import shelf
+
+from conftest import deny_file_transport, gf, git
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +90,12 @@ def _advance(up: Path, tmp_path: Path, tag: str) -> None:
     _git("-C", work, "add", "-A")
     _git("-C", work, "commit", "-m", tag)
     _git("-C", work, "push", "origin", "master")
+
+
+def _denied_pull(tmp_path: Path, monkeypatch, parent: Path):
+    """One `gf pull` with the file transport refused, then restore."""
+    with deny_file_transport(tmp_path, monkeypatch):
+        return gf("-C", str(parent), "pull", check=False)
 
 
 # ---------------------------------------------------------------------------
@@ -166,13 +181,7 @@ def test_pull_init_subfolder_retry_after_failed_store_fetch(
     parent = _parent(tmp_path)
     gf("-C", str(parent), "init", "child", "--url", f"{up}/docs/api")
 
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "never")
-    first = gf("-C", str(parent), "pull", check=False)
-    monkeypatch.delenv("GIT_CONFIG_COUNT")
-    monkeypatch.delenv("GIT_CONFIG_KEY_0")
-    monkeypatch.delenv("GIT_CONFIG_VALUE_0")
+    first = _denied_pull(tmp_path, monkeypatch, parent)
 
     err = first.stderr + first.stdout
     assert first.returncode != 0, (
@@ -217,13 +226,7 @@ def test_pull_failed_fetch_keeps_preexisting_store(
 
     link.unlink()  # force re-serve of the binding on the next pull
 
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "never")
-    first = gf("-C", str(parent), "pull", check=False)
-    monkeypatch.delenv("GIT_CONFIG_COUNT")
-    monkeypatch.delenv("GIT_CONFIG_KEY_0")
-    monkeypatch.delenv("GIT_CONFIG_VALUE_0")
+    first = _denied_pull(tmp_path, monkeypatch, parent)
 
     err = first.stderr + first.stdout
     assert first.returncode != 0, (
@@ -242,3 +245,86 @@ def test_pull_failed_fetch_keeps_preexisting_store(
     assert link.is_symlink()
     assert (link / "x.txt").read_text().strip() == \
         "api on master in upstream"
+
+
+# ---------------------------------------------------------------------------
+# R10-3 — _remove_repo_store keeps a store serving another binding
+
+
+def _repo_store(tmp_path: Path, repo_key: str = "deadbee") -> Path:
+    """A minimal store-shaped gitdir at `.gf/repos/<repo-key>/git`.
+
+    `HEAD` + `objects/` mirror what `ensure_repo_store`'s
+    `git init --bare` leaves before any fetch; `_remove_repo_store`
+    treats the tree opaquely, so no real git call is needed at this
+    seam.
+    """
+    store = tmp_path / ".gf" / "repos" / repo_key / "git"
+    (store / "objects").mkdir(parents=True)
+    (store / "HEAD").write_text("ref: refs/heads/master\n")
+    return store
+
+
+def test_remove_repo_store_keeps_store_serving_foreign_record(tmp_path):
+    """Guard arm: a store whose `worktrees/` holds a record at removal
+    time is serving another binding — a concurrent join whose checkout
+    completed after the failing call's `store_created` flag was taken —
+    so `_remove_repo_store` keeps it: the record dir, its `gitdir`
+    file, and the store's own `HEAD` all survive, and the `<repo-key>`
+    parent is not pruned. Pre-fix this call rmtree'd the whole store —
+    the join's record was wiped by the losing rollback."""
+    store = _repo_store(tmp_path)
+    record = store / "worktrees" / "a1b2-foreign-join"
+    record.mkdir(parents=True)
+    (record / "gitdir").write_text("/parent/.gf/wt/a1b2/.git\n")
+
+    shelf._remove_repo_store(store)
+
+    assert store.is_dir()
+    assert (record / "gitdir").is_file()
+    assert (store / "HEAD").is_file()
+    assert store.parent.is_dir()      # <repo-key> not pruned
+
+
+def test_remove_repo_store_removes_store_with_empty_worktrees_dir(
+        tmp_path):
+    """An empty `worktrees/` dir holds no record and gives no
+    protection: the store removes wholesale and the emptied `<repo-key>`
+    parent is pruned — the existing removal contract, unchanged. The
+    prune stops at `<repo-key>`; `.gf/repos` itself remains."""
+    store = _repo_store(tmp_path)
+    (store / "worktrees").mkdir()
+    repo_key = store.parent
+
+    shelf._remove_repo_store(store)
+
+    assert not store.exists()
+    assert not repo_key.exists()
+    assert (tmp_path / ".gf" / "repos").is_dir()
+
+
+def test_remove_repo_store_removes_recordless_partial_store(tmp_path):
+    """A partial store that never reached `worktrees/` — `HEAD` and
+    `objects/` only, as a failed store-phase clone leaves — removes
+    wholesale, `<repo-key>` pruned: the guard narrows removal to the
+    serving case only."""
+    store = _repo_store(tmp_path)
+
+    shelf._remove_repo_store(store)
+
+    assert not store.exists()
+    assert not store.parent.exists()
+
+
+def test_remove_repo_store_removes_store_despite_worktrees_file(
+        tmp_path):
+    """Boundary arm: a `worktrees` path that is a plain FILE is not a
+    records dir — `is_dir()` is false and it confers no protection, so
+    the store removes (the file goes with it)."""
+    store = _repo_store(tmp_path)
+    (store / "worktrees").write_text("not a records dir\n")
+
+    shelf._remove_repo_store(store)
+
+    assert not store.exists()
+    assert not store.parent.exists()

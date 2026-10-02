@@ -1308,3 +1308,225 @@ def test_clone_create_store_fetches_pinned_commit_sha(tmp_path, capsys):
     assert (co.gitdir / "HEAD").read_text().strip() == gone_sha
     assert (parent / "vendor" / "sha" / "gone.txt").read_text() == (
         "gone tip")
+
+
+# ---------------------------------------------------------------------------
+# R7-C pull arm — pinned-ref coverage when `gf pull` creates the store
+#
+# A `gf init <path> --url <up>/<subdir> -b <ref>` placeholder converted by
+# the first `gf pull` makes the PULL create the repo store. The create arm
+# needs the same pin coverage the clone path has: a tag-pinned binding's
+# `+refs/tags/<t>:refs/tags/<t>` line must be in place BEFORE the one
+# creating fetch — a store this pull created gets no second fetch, so an
+# append that lands after it is coverage no fetch ever reads. The pull
+# resolves every binding's branch/key via `_binding_branch` before the
+# store exists and feeds each non-branch binding's `ref` into
+# `ensure_repo_store(pins=...)`, whose per-pin `_ensure_pinned_ref`
+# coverage rides the creating fetch (the clone mechanism, grouped).
+#
+# Pre-fix signature (verified against 74298d6):
+#   init -b <orphan-tag> + pull: rc 1, "could not resolve ref 'v3'" —
+#   the coverage loop appended the tag's line only AFTER the creating
+#   fetch, leaving a store holding a refspec no fetch ever ran.
+
+
+def test_pull_create_store_orphan_tag_pin_rides_creating_fetch(tmp_path):
+    """R7-C pull twin of the clone-side orphan pin: `gf init vendor/o
+    --url <up>/docs/api -b v3` records the binding without fetching,
+    then `gf pull` creates the store, lands `refs/tags/v3` with the one
+    creating fetch, and serves the orphan commit's tree detached through
+    a `ref=v3` checkout. rc 0, `Pulled o`, store refspecs exactly the
+    wildcard + the tag line. Pre-fix: rc 1 `could not resolve ref 'v3'`.
+    """
+    up = _upstream(tmp_path)
+    orphan_sha = _push_orphan_tag(up, tmp_path, "v3")
+    parent = _parent(tmp_path)
+
+    # init writes the manifest and a placeholder gitdir only — no fetch,
+    # no repo store.
+    gf("-C", str(parent), "init", "vendor/o",
+       "--url", str(up / "docs/api"), "-b", "v3")
+    child = parent / "vendor" / "o"
+    assert child.is_dir() and not child.is_symlink()
+    assert not (parent / ".gf").exists()
+    manifest = tomllib.loads((parent / "gf.toml").read_text())
+    (entry,) = [f for f in manifest["git_folder"]
+                if f["path"] == "vendor/o"]
+    assert entry["url"] == str(up / "docs/api")
+    assert entry["ref"] == "v3"
+
+    r = gf("-C", str(parent), "pull", check=False)
+    assert r.returncode == 0, r.stderr
+    assert "Pulled o" in r.stdout
+
+    store = layout.repo_store(parent, str(up))
+    # append-only coverage: wildcard verbatim + exactly the pin's line.
+    assert _refspec_lines(store) == [
+        "+refs/heads/*:refs/remotes/origin/*",
+        "+refs/tags/v3:refs/tags/v3",
+    ]
+    # the pin landed — the tag names the orphan commit in the store.
+    assert _out("--git-dir", store, "rev-parse",
+                "refs/tags/v3^{}") == orphan_sha
+
+    # the consumer link serves the tagged tree from a detached
+    # `ref=v3` checkout — v3.txt exists only on the orphan commit.
+    co = _co(parent, up, "ref=v3", "docs/api")
+    assert (co.gitdir / "HEAD").read_text().strip() == orphan_sha
+    assert child.is_symlink()
+    assert child.resolve() == (co.work_tree / "docs" / "api").resolve()
+    assert (child / "v3.txt").read_text() == "orphan v3"
+    assert (child / "x.txt").read_text() == "api on master"
+
+
+def test_pull_create_store_tag_pin_probe_append_one_fetch(
+        tmp_path, capsys):
+    """R7-C ordering arm: on the pull that creates the store, the tag's
+    pin coverage runs inside `ensure_repo_store` — `ls-remote` probe,
+    then `config --add`, then the ONE `--filter=blob:none` creating
+    fetch — with no post-append top-up fetch (spec "Fetch refspecs":
+    a needed tag's line lands with the creating fetch). Pre-fix the
+    append ran in the coverage loop AFTER the creating fetch, and the
+    pull still died `could not resolve ref`."""
+    up = _upstream(tmp_path)
+    _push_orphan_tag(up, tmp_path, "v3")
+    parent = _parent(tmp_path)
+    gf("-C", str(parent), "init", "vendor/o",
+       "--url", str(up / "docs/api"), "-b", "v3")
+
+    rec = _LogBackend()
+    code, out = _run(parent, capsys, "pull", backend=rec)
+    assert code == 0, out
+
+    store = layout.repo_store(parent, str(up))
+    calls = [c[0] for c in rec.calls]
+    tag_probe = ("ls-remote", str(up), "refs/tags/v3")
+    tag_append = ("config", "--add", "remote.origin.fetch",
+                  "+refs/tags/v3:refs/tags/v3")
+    create_fetch = ("fetch", "--filter=blob:none", "origin")
+    assert tag_probe in calls and tag_append in calls, calls
+    assert create_fetch in calls, calls
+    # probe → append → the one creating fetch, in that order
+    assert (calls.index(tag_probe) < calls.index(tag_append)
+            < calls.index(create_fetch))
+    fetches = [c for c in rec.calls
+               if "fetch" in c[0] and c[1].get("git_dir") == store]
+    assert len(fetches) == 1, f"fetches: {[c[0] for c in fetches]}"
+
+
+def test_pull_create_store_branch_and_tag_pins_one_fetch(
+        tmp_path, capsys):
+    """R7-C grouped arm: two init bindings share one fresh store — `b`
+    pinned to branch `master`, `o` pinned to orphan tag `v3`. One
+    `gf pull` resolves both before the store exists, carries v3's pin
+    into the one creating fetch, and materializes each under its own
+    checkout key — `master` and `ref=v3`. Exactly one store fetch.
+    Pre-fix: `Pulled b` then rc 1 `could not resolve ref 'v3'`."""
+    up = _upstream(tmp_path)
+    orphan_sha = _push_orphan_tag(up, tmp_path, "v3")
+    parent = _parent(tmp_path)
+    gf("-C", str(parent), "init", "vendor/b",
+       "--url", str(up / "tools"), "-b", "master")
+    gf("-C", str(parent), "init", "vendor/o",
+       "--url", str(up / "docs/api"), "-b", "v3")
+
+    rec = _LogBackend()
+    code, out = _run(parent, capsys, "pull", backend=rec)
+    assert code == 0, out
+    assert "Pulled b" in out and "Pulled o" in out
+
+    store = layout.repo_store(parent, str(up))
+    fetches = [c for c in rec.calls
+               if "fetch" in c[0] and c[1].get("git_dir") == store]
+    assert len(fetches) == 1, f"fetches: {[c[0] for c in fetches]}"
+    assert _refspec_lines(store) == [
+        "+refs/heads/*:refs/remotes/origin/*",
+        "+refs/tags/v3:refs/tags/v3",
+    ]
+
+    # each binding materialized under its own checkout key
+    assert (parent / "vendor" / "b").resolve() == (
+        _co(parent, up, "master", "tools").work_tree / "tools").resolve()
+    assert (parent / "vendor" / "b" / "t.txt").read_text().strip() == (
+        "tool in upstream")
+    co = _co(parent, up, "ref=v3", "docs/api")
+    assert (co.gitdir / "HEAD").read_text().strip() == orphan_sha
+    assert (parent / "vendor" / "o").resolve() == (
+        co.work_tree / "docs" / "api").resolve()
+    assert (parent / "vendor" / "o" / "v3.txt").read_text() == (
+        "orphan v3")
+
+
+def test_pull_existing_store_tag_binding_still_covered(tmp_path, capsys):
+    """R7-C control (join arm unchanged): a tag-pinned init binding on a
+    store that ALREADY exists keeps the join-side coverage — the loop
+    probes `refs/tags/v3`, `--add`s its line, and the pull's one
+    `_fetch_store` lands it. Passed pre-fix; stays green — the `pins`
+    create-arm change must not disturb the join path."""
+    up = _upstream(tmp_path)
+    orphan_sha = _push_orphan_tag(up, tmp_path, "v3")
+    parent = _parent(tmp_path)
+    gf("-C", str(parent), "clone", str(up / "tools"), "vendor/t",
+       "-b", "master")   # creates the store before the pull
+    store = layout.repo_store(parent, str(up))
+    assert _refspec_lines(store) == ["+refs/heads/*:refs/remotes/origin/*"]
+
+    gf("-C", str(parent), "init", "vendor/o",
+       "--url", str(up / "docs/api"), "-b", "v3")
+    rec = _LogBackend()
+    code, out = _run(parent, capsys, "pull", backend=rec)
+    assert code == 0, out
+    assert "Pulled o" in out
+
+    calls = [c[0] for c in rec.calls]
+    tag_probe = ("ls-remote", str(up), "refs/tags/v3")
+    tag_append = ("config", "--add", "remote.origin.fetch",
+                  "+refs/tags/v3:refs/tags/v3")
+    assert tag_probe in calls and tag_append in calls, calls
+    # join arm: the append precedes the pull's ONE store fetch.
+    assert calls.index(tag_probe) < calls.index(tag_append)
+    fetches = [c for c in rec.calls
+               if "fetch" in c[0] and c[1].get("git_dir") == store]
+    assert len(fetches) == 1, f"fetches: {[c[0] for c in fetches]}"
+
+    assert _refspec_lines(store) == [
+        "+refs/heads/*:refs/remotes/origin/*",
+        "+refs/tags/v3:refs/tags/v3",
+    ]
+    assert _out("--git-dir", store, "rev-parse",
+                "refs/tags/v3^{}") == orphan_sha
+    co = _co(parent, up, "ref=v3", "docs/api")
+    assert (co.gitdir / "HEAD").read_text().strip() == orphan_sha
+    assert (parent / "vendor" / "o" / "v3.txt").read_text() == (
+        "orphan v3")
+
+
+def test_pull_create_store_branch_binding_unchanged(tmp_path, capsys):
+    """R7-C control (branch arm unchanged): `-b dev` on a fresh store —
+    the explicit non-default branch resolves via `_binding_branch`'s
+    upstream probe before the store exists, joins no pin, and the one
+    creating fetch lands it under the `dev` key. Passed pre-fix (the
+    coverage loop resolved the same branch from the fetched store) and
+    stays green."""
+    up = _upstream(tmp_path)
+    parent = _parent(tmp_path)
+    gf("-C", str(parent), "init", "vendor/api",
+       "--url", str(up / "docs/api"), "-b", "dev")
+
+    rec = _LogBackend()
+    code, out = _run(parent, capsys, "pull", backend=rec)
+    assert code == 0, out
+    assert "Pulled api" in out
+
+    store = layout.repo_store(parent, str(up))
+    # a branch pin needs no extra line — coverage stays the wildcard.
+    assert _refspec_lines(store) == ["+refs/heads/*:refs/remotes/origin/*"]
+    fetches = [c for c in rec.calls
+               if "fetch" in c[0] and c[1].get("git_dir") == store]
+    assert len(fetches) == 1, f"fetches: {[c[0] for c in fetches]}"
+
+    co = _co(parent, up, "dev", "docs/api")
+    assert (parent / "vendor" / "api").resolve() == (
+        co.work_tree / "docs" / "api").resolve()
+    assert (parent / "vendor" / "api" / "dev.txt").read_text().strip() == (
+        "dev in upstream")

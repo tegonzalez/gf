@@ -18,11 +18,22 @@ failures are injected by backend wrappers — the same seam
 mock's own `-ff` lock semantics (a `locked` worktree refuses a single
 `--force`, yields to two). Real-git twin of the happy rollback:
 R9-3's `test_add_tracked_dir_collision_rolls_back` in test_worktree.py.
+
+F6 extension: when even the doubled-force remove reports failure, the
+rollback re-lists `worktree list --porcelain` and reports the ACTUAL
+registration state rather than assuming the remove's rc told the truth —
+not registered -> the ORIGINAL error only; registered + tree gone ->
+`git worktree prune`; registered + tree present -> `git worktree remove
+--force <path>`; the re-check itself failed -> both remedies. The
+wrappers below inject each remove/list seam shape (live-git twins: the
+`/tmp/f6-live/bin-*` shims).
 """
 
+import shutil
 from pathlib import Path
 
 from gf.backends import GitResult
+from gf.exceptions import GitError
 
 
 SHA1 = "1111111111111111111111111111111111111111"
@@ -127,6 +138,95 @@ class _FailWorktreeRemove:
         return getattr(self._inner, name)
 
 
+class _RemoveLandsButRc1:
+    """Backend wrapper: `worktree remove` of `target` performs the REAL
+    unregister — the inner mock drops the record, the tree and the admin
+    dir — but the call reports rc=1 anyway: the shim that runs the real
+    remove then exits 1 on a later cleanup step. The `-ff` retry then
+    refuses 'not a working tree', still rc=1. A nonzero remove does NOT
+    prove the registration survived.
+
+    `removes` records each attempted remove argv, like
+    `_FailWorktreeRemove`."""
+
+    def __init__(self, inner, target: Path):
+        self._inner = inner
+        self._target = str(Path(target).resolve())
+        self.removes: list[tuple] = []
+
+    def git(self, *args, **kwargs):
+        if args[:2] == ("worktree", "remove"):
+            self.removes.append(args)
+            if str(Path(args[-1]).resolve()) == self._target:
+                result = self._inner.git(*args, **kwargs)
+                return GitResult(
+                    1, result.stdout,
+                    result.stderr or "shim: post-remove cleanup failed")
+        return self._inner.git(*args, **kwargs)
+
+    def git_capture(self, *args, **kwargs):
+        return self._inner.git_capture(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class _FailRemoveDropTree:
+    """Backend wrapper: `worktree remove` of `target` fails (rc=1) AND
+    the tree is gone while the registration record survives — the
+    stale-record arm where the remedy is `git worktree prune`, not
+    another remove that can only fail on the missing tree again.
+
+    `removes` records each attempted remove argv."""
+
+    def __init__(self, inner, target: Path):
+        self._inner = inner
+        self._target = str(Path(target).resolve())
+        self.removes: list[tuple] = []
+
+    def git(self, *args, **kwargs):
+        if args[:2] == ("worktree", "remove"):
+            self.removes.append(args)
+            if str(Path(args[-1]).resolve()) == self._target:
+                # Drop the tree but never the registration: the inner
+                # backend is not called, so `repo.worktrees` keeps the
+                # record and `worktree list --porcelain` still lists it.
+                shutil.rmtree(self._target, ignore_errors=True)
+                return GitResult(
+                    1, "",
+                    f"fatal: remove partially failed for '{self._target}'")
+        return self._inner.git(*args, **kwargs)
+
+    def git_capture(self, *args, **kwargs):
+        return self._inner.git_capture(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class _FailWorktreeList:
+    """Backend wrapper: `worktree list` fails — the post-remove
+    registration re-check cannot determine whether the orphan is still
+    registered. Compose under `_FailWorktreeRemove` so the rollback
+    removes fail first and the re-check is reached."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def git(self, *args, **kwargs):
+        if args[:2] == ("worktree", "list"):
+            raise GitError("git worktree list failed: exploded")
+        return self._inner.git(*args, **kwargs)
+
+    def git_capture(self, *args, **kwargs):
+        if args[:2] == ("worktree", "list"):
+            raise GitError("git worktree list failed: exploded")
+        return self._inner.git_capture(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def test_rollback_retries_locked_worktree_with_double_force(
         fs, gf_inproc, mock_backend):
     """Post-add failure with the new worktree locked: the first
@@ -177,6 +277,9 @@ def test_rollback_failure_names_orphan_and_recovery(
     assert "worktree add failed for git-folder 'zz' (vendor/zz)" in err
     assert "rollback of the new worktree also failed" in err
     assert f"git worktree remove --force {wt}" in err
+    # Registered AND on disk names ONLY the remove remedy — `prune` is
+    # the stale-record remedy and must not be suggested for a live tree.
+    assert "git worktree prune" not in err
     # Both rollback attempts ran before the die.
     assert backend.removes == [
         ("worktree", "remove", "--force", str(wt)),
@@ -207,3 +310,93 @@ def test_rollback_single_force_no_retry_when_it_succeeds(
     assert "rollback of the new worktree also failed" not in err
     assert _registered(mock_backend, parent, wt) is None
     assert not wt.exists()
+
+
+def test_rollback_remove_rc1_but_unregistered_reports_original_error(
+        fs, gf_inproc, mock_backend):
+    """F6 arm — both removes report rc=1 but the FIRST one actually ran
+    the unregister (a shim that runs the real remove then exits 1): the
+    porcelain re-check shows `wt` is NOT registered, so the die is the
+    ORIGINAL post-add error alone — no rollback clause, no orphan
+    wording, no recovery remedy."""
+    parent = _collision_parent(fs, mock_backend)
+    wt = Path("/wt")
+    backend = _RemoveLandsButRc1(mock_backend, wt)
+
+    r = gf_inproc("-C", str(parent), "worktree", "add", str(wt),
+                  backend=backend, check=False)
+
+    assert r.returncode == 1
+    err = r.stderr + r.stdout
+    # The original post-add error is the whole report.
+    assert "worktree add failed for git-folder 'zz' (vendor/zz)" in err
+    assert f"child path {wt / 'vendor' / 'zz'} already exists" in err
+    # Both rollback removes ran; both reported rc=1 ...
+    assert backend.removes == [
+        ("worktree", "remove", "--force", str(wt)),
+        ("worktree", "remove", "--force", "--force", str(wt)),
+    ]
+    # ... yet the re-check proved the unregister landed, so none of the
+    # rollback-failure wording or remedies may appear.
+    assert "rollback of the new worktree also failed" not in err
+    assert "orphan" not in err
+    assert "remove --force" not in err
+    assert "prune" not in err
+    # Ground truth: the registration really is gone, and so is the tree.
+    assert _registered(mock_backend, parent, wt) is None
+    assert not wt.exists()
+
+
+def test_rollback_failure_registered_but_tree_gone_names_prune(
+        fs, gf_inproc, mock_backend):
+    """F6 arm — both removes fail, the registration record survives but
+    the tree is already gone: the die must name `git worktree prune`
+    (which drops exactly that stale record) and NOT `remove --force`
+    (which can only fail on the missing tree again)."""
+    parent = _collision_parent(fs, mock_backend)
+    wt = Path("/wt")
+    backend = _FailRemoveDropTree(mock_backend, wt)
+
+    r = gf_inproc("-C", str(parent), "worktree", "add", str(wt),
+                  backend=backend, check=False)
+
+    assert r.returncode == 1
+    err = r.stderr + r.stdout
+    assert "worktree add failed for git-folder 'zz' (vendor/zz)" in err
+    assert "rollback of the new worktree also failed" in err
+    assert "git worktree prune" in err
+    assert "git worktree remove --force" not in err
+    assert backend.removes == [
+        ("worktree", "remove", "--force", str(wt)),
+        ("worktree", "remove", "--force", "--force", str(wt)),
+    ]
+    # Ground truth for this arm: record live, tree gone.
+    assert _registered(mock_backend, parent, wt) is not None
+    assert not wt.exists()
+
+
+def test_rollback_failure_list_error_names_both_remedies(
+        fs, gf_inproc, mock_backend):
+    """F6 arm — removes fail AND the `worktree list --porcelain`
+    re-check itself fails: the registration state is unknowable, so the
+    die names the orphan and BOTH remedies — `remove --force <path>` for
+    a live tree, `git worktree prune` for a leftover record."""
+    parent = _collision_parent(fs, mock_backend)
+    wt = Path("/wt")
+    backend = _FailWorktreeRemove(_FailWorktreeList(mock_backend), wt)
+
+    r = gf_inproc("-C", str(parent), "worktree", "add", str(wt),
+                  backend=backend, check=False)
+
+    assert r.returncode == 1
+    err = r.stderr + r.stdout
+    assert "worktree add failed for git-folder 'zz' (vendor/zz)" in err
+    assert "rollback of the new worktree also failed" in err
+    assert f"git worktree remove --force {wt}" in err
+    assert "git worktree prune" in err
+    assert backend.removes == [
+        ("worktree", "remove", "--force", str(wt)),
+        ("worktree", "remove", "--force", "--force", str(wt)),
+    ]
+    # The registration was never dropped — still the mock's truth.
+    assert _registered(mock_backend, parent, wt) is not None

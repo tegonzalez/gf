@@ -27,6 +27,52 @@ def test_normalize_and_name_from_url():
     assert _name_from_url("/upstream") == "upstream"
 
 
+def test_normalize_url_dotted_head_existing_at_base_stays_local(tmp_path):
+    """gf-spec.md `gf clone`: bare host/path expansion applies only when
+    neither the first segment nor the spelled path exists under the
+    anchor — a spelled path existing at the anchor is a local path even
+    when its first segment contains a dot (the `<repo>.git/<subdir>`
+    spelling)."""
+    from gf.cli import _normalize_url
+
+    # `<base>/upx.git` exists (a bare repo carried inside the parent):
+    # the spelling is a local path, never `https://upx.git/...`.
+    (tmp_path / "upx.git").mkdir()
+    assert _normalize_url("upx.git/docs/api", tmp_path) == "upx.git/docs/api"
+
+    # "exists" is not "is a directory": a first segment that is an
+    # ordinary file still anchors the spelling as a local path.
+    (tmp_path / "v1.2").write_text("notes")
+    assert _normalize_url("v1.2/changelog", tmp_path) == "v1.2/changelog"
+
+
+def test_normalize_url_dotted_head_missing_at_base_expands(tmp_path):
+    """The same dotted-first-segment spelling under an anchor that
+    lacks it is host shorthand (gf-spec.md `gf clone`: expanded to
+    `https://...`)."""
+    from gf.cli import _normalize_url
+
+    assert _normalize_url("upx.git/docs/api", tmp_path) == (
+        "https://upx.git/docs/api")
+    # Ordinary host shorthand is unchanged by the existence guard.
+    assert _normalize_url("github.com/x", tmp_path) == (
+        "https://github.com/x")
+
+
+def test_normalize_url_scheme_spellings_passthrough(tmp_path):
+    """Control: `https://`/`git@` spellings are returned unchanged
+    whatever the anchor holds (gf-spec.md `gf clone`)."""
+    from gf.cli import _normalize_url
+
+    (tmp_path / "upx.git").mkdir()
+    assert _normalize_url(
+        "https://host.org/repo.git/docs/api", tmp_path
+    ) == "https://host.org/repo.git/docs/api"
+    assert _normalize_url(
+        "git@host.org:repo.git/docs/api", tmp_path
+    ) == "git@host.org:repo.git/docs/api"
+
+
 def test_get_version_reads_pyproject():
     from gf.cli import _get_version
     # The version is sourced from pyproject.toml (or installed metadata).

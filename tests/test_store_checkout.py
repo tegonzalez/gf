@@ -24,8 +24,8 @@ Real-git pins for the machinery layer (no new command behavior):
 Signature surface exercised:
 
     layout.repo_store(root, repo_url) -> Path
-    shelf.ensure_repo_store(store, url, *, branch=None, single_branch=False,
-                            backend=None)
+    shelf.ensure_repo_store(store, url, *, branch=None, ref=None, pins=(),
+                            single_branch=False, depth=None, backend=None)
     shelf.ensure_checkout(co, ref, *, backend=None)   # union from state
     shelf.ensure_consumer_link(link, target)
 

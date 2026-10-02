@@ -60,8 +60,30 @@ Authorities (docs/gf-spec.md unless noted):
   created `kid2/` and `kid2/.gf/git` before refusing — and the
   corrected retry died `kid2 already has a .gf directory` on the
   half-made child.
+- Slash-named upstream default branch: spec "Reference model"
+  (`latest` resolves to the remote's default branch; a floating
+  checkout keys by `quote(resolved branch, safe='')`) and `gf clone`/
+  `gf pull`. `_effective_branch` read `refs/remotes/origin/HEAD` and
+  kept only its last `/` segment, so an upstream defaulting to
+  `feature/main` mis-resolved `latest` to `main` — the clone died
+  `could not resolve remote branch 'origin/main'` — while a symref
+  spelling outside the prefix (e.g. `refs/heads/master`) truncated to
+  `master` and pulled silently instead of failing on the unresolvable
+  `origin/<target>` the symref actually names.
+- `.git`-suffixed local repository alias: spec §Physical layout fixes
+  `<repo-key>` = `<basename>-<first 8 hex of sha1(normalized repo URL)>`
+  and URL resolution's local walk-up treats `…/repo` and `…/repo.git`
+  as two real repository boundaries; gf-arch.md GF-D5's store contract
+  makes the `.git` alias a remote-transport convention only. Ruling
+  R14-F5 fixes the collapse: a `.git`-suffixed LOCAL binding derives a
+  key distinct from its suffixless sibling, so each repository keeps
+  its own store/checkout and serves its own bytes; an existing
+  collapsed binding's next pull re-derives the new key into a fresh
+  store, retargets the consumer link, and leaves the old store
+  orphaned on disk.
 """
 
+import hashlib
 import os
 import re
 import shutil
@@ -72,7 +94,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import gf, git
+from conftest import deny_file_transport, gf, git
 
 
 # ---------------------------------------------------------------------------
@@ -430,18 +452,17 @@ def test_clone_subfolder_retry_after_failed_initial_store_fetch(
     creates the store fresh, fetches, and resolves the ref in it (spec
     `gf clone` subfolder bullet). The first attempt's transport is
     refused through git's own config (`protocol.file.allow=never`),
-    which fails the fetch after the store is initialised."""
+    which fails the fetch after the store is initialised. The refusal is
+    injected by rewriting the suite's $HOME-anchored gitconfig — the
+    file channel every spawned git still reads; the env vars
+    (GIT_CONFIG_GLOBAL, GIT_CONFIG_KEY_*/VALUE_*) no longer reach child
+    git."""
     up = _upstream(tmp_path, "upstream", API)
     parent = _parent(tmp_path)
 
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "never")
-    first = gf("-C", str(parent), "clone", f"{up}/docs/api", "vendor/api",
-               check=False)
-    monkeypatch.delenv("GIT_CONFIG_COUNT")
-    monkeypatch.delenv("GIT_CONFIG_KEY_0")
-    monkeypatch.delenv("GIT_CONFIG_VALUE_0")
+    with deny_file_transport(tmp_path, monkeypatch):
+        first = gf("-C", str(parent), "clone", f"{up}/docs/api",
+                   "vendor/api", check=False)
     if first.returncode == 0 or "fetch" not in first.stderr:
         pytest.fail(f"setup: first clone did not fail at the fetch:\n"
                     f"rc={first.returncode}\n{first.stderr}")
@@ -908,3 +929,644 @@ def test_clone_relative_url_from_parent_root_unchanged(tmp_path):
     entry = _single(manifest["git_folder"], "git_folder entry")
     assert entry["url"] == "../upstream.git", manifest
     assert entry["path"] == "kid", manifest
+
+
+# ---------------------------------------------------------------------------
+# Defect 8 — a dangling consumer-path symlink is occupancy, not a crash
+#
+# Authorities: spec `gf clone` occupancy bullet ("a dangling symlink at
+# `<path>` counts as occupied — a path that exists only as a link to nowhere
+# is refused with a clean error rather than treated as empty space"), spec
+# `gf init` ("a dangling symlink at `<path>` is refused rather than
+# initialized through, and so is any non-directory occupant"), and the
+# changelog entry ("a dangling symlink at a consumer path is occupancy, not
+# a traceback ... the link is preserved rather than removed as gf-created
+# state ... a link to a real directory still binds through the link").
+#
+# Pre-fix signatures (verified against the base sources):
+# - `gf clone <up> <dangling-link>` and `gf init <dangling-link>` died with
+#   `FileExistsError` tracebacks: `exists()` is False on a dangling link, so
+#   the occupancy guard passed it through and `mkdir(exist_ok=True)` raised
+#   `EEXIST` on the link itself (`init_child`'s `child.mkdir`; `cmd_init`'s
+#   `target.mkdir`).
+# - `gf clone <up> <file>` — a plain file or a link to one — died with
+#   `NotADirectoryError` at `init_child`'s `any(child.iterdir())`; `gf init
+#   <file>` reached `init_git_folder`'s `gitdir.mkdir` the same way.
+# - `gf pull` on a whole-repo binding whose consumer path is a file or a
+#   symlink loop died in `update_child` identically (`iterdir` /
+#   `child.mkdir`).
+#
+# A dangling link whose target resolves OUTSIDE the parent still hits the
+# earlier containment refusal, so the occupants below dangle at in-parent
+# targets.
+
+
+def test_clone_dangling_symlink_refused_link_preserved(tmp_path):
+    """`gf clone <up> <path>` onto a consumer path that is a symlink to
+    nowhere is refused with the spec'd occupancy error — `exists()` is
+    False on a dangling link, but `lexists` counts it as occupied so the
+    clone dies `is a dangling symlink` (rc 1, `gf:` envelope) instead of
+    crashing `FileExistsError` in `child.mkdir`. The link — user content
+    the command never created — is preserved exactly."""
+    up = _upstream(tmp_path, "upstream", {"leaf.txt": "v1"})
+    parent = _occupied_parent(tmp_path)
+    os.symlink("gone", parent / "kid")  # `kid -> gone`, `gone` absent
+    before = _tree_bytes(parent)
+
+    r = gf("-C", str(parent), "clone", str(up), "kid", check=False)
+    err = r.stderr + r.stdout
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    assert "gf: clone failed for git-folder 'kid' (kid):" in err, err
+    assert "is a dangling symlink" in err, err
+    assert "Traceback" not in err, err
+
+    link = parent / "kid"
+    assert link.is_symlink() and os.readlink(link) == "gone", (
+        "dangling link not preserved")
+    assert not os.path.lexists(parent / "gone"), "link target created"
+    assert _tree_bytes(parent) == before, (
+        "parent tree changed by a refused clone")
+
+
+def test_init_dangling_symlink_refused_link_preserved(tmp_path):
+    """`gf init <dangling-link>` is refused the same way: `cmd_init` must
+    not pass the link through to `target.mkdir` (`EEXIST`) or let
+    `init_git_folder`'s gitdir mkdir write through it — the refusal names
+    the dangling symlink and the link is preserved."""
+    parent = _occupied_parent(tmp_path)
+    os.symlink("gone", parent / "din")
+    before = _tree_bytes(parent)
+
+    r = gf("-C", str(parent), "init", "din", check=False)
+    err = r.stderr + r.stdout
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    assert "gf: init failed for git-folder 'din' (din):" in err, err
+    assert "is a dangling symlink" in err, err
+    assert "Traceback" not in err, err
+
+    link = parent / "din"
+    assert link.is_symlink() and os.readlink(link) == "gone", (
+        "dangling link not preserved")
+    assert not os.path.lexists(parent / "gone"), "link target created"
+    assert _tree_bytes(parent) == before, (
+        "parent tree changed by a refused init")
+
+
+def test_clone_file_occupants_refused_cleanly(tmp_path):
+    """A plain file — or a link to one — at `<path>` passes `exists()`
+    but is not a directory: `gf clone` refuses `exists and is not a
+    directory` instead of crashing `NotADirectoryError` in
+    `any(child.iterdir())`. Both occupants survive untouched."""
+    up = _upstream(tmp_path, "upstream", {"leaf.txt": "v1"})
+    parent = _occupied_parent(tmp_path)
+    (parent / "plainfile").write_text("occupied\n")
+    os.symlink("plainfile", parent / "linkfile")
+    before = _tree_bytes(parent)
+
+    for path in ("plainfile", "linkfile"):
+        r = gf("-C", str(parent), "clone", str(up), path, check=False)
+        err = r.stderr + r.stdout
+        assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+        assert f"gf: clone failed for git-folder '{path}' ({path}):" in err, err
+        assert "exists and is not a directory" in err, err
+        assert "Traceback" not in err, err
+
+    assert (parent / "plainfile").read_text() == "occupied\n"
+    assert (parent / "linkfile").is_symlink()
+    assert _tree_bytes(parent) == before, (
+        "parent tree changed by a refused clone")
+
+
+def test_init_file_occupants_refused_cleanly(tmp_path):
+    """Same occupants through `gf init`: the non-directory refusal fires
+    before `init_git_folder`'s `gitdir.mkdir` — where a file path
+    previously surfaced only as `NotADirectoryError`."""
+    parent = _occupied_parent(tmp_path)
+    (parent / "plainfile").write_text("occupied\n")
+    os.symlink("plainfile", parent / "linkfile")
+    before = _tree_bytes(parent)
+
+    for path in ("plainfile", "linkfile"):
+        r = gf("-C", str(parent), "init", path, check=False)
+        err = r.stderr + r.stdout
+        assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+        assert f"gf: init failed for git-folder '{path}' ({path}):" in err, err
+        assert "exists and is not a directory" in err, err
+        assert "Traceback" not in err, err
+
+    assert (parent / "plainfile").read_text() == "occupied\n"
+    assert (parent / "linkfile").is_symlink()
+    assert _tree_bytes(parent) == before, (
+        "parent tree changed by a refused init")
+
+
+def test_pull_whole_repo_file_occupants_refused_cleanly(tmp_path):
+    """`update_child` carries the same gates as `init_child`: `gf pull` on
+    a whole-repo binding whose consumer path was replaced by a file — or
+    a link to one — refuses `exists and is not a directory` instead of
+    crashing `NotADirectoryError` in the non-empty check's `iterdir`."""
+    up = _upstream(tmp_path, "upstream", {"leaf.txt": "v1"})
+    parent = _occupied_parent(tmp_path)
+    _setup_gf("-C", str(parent), "clone", str(up), "kid")
+
+    # Plain file at the binding's path.
+    shutil.rmtree(parent / "kid")
+    (parent / "kid").write_text("occupied\n")
+    r = gf("-C", str(parent), "pull", check=False)
+    err = r.stderr + r.stdout
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    assert "gf: pull failed for git-folder 'kid' (kid):" in err, err
+    assert "exists and is not a directory" in err, err
+    assert "Traceback" not in err, err
+    assert (parent / "kid").read_text() == "occupied\n"
+
+    # A link to a file — the error names the resolved target.
+    (parent / "kid").unlink()
+    (parent / "real.txt").write_text("occupied\n")
+    os.symlink("real.txt", parent / "kid")
+    r = gf("-C", str(parent), "pull", check=False)
+    err = r.stderr + r.stdout
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    assert "gf: pull failed for git-folder 'kid' (kid):" in err, err
+    assert "exists and is not a directory" in err, err
+    assert "Traceback" not in err, err
+    assert (parent / "kid").is_symlink()
+    assert (parent / "real.txt").read_text() == "occupied\n"
+
+
+def test_pull_whole_repo_symlink_loop_refused_as_dangling(tmp_path):
+    """The `update_child` dangling gate on a path that stays a link after
+    realpath: a self-referential `kid -> kid` cannot resolve (ELOOP), so
+    `link_path.resolve()` returns the link itself — `lexists` True,
+    `exists()` False — and `gf pull` dies `is a dangling symlink` (rc 1)
+    instead of `FileExistsError` in `child.mkdir`. The loop link is
+    preserved."""
+    up = _upstream(tmp_path, "upstream", {"leaf.txt": "v1"})
+    parent = _occupied_parent(tmp_path)
+    _setup_gf("-C", str(parent), "clone", str(up), "kid")
+    shutil.rmtree(parent / "kid")
+    os.symlink("kid", parent / "kid")  # self-referential loop
+
+    r = gf("-C", str(parent), "pull", check=False)
+    err = r.stderr + r.stdout
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    assert "gf: pull failed for git-folder 'kid' (kid):" in err, err
+    assert "is a dangling symlink" in err, err
+    assert "Traceback" not in err, err
+
+    link = parent / "kid"
+    assert link.is_symlink() and os.readlink(link) == "kid", (
+        "loop link not preserved")
+
+
+def test_clone_link_to_empty_dir_still_binds_through(tmp_path):
+    """Control: a link to a real directory is not occupancy — `gf clone
+    <up> <link-to-empty-dir>` still binds through the link per the spec's
+    write-through semantics (`exists()`/`is_dir()` follow it, the
+    non-empty check passes on the empty target, and `.gf/git` lands in
+    the real directory while the manifest records the spelled path)."""
+    up = _upstream(tmp_path, "upstream", {"leaf.txt": "v1"})
+    parent = _occupied_parent(tmp_path)
+    (parent / "emptytarget").mkdir()
+    os.symlink("emptytarget", parent / "linkdir")
+
+    r = gf("-C", str(parent), "clone", str(up), "linkdir", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+
+    link = parent / "linkdir"
+    assert link.is_symlink() and os.readlink(link) == "emptytarget"
+    assert (link / "leaf.txt").read_text() == "v1"
+    assert (parent / "emptytarget" / ".gf" / "git" / "HEAD").is_file()
+    manifest = tomllib.loads((parent / "gf.toml").read_text())
+    entry = _single(manifest["git_folder"], "git_folder entry")
+    assert entry["name"] == "linkdir", manifest
+    assert entry["path"] == "linkdir", manifest
+    assert entry["url"] == str(up), manifest
+
+
+def test_clone_and_init_fresh_paths_still_succeed(tmp_path):
+    """Control: the new occupancy gates sit in front of the existing
+    checks only — a clone onto an absent path and an init onto an absent
+    path proceed exactly as before."""
+    up = _upstream(tmp_path, "upstream", {"leaf.txt": "v1"})
+    parent = _occupied_parent(tmp_path)
+
+    r = gf("-C", str(parent), "clone", str(up), "kid", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert (parent / "kid" / "leaf.txt").read_text() == "v1"
+    assert (parent / "kid" / ".gf" / "git" / "HEAD").is_file()
+
+    r = gf("-C", str(parent), "init", "fresh", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert (parent / "fresh" / ".gf" / "git" / "HEAD").is_file()
+
+    manifest = tomllib.loads((parent / "gf.toml").read_text())
+    assert [(f["name"], f["path"]) for f in manifest["git_folder"]] == [
+        ("kid", "kid"), ("fresh", "fresh")], manifest
+
+
+def test_pull_retargets_dangling_consumer_link(tmp_path):
+    """Heal pin (`ensure_consumer_link` is untouched): a consumer link
+    left dangling — here retargeted by hand at a `.gf/wt` checkout path
+    that was never created, so its realpath still names a store checkout
+    and the binding keeps its subfolder routing — is retargeted back at
+    the live checkout by `gf pull` (spec `gf pull` grouped update:
+    consumer links are created or retargeted when the effective repo
+    URL, subdir, or checkout key changes them out from under the link)."""
+    up = _upstream(tmp_path, "upstream", API)
+    parent = _occupied_parent(tmp_path)
+    _setup_gf("-C", str(parent), "clone", f"{up}/docs/api", "vendor/api")
+    link = parent / "vendor" / "api"
+    rk = _single([p for p in (parent / ".gf" / "wt").iterdir()
+                  if p.is_dir()], "repo-key dir")
+    live = rk / "master" / "docs" / "api"
+    if Path(os.path.realpath(link)) != live:
+        pytest.fail("setup: consumer link does not map to the live checkout")
+
+    link.unlink()
+    os.symlink(f"../.gf/wt/{rk.name}/gone/docs/api", link)
+    if link.exists() or not link.is_symlink():
+        pytest.fail("setup: consumer link not left dangling")
+
+    r = gf("-C", str(parent), "pull", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "Pulled api" in r.stdout, r.stdout
+    assert link.is_symlink() and link.exists(), "link still dangling"
+    assert Path(os.path.realpath(link)) == live
+    assert (link / "reference.md").read_text() == "api v1"
+
+
+def test_pull_recreated_checkout_heals_dangling_consumer_link(tmp_path):
+    """Heal pin, second arm: deleting the shared checkout leaves the
+    consumer link dangling; `gf pull --force` recreates the worktree
+    (its admin record survives — `ensure_checkout`'s existing-checkout
+    arm) so the untouched link resolves again and serves the mapping.
+    `--force` answers the recreated checkout's transient ` D` porcelain
+    — the fresh worktree reads deleted against the surviving index
+    before the ref apply repopulates it."""
+    up = _upstream(tmp_path, "upstream", API)
+    parent = _occupied_parent(tmp_path)
+    _setup_gf("-C", str(parent), "clone", f"{up}/docs/api", "vendor/api")
+    link = parent / "vendor" / "api"
+    rk = _single([p for p in (parent / ".gf" / "wt").iterdir()
+                  if p.is_dir()], "repo-key dir")
+    shutil.rmtree(rk / "master")
+    if link.exists() or not link.is_symlink():
+        pytest.fail("setup: consumer link not left dangling")
+
+    r = gf("-C", str(parent), "pull", "--force", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "Pulled api" in r.stdout, r.stdout
+    assert link.is_symlink() and link.exists(), "link still dangling"
+    assert Path(os.path.realpath(link)) == rk / "master" / "docs" / "api"
+    assert (link / "reference.md").read_text() == "api v1"
+
+
+# ---------------------------------------------------------------------------
+# Defect 9 — a slash-named upstream default branch resolved to its last
+# `/` segment only (`origin/feature/main` misread as `origin/main`)
+
+
+def _slash_default_upstream(tmp_path: Path) -> Path:
+    """Bare upstream whose HEAD names a slash default branch — the
+    `git init -b feature/main` shape (HEAD → refs/heads/feature/main) —
+    carrying one commit with a root file and a docs/api tree."""
+    up = tmp_path / "upstream"
+    _git("init", "-q", "--bare", "-b", "feature/main", up)
+    work = tmp_path / "_seed_slash"
+    _git("clone", "-q", up, work)
+    if _git("-C", work, "symbolic-ref", "HEAD").stdout.strip() != (
+            "refs/heads/feature/main"):
+        pytest.fail("setup: seed clone did not adopt feature/main")
+    (work / "docs" / "api").mkdir(parents=True)
+    (work / "docs" / "api" / "reference.md").write_text(
+        "api on feature/main")
+    (work / "a.txt").write_text("hello")
+    _git("-C", work, "add", "-A")
+    _git("-C", work, "commit", "-qm", "init")
+    _git("-C", work, "push", "-q", "origin", "feature/main")
+    return up
+
+
+def _push_slash_update(tmp_path: Path, rel: str, text: str) -> None:
+    """Commit `rel`=`text` on the slash upstream's feature/main."""
+    work = tmp_path / "_seed_slash"
+    (work / rel).write_text(text)
+    _git("-C", work, "commit", "-qam", f"update {rel}")
+    _git("-C", work, "push", "-q", "origin", "feature/main")
+
+
+def test_clone_pull_upstream_slash_default_branch(tmp_path):
+    """A whole-repo `gf clone` of an upstream defaulting to a slash-named
+    branch checks out the FULL branch — `feature/main` tracking
+    `origin/feature/main`: `latest` resolution must strip the whole
+    `refs/remotes/origin/` prefix off the origin/HEAD symref, never
+    keep only its last segment (spec "Reference model", `gf clone`).
+    The same upstream's subfolder clone keys its shared checkout
+    `feature%2Fmain` (`quote(resolved branch, safe='')`), and `gf pull`
+    updates both bindings.
+
+    Pre-fix signature: `head.split('/')[-1]` truncated the symref to
+    `main`, so the clone died `gf: clone failed for git-folder 'lib'
+    (vendor/lib): could not resolve remote branch 'origin/main' in
+    <child>` — the fetched `origin/feature/main` was never tried."""
+    up = _slash_default_upstream(tmp_path)
+    parent = _parent(tmp_path)
+
+    r = gf("-C", str(parent), "clone", str(up), "vendor/lib",
+           check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    child = parent / "vendor" / "lib"
+    assert (child / "a.txt").read_text() == "hello"
+
+    # The checked-out branch is the full slash name tracking its origin
+    # twin — never the truncated `main` segment.
+    branch = gf("-C", str(child), "git", "rev-parse", "--abbrev-ref",
+                "HEAD").stdout.strip()
+    assert branch == "feature/main", branch
+    upstream_ref = gf("-C", str(child), "git", "rev-parse",
+                      "--abbrev-ref", "--symbolic-full-name",
+                      "@{upstream}").stdout.strip()
+    assert upstream_ref == "origin/feature/main", upstream_ref
+    status = gf("-C", str(parent), "status").stdout
+    assert re.search(
+        rf"lib\s+{re.escape(str(up))}\s+\[feature/main\]", status), status
+
+    # A subfolder clone of the same upstream resolves `latest` to the
+    # same branch: the checkout key is quote('feature/main', safe='').
+    r = gf("-C", str(parent), "clone", f"{up}/docs/api", "vendor/api",
+           check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    rk = _single([p for p in (parent / ".gf" / "wt").iterdir()
+                  if p.is_dir()], "repo-key dir")
+    checkout = _single([p for p in rk.iterdir() if p.is_dir()],
+                       "checkout dir")
+    assert checkout.name == "feature%2Fmain", [
+        p.name for p in rk.iterdir()]
+    assert not (rk / "feature").exists(), "slash key split a path level"
+    assert (rk / ".feature%2Fmain.state").is_file()
+    link = parent / "vendor" / "api"
+    assert link.is_symlink()
+    assert Path(os.path.realpath(link)) == checkout / "docs" / "api"
+    assert (link / "reference.md").read_text() == "api on feature/main"
+    # The shared checkout's worktree record is attached to the branch.
+    admin = _checkout_admin(parent, link, "docs/api")
+    assert _git("--git-dir", admin, "symbolic-ref",
+                "HEAD").stdout.strip() == "refs/heads/feature/main"
+
+    # `gf pull` advances both bindings on feature/main.
+    _push_slash_update(tmp_path, "a.txt", "adv")
+    _push_slash_update(tmp_path, "docs/api/reference.md", "api adv")
+    r = gf("-C", str(parent), "pull", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert (child / "a.txt").read_text() == "adv"
+    assert (link / "reference.md").read_text() == "api adv"
+    assert gf("-C", str(child), "git", "rev-parse", "--abbrev-ref",
+              "HEAD").stdout.strip() == "feature/main"
+
+
+def test_clone_pull_upstream_master_default_branch_control(tmp_path):
+    """Control: a `master` default resolves unchanged — whole-repo clone
+    checks out `master` tracking `origin/master`, a same-repo subfolder
+    clone keys its checkout `master`, and `gf pull` updates. With no
+    slash in the name the prefix strip and the retired last-segment
+    truncation agree, so this arm must hold on either side of the fix."""
+    up = _upstream(tmp_path, "upstream",
+                   {"a.txt": "hello",
+                    "docs/api/reference.md": "api on master"})
+    parent = _parent(tmp_path)
+
+    r = gf("-C", str(parent), "clone", str(up), "vendor/lib",
+           check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    child = parent / "vendor" / "lib"
+    assert (child / "a.txt").read_text() == "hello"
+    assert gf("-C", str(child), "git", "rev-parse", "--abbrev-ref",
+              "HEAD").stdout.strip() == "master"
+    assert gf("-C", str(child), "git", "rev-parse", "--abbrev-ref",
+              "--symbolic-full-name",
+              "@{upstream}").stdout.strip() == "origin/master"
+
+    r = gf("-C", str(parent), "clone", f"{up}/docs/api", "vendor/api",
+           check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    rk = _single([p for p in (parent / ".gf" / "wt").iterdir()
+                  if p.is_dir()], "repo-key dir")
+    assert _single([p for p in rk.iterdir() if p.is_dir()],
+                   "checkout dir").name == "master"
+
+    _push_update(tmp_path, up, "a.txt", "adv")
+    r = gf("-C", str(parent), "pull", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert (child / "a.txt").read_text() == "adv"
+    assert (parent / "vendor" / "api" / "reference.md"
+            ).read_text() == "api on master"
+
+
+def test_pull_origin_head_symref_outside_prefix_fails_honestly(tmp_path):
+    """An `origin/HEAD` symref spelling a target OUTSIDE
+    `refs/remotes/origin/` — here `refs/heads/master` — is not a
+    default-branch answer: `latest` must fail with a clean `gf:` error
+    naming the spelled target, never silently truncate to its last
+    segment (spec "Reference model" — `latest` resolves against the
+    remote-tracking refs). The planted symref verifies against the
+    child gitdir's local `master`, so `_ensure_origin_head` leaves it
+    in place for resolution to read.
+
+    Pre-fix signature: `split('/')[-1]` reduced `refs/heads/master` to
+    `master`, `origin/master` resolved, and the pull printed `Pulled
+    lib` — silent truncation with no indication the symref pointed
+    outside the origin namespace."""
+    up = _upstream(tmp_path, "upstream", {"a.txt": "hello"})
+    parent = _parent(tmp_path)
+    _setup_gf("-C", str(parent), "clone", str(up), "vendor/lib")
+    child = parent / "vendor" / "lib"
+    gitdir = child / ".gf" / "git"
+
+    # Plant the defect shape; it survives `_ensure_origin_head` only
+    # because `refs/heads/master` verifies as an existing local ref.
+    _git("--git-dir", gitdir, "symbolic-ref",
+         "refs/remotes/origin/HEAD", "refs/heads/master")
+    if _git("--git-dir", gitdir, "symbolic-ref",
+            "refs/remotes/origin/HEAD").stdout.strip() != (
+            "refs/heads/master"):
+        pytest.fail("setup: planted origin/HEAD symref did not stick")
+    if _git("--git-dir", gitdir, "show-ref", "--verify",
+            "refs/heads/master", check=False).returncode != 0:
+        pytest.fail("setup: child gitdir lacks local refs/heads/master")
+
+    r = gf("-C", str(parent), "pull", "vendor/lib", check=False)
+
+    assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)
+    assert r.stderr.startswith("gf: "), r.stderr
+    assert "Traceback" not in r.stderr
+    # The error names the spelled target — `origin/refs/heads/master`
+    # is unresolvable — not a `main`/`master` segment guess.
+    assert "origin/refs/heads/master" in r.stderr, r.stderr
+    assert "Pulled" not in r.stdout
+    # Nothing was applied or silently repaired: HEAD stayed on master
+    # and the out-of-prefix symref is still what it spelled.
+    assert gf("-C", str(child), "git", "rev-parse", "--abbrev-ref",
+              "HEAD").stdout.strip() == "master"
+    assert _git("--git-dir", gitdir, "symbolic-ref",
+                "refs/remotes/origin/HEAD").stdout.strip() == (
+        "refs/heads/master")
+# Defect 10 — a `.git`-suffixed local repository aliased into its
+# suffixless sibling's store (`repo_key` stripped `.git` for every
+# spelling; R14-F5 keeps the alias for remote spellings only)
+
+
+def _sha8(text: str) -> str:
+    """First 8 hex of sha1(text) — the spec's repo-key suffix formula."""
+    return hashlib.sha1(text.encode()).hexdigest()[:8]
+
+
+def _collapsed_key(repo_url: str) -> str:
+    """The PRE-fix repo key of a `.git`-suffixed local path: the alias
+    applied to every spelling, so `…/lib.git` keyed exactly as `…/lib`.
+    Computed from the defect's own rule, never from `layout.repo_key`
+    (the code under test)."""
+    stripped = repo_url.rstrip("/").removesuffix(".git")
+    base = stripped.replace(":", "/").rsplit("/", 1)[-1] or "repo"
+    return f"{base}-{_sha8(stripped)}"
+
+
+def _collapsed_simulated_binding(
+        parent: Path, link: Path, old_key: str, new_key: str,
+        checkout_key: str, subdir: str) -> None:
+    """Rewrite a live post-fix binding into its pre-fix collapsed state.
+
+    A pre-fix `gf clone` cannot run in-slice (the fix is applied), so
+    the real store, checkout, worktree record and consumer link are
+    renamed onto the collapsed key's paths — byte-identical to what the
+    old key derivation produced (the worktree record's `gitdir` file and
+    the relative consumer link are the only absolute-path-bearing
+    artifacts)."""
+    repos = parent / ".gf" / "repos"
+    wt = parent / ".gf" / "wt"
+    (repos / new_key).rename(repos / old_key)
+    (wt / new_key).rename(wt / old_key)
+    gitdir = repos / old_key / "git" / "worktrees" / checkout_key / "gitdir"
+    gitdir.write_text(f"{wt / old_key / checkout_key / '.git'}\n")
+    link.unlink()
+    os.symlink(
+        os.path.relpath(wt / old_key / checkout_key / subdir,
+                        link.parent),
+        link)
+
+
+def test_clone_local_dotgit_repo_keeps_its_own_store_and_bytes(tmp_path):
+    """R14-F5 live defect: the local walk-up resolves `…/repo/docs` and
+    `…/repo.git/docs` at two DISTINCT repository boundaries (spec URL
+    resolution), so each derives its own `<repo-key>` and store — the
+    `.git` alias is a remote-transport convention (`https://h/r` ≡
+    `https://h/r.git`), never a local one. Collapsed into one key, the
+    second binding joined the first store's checkout and served the
+    FIRST repository's bytes."""
+    plain = _upstream(tmp_path, "repo", {"docs/x.txt": "plain repo bytes"})
+    dotted = _upstream(tmp_path, "repo.git", {
+        "docs/x.txt": "dotted repo bytes",
+        "docs/only-dotted.txt": "present only in repo.git",
+    })
+    parent = _parent(tmp_path)
+    _setup_gf("-C", str(parent), "clone", f"{plain}/docs", "one")
+    _setup_gf("-C", str(parent), "clone", f"{dotted}/docs", "two")
+
+    # The spec formula, computed independently of the code under test:
+    # each resolved local path keys by its own spelling, `.git` kept.
+    plain_key = f"repo-{_sha8(os.path.realpath(plain))}"
+    dotted_key = f"repo.git-{_sha8(os.path.realpath(dotted))}"
+    assert {p.name for p in (parent / ".gf" / "repos").iterdir()} == {
+        plain_key, dotted_key}
+    assert {p.name for p in (parent / ".gf" / "wt").iterdir()} == {
+        plain_key, dotted_key}
+    # Each consumer link lands in ITS repository's checkout …
+    assert Path(os.path.realpath(parent / "one")) == Path(
+        os.path.realpath(
+            parent / ".gf" / "wt" / plain_key / "master" / "docs"))
+    assert Path(os.path.realpath(parent / "two")) == Path(
+        os.path.realpath(
+            parent / ".gf" / "wt" / dotted_key / "master" / "docs"))
+    # … and serves that repository's own bytes — the wrong-result
+    # witness the collapse produced (repo's `x.txt`, no `only-dotted`).
+    assert (parent / "one" / "x.txt").read_text() == "plain repo bytes"
+    assert (parent / "two" / "x.txt").read_text() == "dotted repo bytes"
+    assert (parent / "two" / "only-dotted.txt").read_text() == (
+        "present only in repo.git")
+
+
+def test_pull_migrates_dotgit_local_binding_to_its_own_store(tmp_path):
+    """R14-F5 migration: a binding recorded under the collapsed key has
+    its effective url re-derived on the next `gf pull` — the recorded
+    store's `remote.origin.url` (`…/lib.git`) no longer keys that store,
+    so the resolution re-runs, builds the NEW key's store and checkout,
+    retargets the consumer link, and leaves the old store orphaned on
+    disk (never deleted — GF-TRB-3-class leftover; uncommitted work in
+    its checkout survives)."""
+    up = _upstream(tmp_path, "lib.git", {"docs/x.txt": "lib.git v1"})
+    parent = _parent(tmp_path)
+    _setup_gf("-C", str(parent), "clone", f"{up}/docs", "vend")
+
+    up_real = os.path.realpath(up)
+    new_key = f"lib.git-{_sha8(up_real)}"
+    old_key = _collapsed_key(up_real)
+    repos = parent / ".gf" / "repos"
+    wt = parent / ".gf" / "wt"
+    if sorted(p.name for p in repos.iterdir()) != [new_key]:
+        pytest.fail(
+            f"setup: clone created stores "
+            f"{sorted(p.name for p in repos.iterdir())}, not [{new_key}]")
+    if old_key == new_key:
+        pytest.fail("setup: keys unexpectedly identical")
+
+    # Rebuild the pre-fix collapsed state in place: same store, same
+    # checkout, same link — spelled under the OLD key's paths.
+    link = parent / "vend"
+    _collapsed_simulated_binding(parent, link, old_key, new_key,
+                                 "master", "docs")
+    if Path(os.path.realpath(link)) != (
+            wt / old_key / "master" / "docs"):
+        pytest.fail("setup: collapsed-state link does not resolve into "
+                    "the old-key checkout")
+    if not (repos / old_key / "git" / "HEAD").is_file():
+        pytest.fail("setup: collapsed-state store has no HEAD")
+    # Uncommitted work inside the old checkout: it must survive.
+    (wt / old_key / "master" / "docs" / "local.txt").write_text(
+        "uncommitted work")
+
+    r = gf("-C", str(parent), "pull", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "Pulled vend" in r.stdout, r.stdout
+
+    # A NEW store under the re-derived key; the old one orphaned, not
+    # deleted or rewritten into service.
+    assert {p.name for p in repos.iterdir()} == {old_key, new_key}
+    assert {p.name for p in wt.iterdir()} == {old_key, new_key}
+    new_store = repos / new_key / "git"
+    assert (new_store / "HEAD").is_file()
+    origin = _git("--git-dir", new_store, "config",
+                  "remote.origin.url").stdout.strip()
+    assert origin == up_real
+
+    # The consumer link retargeted to the new checkout and serves the
+    # binding's own repository bytes.
+    assert Path(os.path.realpath(link)) == Path(
+        os.path.realpath(wt / new_key / "master" / "docs"))
+    assert (link / "x.txt").read_text() == "lib.git v1"
+
+    # The orphaned store keeps its content (a still-valid bare repo) and
+    # the old checkout's uncommitted file survives on disk.
+    old_store = repos / old_key / "git"
+    assert (old_store / "HEAD").is_file()
+    assert _git("--git-dir", old_store, "rev-parse", "--verify",
+                "refs/remotes/origin/master",
+                check=False).returncode == 0
+    assert (wt / old_key / "master" / "docs" / "local.txt") \
+        .read_text() == "uncommitted work"
+
+    # The retargeted binding keeps working: a pushed update lands on the
+    # next pull through the NEW store.
+    _push_update(tmp_path, up, "docs/x.txt", "lib.git v2")
+    r = gf("-C", str(parent), "pull", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert (link / "x.txt").read_text() == "lib.git v2"

@@ -8,14 +8,11 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import tomllib
 import urllib.parse
 from pathlib import Path
 
-import tomli_w
-
-from .backends import GitBackend, GitCliBackend
+from .backends import GitBackend, GitCliBackend, clean_environ
 from . import layout, manifest, platform, runner, shelf
 from .exceptions import DirtyError, GitError, GitFoldersError, ValidationError, folder_error
 
@@ -35,13 +32,19 @@ def _get_version() -> str:
         return importlib.metadata.version("git-folders")
     except importlib.metadata.PackageNotFoundError:
         pass
-    # Fallback: read pyproject.toml from the project root.
+    # Fallback: read pyproject.toml from the project root. A version probe
+    # runs before main()'s try — an unreadable or malformed pyproject must
+    # not traceback `--version`, so fs/TOML failures fall through to the
+    # default below.
     here = Path(__file__).resolve()
     for p in (here.parent, *here.parents):
         candidate = p / "pyproject.toml"
         if candidate.is_file():
-            with open(candidate, "rb") as f:
-                data = tomllib.load(f)
+            try:
+                with open(candidate, "rb") as f:
+                    data = tomllib.load(f)
+            except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+                break
             v = data.get("project", {}).get("version")
             if v:
                 return v
@@ -65,25 +68,39 @@ def _apply_chdir(argv: list[str]) -> list[str]:
     while i < len(argv):
         if argv[i] == "-C" and i + 1 < len(argv):
             path = argv[i + 1]
+            # Resolve the operand against the cwd that spelled it: an
+            # abspath after chdir would anchor a relative spelling at the
+            # destination itself (`one` -> `.../one/one`), failing
+            # logical_cwd's same-inode check and losing the lexical
+            # spelling bindings select on.
+            dest = os.path.abspath(os.path.expanduser(path))
             try:
-                os.chdir(path)
+                os.chdir(dest)
             except OSError as e:
                 die(f"cannot change to '{path}': {e.strerror or e}")
-            os.environ["PWD"] = os.path.abspath(os.path.expanduser(path))
+            os.environ["PWD"] = dest
             i += 2
         else:
             break
     return argv[i:]
 
 
-def _normalize_url(url: str) -> str:
-    """Expand a bare host/path URL into an https:// URL."""
+def _normalize_url(url: str, base: Path | None = None) -> str:
+    """Expand a bare host/path URL into an https:// URL.
+
+    A dotted first segment is host shorthand only when neither it nor the
+    full spelling exists under `base` — the root a relative url resolves
+    against, defaulting to the cwd. An existing `<repo>.git/<subdir>`
+    spelling stays the plain local path the spec defines a url to be.
+    """
     if "://" in url or url.startswith("git@"):
         return url
     if "/" in url:
         head, _, _ = url.partition("/")
         if "." in head and " " not in head and not head.startswith("."):
-            return f"https://{url}"
+            root = Path.cwd() if base is None else base
+            if not (root / head).exists() and not (root / url).exists():
+                return f"https://{url}"
     return url
 
 
@@ -113,7 +130,7 @@ def cmd_clone(args, backend: GitBackend) -> int:
         manifest_data = {"git_folder": []}
         manifest.write_manifest(parent, manifest_data)
 
-    url = _normalize_url(args.url)
+    url = _normalize_url(args.url, parent)
     path = args.path
     name = args.name
 
@@ -150,16 +167,26 @@ def cmd_clone(args, backend: GitBackend) -> int:
             name, str(child_path), "clone",
             "child path must be inside the parent repo"))
 
-    # A spelled child path must never land inside the parent's own `.gf`
-    # storage — a `.gf/...` spelling or an ancestor consumer link that
-    # resolved into a shared checkout. The leaf stays lexical, so a leaf
+    # A spelled child path must never carry a `.gf` or `.git` segment —
+    # a `.gf/...` spelling or an ancestor consumer link that resolved
+    # into a shared checkout writes inside gf's own storage, and a
+    # `.git` segment (e.g. `.git/hooks/post-checkout`) would record a
+    # consumer link the parent repo's own git operations read — hooks
+    # execute on checkout. The segment test is anywhere-in-path on the
+    # resolved spelling, so a mid-path committed symlink (sub ->
+    # `.git/hooks`) is caught by its resolved parts too, and a
+    # `sub/.gf/x` spelling refuses before it can record a binding the
+    # manifest reader would wedge on. The leaf stays lexical, so a leaf
     # that is itself the existing consumer link is not caught here and
     # keeps its idempotent re-add path.
-    if child_path.is_relative_to(parent / layout.GF_DIR):
+    if (
+        layout.GF_DIR in child_path.relative_to(parent).parts
+        or ".git" in child_path.relative_to(parent).parts
+    ):
         die(folder_error(
             name, str(child_path), "clone",
             f"child path resolves inside gf-managed storage "
-            f"({layout.GF_DIR})"))
+            f"({layout.GF_DIR}) or repository metadata (.git)"))
 
     rel = child_path.relative_to(parent).as_posix()
     for folder in manifest_data.get("git_folder", []):
@@ -200,7 +227,10 @@ def _resolve(cwd: Path) -> tuple[Path | None, dict | None]:
     parent, _ = manifest.resolve_context(cwd)
     if parent is None:
         return None, None
-    if not (parent / manifest.MANIFEST).is_file():
+    # lexists so a `gf.toml` that exists but is not a readable regular
+    # file (directory, fifo, dangling symlink) reaches read_manifest's
+    # error envelope instead of silently counting as absent.
+    if not os.path.lexists(parent / manifest.MANIFEST):
         return parent, None
     return parent, manifest.read_manifest(parent)
 
@@ -250,7 +280,6 @@ def cmd_pull(args, backend: GitBackend) -> int:
     # selected binding updated.
     for folder in selected:
         url, ref = manifest.effective_url_ref(folder, overrides)
-        url = _normalize_url(url)
         link_path = parent / folder["path"]
         child = link_path.resolve()
         co = layout.resolve_checkout(child)
@@ -273,6 +302,20 @@ def cmd_pull(args, backend: GitBackend) -> int:
             or manifest.binding_root(child, folder["path"])
             or parent
         )
+        # The resolved consumer path must stay inside the root that owns
+        # the binding — a mid-path symlink a checked-out tree
+        # materialized would otherwise send update_child /
+        # strip_placeholder_child writes outside the workspace.
+        # `gf worktree add` link chains still pass: their resolution
+        # lands in the OWNING root, which is what `anchor` names.
+        if not Path(os.path.realpath(child)).is_relative_to(
+            Path(os.path.realpath(anchor))
+        ):
+            die(folder_error(
+                folder["name"], folder["path"], "pull",
+                f"consumer path {link_path} resolves to {child}, "
+                f"outside {anchor}"))
+        url = _normalize_url(url, anchor)
 
         if not _looks_remote(url):
             resolved = anchor / url
@@ -379,7 +422,7 @@ def cmd_pull(args, backend: GitBackend) -> int:
                     # `gf init` placeholder (only `.gf`, no commits) —
                     # anything else is refused by ensure_consumer_link
                     # without deleting it.
-                    shelf.strip_placeholder_child(it["child"], backend)
+                    shelf.strip_placeholder_child(it["link_path"], backend)
                 pending.append({
                     "folder": folder,
                     "url": it["url"],
@@ -456,28 +499,20 @@ def cmd_rm(args, backend: GitBackend) -> int:
     names = {s["name"] for s in selected}
     kept = [s for s in manifest_data.get("git_folder", []) if s["name"] not in names]
 
-    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".gf.toml.new", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            tomli_w.dump({**manifest_data, "git_folder": kept}, f)
-    except Exception:
-        os.unlink(tmp_path)
-        raise
-
     for folder in selected:
         child = parent / folder["path"]
         try:
             shelf.remove_child(child, parent)
         except GitFoldersError as e:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
             die(folder_error(
                 folder["name"], folder["path"], "rm", str(e)),
                 code=e.code)
 
-    os.replace(tmp_path, parent / manifest.MANIFEST)
+    # Atomic write (mkstemp + os.replace) shared with clone/init via
+    # `write_manifest` — after the removals so a failed `remove_child`
+    # leaves the manifest still listing every binding, and the swap
+    # replaces a `gf.toml` symlink rather than writing through it.
+    manifest.write_manifest(parent, {**manifest_data, "git_folder": kept})
     for folder in selected:
         print(f"Removed {folder['name']}")
     return 0
@@ -560,8 +595,8 @@ def cmd_status(args, backend: GitBackend) -> int:
     porcelains: list[str] = []
     for folder in selected:
         co = layout.resolve_checkout((parent / folder["path"]).resolve())
-        scope = shelf.binding_scope(parent, folder, co)
         try:
+            scope = shelf.binding_scope(parent, folder, co)
             branch = _branch(co, backend)
             row = [folder["name"], folder["url"], f"[{branch}]"]
             if args.remote:
@@ -598,8 +633,8 @@ def cmd_ls(args, backend: GitBackend) -> int:
     rows: list[list[str]] = []
     for folder in selected:
         co = layout.resolve_checkout((parent / folder["path"]).resolve())
-        scope = shelf.binding_scope(parent, folder, co)
         try:
+            scope = shelf.binding_scope(parent, folder, co)
             branch = _branch(co, backend)
             head = _head(co, backend)
             porcelain = _porcelain(co, backend, paths=scope)
@@ -655,18 +690,34 @@ def cmd_init(args, backend: GitBackend) -> int:
             args.name or target.name or str(target), str(target), "init",
             "child path must be inside the parent repo"))
 
+    rel = target.relative_to(parent).as_posix()
+
     # Same `.gf`-storage refusal as `gf clone`: a spelled target inside the
     # parent's `.gf` — directly or through an ancestor consumer link —
     # must not let `target.mkdir` or `init_git_folder` write inside a
-    # shared checkout or store. A leaf that is itself a consumer link
-    # stays lexical here and is refused later by the occupancy checks.
-    if target.is_relative_to(parent / layout.GF_DIR):
+    # shared checkout or store. The resolved arm adds the leaf: a leaf
+    # that is itself a link keeps its lexical spelling for `rel`, but its
+    # resolution inside `.gf` is still never a bindable child (spec §init).
+    # The `rel` arm is the manifest reader's own predicate on the recorded
+    # path: a `.gf` segment anywhere in the spelling (`sub/.gf/x`, not only
+    # a `.gf` root) would record a binding `_validate_consumer_path`
+    # refuses on read, wedging every later command until hand-edited.
+    # `.git` gets the same treatment: a `.git`-segment spelling or a
+    # resolved landing inside the parent's repository metadata would put
+    # the child gitdir where git reads config and executes hooks.
+    if (
+        target.is_relative_to(parent / layout.GF_DIR)
+        or target.resolve().is_relative_to(
+            (parent / layout.GF_DIR).resolve())
+        or layout.GF_DIR in Path(rel).parts
+        or ".git" in Path(rel).parts
+        or layout.in_git_tree(target.resolve())
+    ):
         die(folder_error(
             args.name or target.name or str(target), str(target), "init",
             f"child path resolves inside gf-managed storage "
-            f"({layout.GF_DIR})"))
+            f"({layout.GF_DIR}) or repository metadata (.git)"))
 
-    rel = target.relative_to(parent).as_posix()
     name = args.name if args.name else (target.name or rel)
     url = args.url if args.url else rel
 
@@ -695,7 +746,20 @@ def cmd_init(args, backend: GitBackend) -> int:
                 name, rel, "init",
                 f"path {rel} is already used by git-folder '{folder['name']}'"))
 
-    if not target.exists():
+    # A dangling symlink is occupancy, not a crash — the same refusal as
+    # `init_child`/`update_child`. exists() is False for one, so without
+    # this gate `target.mkdir`'s `lexists` guard would pass it through to
+    # `init_git_folder`, whose gitdir mkdir cannot write through a
+    # dangling link (os.mkdir still raises EEXIST on the link itself).
+    if os.path.lexists(target) and not target.exists():
+        die(folder_error(
+            name, rel, "init", f"{target} is a dangling symlink"))
+    # An existing non-directory occupant (a plain file, or a link to one)
+    # reaches `init_git_folder`'s gitdir mkdir only as NotADirectoryError.
+    if target.exists() and not target.is_dir():
+        die(folder_error(
+            name, rel, "init", f"{target} exists and is not a directory"))
+    if not os.path.lexists(target):
         target.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -737,7 +801,8 @@ def _passthrough_target(op: str) -> tuple[layout.Checkout, Path]:
     git_dir = co.gitdir.resolve()
     if not (git_dir / "HEAD").is_file():
         folder = None
-        if parent is not None and (parent / manifest.MANIFEST).is_file():
+        if parent is not None and os.path.lexists(
+                parent / manifest.MANIFEST):
             folder = shelf.folder_containing(
                 parent, cwd, manifest.read_manifest(parent))
         if folder is not None:
@@ -753,8 +818,14 @@ def _git_env_for_child(co: layout.Checkout) -> dict[str, str]:
 
     For a store checkout `co.gitdir` is the linked worktree's admin dir
     under the repo store; for a whole-repo child it is `child/.gf/git`.
+
+    The base env is scrubbed so an ambient GIT_INDEX_FILE /
+    GIT_OBJECT_DIRECTORY / GIT_CONFIG_* inherited from a foreign repo's
+    environment cannot misdirect the child `git`; gf then sets
+    GIT_DIR/GIT_WORK_TREE explicitly, so the `gf sh` contract (the user's
+    git runs with GIT_DIR set) is intact — only INHERITED vars go.
     """
-    env = os.environ.copy()
+    env = clean_environ()
     env["GIT_DIR"] = str(co.gitdir.resolve())
     env["GIT_WORK_TREE"] = str(co.work_tree)
     return env
@@ -898,6 +969,24 @@ def _worktree_link_folders(
         # (spec L399/L400; GF-D14). Resolving here would freeze the link
         # at today's checkout position.
         new_child = new_parent / folder["path"]
+        # A mid-path symlink the checkout materialized (a committed
+        # `vendor -> /abs` link) must not redirect the unlink/replace
+        # below outside the new worktree, into `.gf` storage, or into
+        # the worktree's `.git` metadata — refuse so the caller's
+        # rollback removes the worktree. The leaf's own realpath is
+        # never tested: a checked-out link leaf is unlinked, not
+        # followed.
+        new_child_parent = Path(os.path.realpath(new_child.parent))
+        if not (
+            new_child_parent.is_relative_to(Path(os.path.realpath(new_parent)))
+            and not layout.in_gf_tree(new_child_parent)
+            and not layout.in_git_tree(new_child_parent)
+        ):
+            raise ValidationError(folder_error(
+                folder["name"], folder["path"], "worktree add",
+                f"child path resolves outside {new_parent} or into "
+                f"gf-managed storage ({layout.GF_DIR}) or repository "
+                f"metadata (.git)"))
         detail = _worktree_takeover_detail(new_child, force)
         if detail is not None:
             raise ValidationError(folder_error(
@@ -906,7 +995,11 @@ def _worktree_link_folders(
             new_child.parent.mkdir(parents=True, exist_ok=True)
             if new_child.is_symlink() or new_child.exists():
                 new_child.unlink()
-            rel = os.path.relpath(source_child, new_child.parent)
+            # The leaf lands at the parent's REALPATH (the mid-path
+            # redirect above), so the relpath base is the realpath'd
+            # parent — while the TARGET stays the literally-spelled
+            # source consumer path for link→link chain propagation.
+            rel = os.path.relpath(source_child, new_child_parent)
             os.symlink(rel, new_child, target_is_directory=True)
         except OSError as e:
             raise ValidationError(folder_error(
@@ -927,13 +1020,19 @@ def cmd_worktree_add(args, backend: GitBackend) -> int:
 
     new_parent = Path(args.path).resolve()
 
-    # The worktree destination must never land inside this parent's own
-    # `.gf` storage — a `.gf/...` spelling or one that resolves through a
-    # consumer link into a shared checkout. `new_parent` is already the
-    # resolved target `git worktree add` receives.
-    if new_parent.is_relative_to(parent / layout.GF_DIR):
+    # The worktree destination must never land inside ANY `.gf` tree —
+    # a `sub/.gf/...` spelling, an outside-the-parent path carrying a
+    # `.gf` segment (worktrees legitimately live outside the parent, so
+    # a parent-relative predicate misses those), or one that resolves
+    # through a consumer link into a shared checkout — nor inside a
+    # `.git` metadata tree, where the copied manifest and linked
+    # children would sit among the repo's own config/hooks.
+    # `new_parent` is already the resolved target `git worktree add`
+    # receives; `in_gf_tree`/`in_git_tree` test `.gf`/`.git` as exact
+    # realpath segments.
+    if layout.in_gf_tree(new_parent) or layout.in_git_tree(new_parent):
         die(f"worktree path {new_parent} resolves inside gf-managed "
-            f"storage ({layout.GF_DIR})")
+            f"storage ({layout.GF_DIR}) or repository metadata (.git)")
 
     folders = manifest_data.get("git_folder", [])
 
@@ -968,7 +1067,7 @@ def cmd_worktree_add(args, backend: GitBackend) -> int:
 
     try:
         _worktree_link_folders(parent, new_parent, folders, args.force)
-    except (GitFoldersError, OSError) as e:
+    except Exception as e:
         # A post-add failure must not orphan the registered worktree:
         # retry would fail on the existing directory and a plain remove
         # refuses the untracked copied manifest. `--force` drops the
@@ -982,11 +1081,45 @@ def cmd_worktree_add(args, backend: GitBackend) -> int:
                                  "--force", str(new_parent),
                                  cwd=parent, check=False)
         if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip()
+            # A nonzero remove does not prove the registration
+            # survived: the tree may be gone while a later admin-dir
+            # cleanup step failed (e.g. a remove shim that runs the
+            # real remove then exits 1). Re-check the porcelain list so
+            # the report reflects the actual registration state.
+            detail = (result.stderr.strip() or result.stdout.strip()
+                      or "unknown error")
+            try:
+                registered_paths = [
+                    Path(wt["path"]).resolve()
+                    for wt in shelf.list_parent_worktrees(parent, backend)
+                ]
+            except Exception:
+                registered_paths = None
+            if (registered_paths is not None
+                    and new_parent not in registered_paths):
+                # The remove actually landed despite its exit code;
+                # report only the original post-add failure, exactly
+                # as the rollback-success path does.
+                die(str(e), code=getattr(e, "code", 1))
+            if registered_paths is None:
+                # The registration state could not be determined;
+                # name the orphan and both remedies.
+                die(f"{e} — and rollback of the new worktree also "
+                    f"failed: {detail}; remove the orphaned worktree "
+                    f"with `git worktree remove --force {new_parent}` "
+                    f"or clear a leftover registration with "
+                    f"`git worktree prune`")
+            if new_parent.exists():
+                hint = (f"remove the orphaned worktree with `git "
+                        f"worktree remove --force {new_parent}`")
+            else:
+                # Registered but unlinked: `git worktree prune` drops
+                # exactly this stale record, while another remove can
+                # only fail on the missing tree again.
+                hint = ("clear the orphaned worktree registration "
+                        "with `git worktree prune`")
             die(f"{e} — and rollback of the new worktree also failed: "
-                f"{detail or 'unknown error'}; remove the orphaned "
-                f"worktree with `git worktree remove --force "
-                f"{new_parent}`")
+                f"{detail}; {hint}")
         die(str(e), code=getattr(e, "code", 1))
 
     print(f"Added worktree at {new_parent}")
@@ -1050,8 +1183,9 @@ def cmd_worktree_remove(args, backend: GitBackend) -> int:
     main_path = listed_paths[0] if listed_paths else None
     if main_path is not None and worktree_path == main_path:
         die(f"{worktree_path} is the main worktree; refusing to remove it")
-    if worktree_path == _logical_cwd().resolve():
-        die(f"{worktree_path} is the current worktree; refusing to remove it")
+    if _logical_cwd().resolve().is_relative_to(worktree_path):
+        die(f"{worktree_path} contains the current working directory; "
+            f"refusing to remove it")
 
     # Capture the symlinks we unlink so they can be restored if
     # `git worktree remove` fails.
@@ -1183,31 +1317,43 @@ def main(argv: list[str] | None = None, backend: GitBackend | None = None) -> in
     elif unknown:
         parser.error(f"unrecognized arguments: {' '.join(unknown)}")
 
-    if args.command == "clone":
-        return cmd_clone(args, real_backend)
-    elif args.command == "pull":
-        return cmd_pull(args, real_backend)
-    elif args.command == "rm":
-        return cmd_rm(args, real_backend)
-    elif args.command == "status":
-        return cmd_status(args, real_backend)
-    elif args.command == "ls":
-        return cmd_ls(args, real_backend)
-    elif args.command == "init":
-        return cmd_init(args, real_backend)
-    elif args.command == "diff":
-        return cmd_diff(args)
-    elif args.command == "log":
-        return cmd_log(args)
-    elif args.command == "git":
-        return cmd_git(args)
-    elif args.command == "worktree":
-        if args.worktree_command == "add":
-            return cmd_worktree_add(args, real_backend)
-        elif args.worktree_command == "list":
-            return cmd_worktree_list(args, real_backend)
-        elif args.worktree_command == "remove":
-            return cmd_worktree_remove(args, real_backend)
-    elif args.command == "sh":
-        return cmd_sh(args)
+    # GitFoldersError escaping a command (e.g. a manifest error raised by
+    # `_resolve` before any per-folder envelope) dies cleanly with its
+    # deterministic code instead of tracebacking. Errors already caught
+    # inside a cmd_* exit through die()'s SystemExit, untouched here.
+    # The trailing OSError catch is the completeness net over fs sites a
+    # sweep can't exhaustively cover: a raw fs failure still dies with
+    # the `gf:` envelope and exit 1 rather than a Python traceback.
+    try:
+        if args.command == "clone":
+            return cmd_clone(args, real_backend)
+        elif args.command == "pull":
+            return cmd_pull(args, real_backend)
+        elif args.command == "rm":
+            return cmd_rm(args, real_backend)
+        elif args.command == "status":
+            return cmd_status(args, real_backend)
+        elif args.command == "ls":
+            return cmd_ls(args, real_backend)
+        elif args.command == "init":
+            return cmd_init(args, real_backend)
+        elif args.command == "diff":
+            return cmd_diff(args)
+        elif args.command == "log":
+            return cmd_log(args)
+        elif args.command == "git":
+            return cmd_git(args)
+        elif args.command == "worktree":
+            if args.worktree_command == "add":
+                return cmd_worktree_add(args, real_backend)
+            elif args.worktree_command == "list":
+                return cmd_worktree_list(args, real_backend)
+            elif args.worktree_command == "remove":
+                return cmd_worktree_remove(args, real_backend)
+        elif args.command == "sh":
+            return cmd_sh(args)
+    except GitFoldersError as e:
+        die(str(e), code=e.code)
+    except OSError as e:
+        die(str(e))
     return 0

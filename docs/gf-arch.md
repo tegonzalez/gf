@@ -99,7 +99,7 @@ The development launcher. If `.venv/bin/python` exists it re-execs that interpre
 
 ### `tests/conftest.py`
 
-The test-environment seam. It owns fixture isolation and the host inputs the suite must not inherit: hermetic git identity plus `init.defaultBranch = master` through `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_NOSYSTEM`. The pin controls real Git without wrapping it or changing product behavior.
+The test-environment seam. It owns fixture isolation and the host inputs the suite must not inherit: hermetic git identity plus `init.defaultBranch = master` through a `HOME`-redirected `.gitconfig` — a channel `clean_environ` cannot close — with `GIT_CONFIG_NOSYSTEM` kept passing through. The pin controls real Git without wrapping it or changing product behavior.
 
 ### `tests/mock_git.py`
 

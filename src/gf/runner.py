@@ -88,6 +88,7 @@ def run_command(
                 cwd=_cwd_arg(cwd),
                 capture_output=True,
                 text=True,
+                errors="replace",
             )
         except FileNotFoundError:
             return RunResult(127, "", f"{cmd[0]}: command not found")

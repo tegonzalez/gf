@@ -198,9 +198,60 @@ def test_worktree_remove_refuses_current_worktree(tmp_path):
         check=False,
     )
     assert result.returncode != 0
-    assert "current worktree" in result.stderr
+    assert "current working directory" in result.stderr
     # The worktree is still there.
     assert new_parent.exists()
+    assert (parent / "vendor" / "lib" / ".gf" / "git" / "HEAD").is_file()
+
+
+def test_worktree_remove_refuses_current_worktree_from_subdir(tmp_path):
+    """`gf worktree remove` refuses the worktree it is run from even when
+    the working directory is a subdirectory of that worktree — the
+    resolved target only has to contain the cwd, not equal it."""
+    parent, _ = _setup_parent_with_git_folder(tmp_path)
+    new_parent = tmp_path / "feature"
+    gf("-C", str(parent), "worktree", "add", str(new_parent), "-b", "feature")
+
+    subdir = new_parent / "sub"
+    subdir.mkdir()
+    # Untracked work the removal would silently destroy under --force.
+    (subdir / "scratch.txt").write_text("keep me")
+
+    result = gf(
+        "-C", str(subdir), "worktree", "remove", str(new_parent), "--force",
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "current working directory" in result.stderr
+    # The worktree and its untracked content survive.
+    assert (subdir / "scratch.txt").is_file()
+    assert (parent / "vendor" / "lib" / ".gf" / "git" / "HEAD").is_file()
+
+
+def test_worktree_remove_refuses_current_worktree_via_dot(tmp_path):
+    """Control pair: `gf -C <wt> worktree remove .` hits the equality edge
+    of the containment guard (spelled `.` resolves to the worktree root,
+    which contains — and equals — the cwd), so it is refused with the new
+    message; removing the same worktree from the parent still works."""
+    parent, _ = _setup_parent_with_git_folder(tmp_path)
+    new_parent = tmp_path / "feature"
+    gf("-C", str(parent), "worktree", "add", str(new_parent), "-b", "feature")
+
+    refused = gf(
+        "-C", str(new_parent), "worktree", "remove", ".",
+        check=False,
+    )
+    assert refused.returncode != 0
+    assert "current working directory" in refused.stderr
+    assert new_parent.exists()
+
+    # From the parent — outside the target — the same removal succeeds.
+    removed = gf(
+        "-C", str(parent), "worktree", "remove", str(new_parent),
+        check=False,
+    )
+    assert removed.returncode == 0, removed.stderr
+    assert not new_parent.exists()
     assert (parent / "vendor" / "lib" / ".gf" / "git" / "HEAD").is_file()
 
 
@@ -620,3 +671,123 @@ def test_add_manifest_copy_over_checked_out_file(tmp_path):
     link = wt / "vendor" / "lib"
     assert link.is_symlink()
     assert link.resolve() == (parent / "vendor" / "lib").resolve()
+
+
+# ---------------------------------------------------------------------------
+# R13-5 — `gf worktree add` refuses an exact `.gf` segment ANYWHERE in the
+# destination realpath, not only inside this parent's own `.gf`
+#
+# The destination guard used to spell
+# `new_parent.is_relative_to(parent / ".gf")`: it refused only paths that
+# resolve under THIS parent's own `.gf` storage. A `sub/.gf/w2` spelling —
+# inside the parent but under a different subtree — and an
+# outside-the-parent path carrying a `.gf` segment (worktrees legitimately
+# live outside the parent, so a parent-relative predicate cannot see them)
+# both slipped through: `git worktree add` ran, registered the worktree
+# inside a `.gf` tree, and gf reported success. The guard is now
+# `layout.in_gf_tree(new_parent)`, which tests `.gf` as an exact realpath
+# segment before `git worktree add` runs.
+#
+# Zero-binding fixtures are the discriminating shape: with no git_folder
+# entries nothing else in the command can fail, so PRE-FIX these adds
+# SUCCEEDED (rc 0, `Added worktree`, the `.gf`-bearing path registered in
+# `git worktree list`). Post-fix they die with the gf-managed-storage
+# refusal BEFORE git runs — no `Preparing worktree` output, no
+# registration, no created directory.
+
+
+def _setup_parent_zero_bindings(tmp_path):
+    """Parent repo whose committed `gf.toml` carries no git_folder
+    entries — with no children to link, the destination guard is the
+    only check that can refuse the add."""
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    git("init", cwd=parent)
+    (parent / "README").write_text("root")
+    (parent / "gf.toml").write_text("git_folder = []\n")
+    git("add", "README", "gf.toml", cwd=parent)
+    git("commit", "-m", "root", cwd=parent)
+    return parent
+
+
+def test_worktree_add_refuses_dotgf_segment_inside_parent(tmp_path):
+    """`gf worktree add sub/.gf/w2`: an exact `.gf` segment inside the
+    parent but OUTSIDE its own `.gf` is refused before `git worktree
+    add` runs — no registration, and even the leading `sub/` is never
+    created.
+
+    Verified pre-fix signature (base 85856af): rc 0, `Added worktree at
+    <parent>/sub/.gf/w2`, the path registered in `git worktree list` —
+    the parent-relative guard could not see it."""
+    parent = _setup_parent_zero_bindings(tmp_path)
+    before = _registered_worktrees(parent)
+
+    result = gf(
+        "-C", str(parent), "worktree", "add", "sub/.gf/w2", check=False)
+
+    assert result.returncode == 1
+    err = result.stderr + result.stdout
+    # The gf: die envelope, not a git-level failure or a traceback.
+    assert "gf: worktree path" in result.stderr
+    assert "resolves inside gf-managed storage (.gf)" in result.stderr
+    assert "Traceback" not in err
+    # Pre-registration refusal: `git worktree add` never ran, so nothing
+    # was registered and no directory was materialized.
+    assert "Preparing worktree" not in err
+    assert _registered_worktrees(parent) == before
+    assert not os.path.lexists(parent / "sub")
+
+
+def test_worktree_add_refuses_dotgf_segment_outside_parent(tmp_path):
+    """`gf worktree add <outside>/.gf/w2`: a destination outside the
+    parent carrying an exact `.gf` segment is refused identically — the
+    old parent-relative predicate structurally missed these.
+
+    Verified pre-fix signature (base 85856af): rc 0 and git created +
+    registered `<outside>/.gf/w2` — outside-the-parent destinations were
+    never checked at all."""
+    parent = _setup_parent_zero_bindings(tmp_path)
+    outside = tmp_path / "outside" / ".gf" / "w2"
+    before = _registered_worktrees(parent)
+
+    result = gf(
+        "-C", str(parent), "worktree", "add", str(outside), check=False)
+
+    assert result.returncode == 1
+    err = result.stderr + result.stdout
+    assert "gf: worktree path" in result.stderr
+    assert "resolves inside gf-managed storage (.gf)" in result.stderr
+    assert "Traceback" not in err
+    assert "Preparing worktree" not in err
+    assert _registered_worktrees(parent) == before
+    assert not os.path.lexists(tmp_path / "outside")
+
+
+def test_worktree_add_outside_parent_path_still_works(tmp_path):
+    """Control: a plain outside-the-parent destination was always lawful
+    and stays lawful — the exact-segment test adds no parent-relative
+    bound."""
+    parent = _setup_parent_zero_bindings(tmp_path)
+
+    result = gf(
+        "-C", str(parent), "worktree", "add", "../wt-ok", check=False)
+    assert result.returncode == 0, result.stderr
+
+    wt = tmp_path / "wt-ok"
+    assert (wt / ".git").exists()
+    assert (wt / "gf.toml").is_file()
+    assert str(wt.resolve()) in _registered_worktrees(parent)
+
+
+def test_worktree_add_dotgf_substring_segment_still_works(tmp_path):
+    """Control: `x.gf` is a substring lookalike, not an exact `.gf`
+    segment — the destination stays lawful and the add succeeds."""
+    parent = _setup_parent_zero_bindings(tmp_path)
+
+    result = gf(
+        "-C", str(parent), "worktree", "add", "sub/x.gf/w2", check=False)
+    assert result.returncode == 0, result.stderr
+
+    wt = parent / "sub" / "x.gf" / "w2"
+    assert (wt / ".git").exists()
+    assert str(wt.resolve()) in _registered_worktrees(parent)

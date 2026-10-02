@@ -22,9 +22,13 @@ The public surface these tests pin (each name cited to its source):
                                 "normalized" here means: the URL as spelled
                                 after `cli._normalize_url` shorthand expansion
                                 (spec "gf clone"), any trailing `/` removed,
-                                and one trailing `.git` on the last path
-                                segment removed — `repo` and `repo.git` are
-                                one repository and share one store (GF-D5).
+                                and — for remote spellings only — one
+                                trailing `.git` on the last path segment
+                                removed: remote `repo` and `repo.git` are
+                                one repository and share one store (GF-D5),
+                                while local `…/repo` and `…/repo.git` are
+                                distinct real directories and never alias
+                                (R14-F5).
   checkout_key_for_branch(b)  — floating branch/`latest` checkout key by
                                 resolved branch name:
                                 `urllib.parse.quote(resolved branch,
@@ -135,12 +139,15 @@ def test_repo_key_format_is_basename_dash_8_lowercase_hex():
 
 
 def test_repo_key_ignores_trailing_dot_git():
-    """`repo` and `repo.git` spell one repository: the `.git` suffix is part
-    of neither the basename (spec 'gf clone' name derivation strips it) nor
-    the normalized URL."""
+    """Remote `repo` and `repo.git` spell one repository: the `.git`
+    suffix is part of neither the basename (spec 'gf clone' name
+    derivation strips it) nor the normalized URL."""
     expected = "libfoo-" + _sha8(REPO_URL)
     assert repo_key(REPO_URL + ".git") == expected
     assert repo_key(REPO_URL) == expected
+    # `file://` is a remote spelling: the `.git` alias holds there too.
+    assert repo_key("file:///abs/path/repo.git") == repo_key(
+        "file:///abs/path/repo")
 
 
 def test_repo_key_normalizes_bare_host_path():
@@ -163,13 +170,25 @@ def test_repo_key_for_ssh_url_keeps_transport_in_hash():
 
 
 def test_repo_key_for_local_path():
+    """Local paths never alias (R14-F5): `…/repo` and `…/repo.git` are
+    distinct real directories, each keyed by its own spelling — sharing
+    one store would silently serve the first repo's content for both."""
     assert repo_key("/abs/path/repo") == "repo-" + _sha8("/abs/path/repo")
-    assert repo_key("/abs/path/repo.git") == "repo-" + _sha8("/abs/path/repo")
+    assert repo_key("/abs/path/repo.git") == "repo.git-" + _sha8(
+        "/abs/path/repo.git")
+    assert repo_key("/abs/path/repo") != repo_key("/abs/path/repo.git")
 
 
 def test_repo_key_differs_for_different_repos():
     assert repo_key(REPO_URL) != repo_key("https://github.com/foo/other")
     assert repo_key(REPO_URL) != repo_key("https://github.com/bar/libfoo")
+
+
+def test_repo_key_differs_for_different_local_repos():
+    """Control: two DIFFERENT non-`.git` local paths stay distinct too —
+    the R14-F5 contract widens local keying, it does not collapse it."""
+    assert repo_key("/abs/path/repo") != repo_key("/abs/path/other")
+    assert repo_key("/abs/path/repo") != repo_key("/abs/other/repo")
 
 
 # --- checkout_key -------------------------------------------------------

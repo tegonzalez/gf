@@ -306,7 +306,7 @@ def test_remove_current_worktree_refused(tmp_path):
     gf("-C", str(parent), "worktree", "add", str(wt2))
     r = gf("-C", str(wt2), "worktree", "remove", str(wt2), check=False)
     assert r.returncode != 0
-    assert "current worktree" in r.stderr
+    assert "current working directory" in r.stderr
     assert (wt2 / "vendor" / "api").is_symlink()
 
 
@@ -972,3 +972,200 @@ def test_pull_via_stale_worktree_vacate_still_prunes_dropped_binding(
     dev = _checkout_state(parent, rk, "dev")
     assert set(dev["bindings"]) == {"docs/api"}
     assert set(dev["binding_urls"]) == {"vendor/api"}
+
+
+# ---------------------------------------------------------------------------
+# F3 — pruning a vacated record requires a parsed OWNING manifest
+#
+# `_vacate_checkout(old_co, parent_root)` recomputes a vacated shared
+# checkout's `bindings`/`binding_urls` from the OWNING root's `gf.toml`.
+# An absent, non-regular, unreadable or corrupt owning manifest cannot
+# prove which bindings are still live, so the record must be left
+# untouched: pruning it against an empty folder set would empty the
+# record, and the same pull's `_sparse_union` cone rebuild would then
+# dematerialize still-linked siblings — dropping their recorded urls and
+# leaving their consumer links dangling. The `owning_folders` read that
+# feeds the cosmetic `(moved with …)` sibling lines degrades to `[]`
+# under the same condition rather than aborting a valid pull.
+#
+# The pull is driven through wt2 exactly as in R10-4 (the source root's
+# destroyed manifest is not the manifest the invocation reads — wt2's
+# own snapshot copy still lists api+tools, so the pull proceeds and the
+# vacate scan is what must fail safe).
+#
+# Pre-fix signatures (verified against d45b79a with shelf.py reverted):
+#   absent/non-regular owning manifest: the retarget pull wipes the
+#       vacated `master` record to `bindings == ["tools"]` /
+#       `binding_urls == {"vendor/tools"}` (tools is re-added by the
+#       serve loop); the cone union then shrinks to `tools`, so
+#       `libs/lib` dematerializes and `parent/vendor/lib` dangles.
+#   corrupt owning manifest: the `owning_folders` read dies on
+#       `tomllib.TOMLDecodeError` — the pull exits rc=1 with a Traceback
+#       before any checkout work.
+
+
+def _wt2_retarget_pull(wt2: Path) -> subprocess.CompletedProcess:
+    """`gf -C wt2 pull` under wt2's own `api → dev` override — retargets
+    `vendor/api` off the shared `master` checkout, vacating it."""
+    (wt2 / "gf.local.toml").write_text(
+        '[[git_folder_override]]\nname = "api"\nref = "dev"\n')
+    return gf("-C", str(wt2), "pull", check=False)
+
+
+def test_pull_via_worktree_deleted_owning_manifest_keeps_record(tmp_path):
+    """F3 absent-manifest arm — with the OWNING root's `gf.toml` deleted,
+    a retarget pull through the linked worktree must leave the vacated
+    checkout's record untouched: the moved `api` entries AND the live
+    `tools`/`lib` siblings all stay recorded, and `libs/lib` stays
+    materialized behind `parent/vendor/lib`.
+
+    Pre-fix signature (verified): rc=0, `Pulled api`/`Pulled tools`,
+    master record wiped to `["tools"]`/`{"vendor/tools"}`, and the cone
+    rebuild dematerialized `libs/lib` so `parent/vendor/lib/l.txt`
+    stopped resolving."""
+    up, parent, wt2, rk = _stale_worktree_setup(tmp_path)
+    push_branch(up, "dev", "dev content")
+    (parent / "gf.toml").unlink()
+
+    r = _wt2_retarget_pull(wt2)
+    assert r.returncode == 0, r.stderr
+    assert "Traceback" not in r.stderr
+    assert "Pulled api" in r.stdout
+    assert "Pulled tools" in r.stdout
+    # the destroyed owning manifest cannot name served siblings — the
+    # degrade is cosmetic lines only, never a wipe
+    assert "(moved with" not in r.stdout
+
+    # the vacated `master` record kept every pre-pull entry — the moved
+    # `api` included — rather than being emptied against no manifest
+    st = _checkout_state(parent, rk, "master")
+    assert set(st["bindings"]) == {"docs/api", "libs/lib", "tools"}
+    assert set(st["binding_urls"]) == {
+        "vendor/api", "vendor/tools", "vendor/lib"}
+
+    # the pull itself still did its work: api retargeted into the new
+    # `dev` checkout, reachable through wt2's chained link
+    dev_wt = parent / ".gf" / "wt" / rk / "dev"
+    assert (parent / "vendor" / "api").resolve() == (
+        dev_wt / "docs" / "api").resolve()
+    assert (wt2 / "vendor" / "api" / "x.txt").is_file()
+    dev = _checkout_state(parent, rk, "dev")
+    assert set(dev["bindings"]) == {"docs/api"}
+    assert set(dev["binding_urls"]) == {"vendor/api"}
+
+    # the pin: the still-linked sibling wt2's manifest never knew stays
+    # materialized — the record the cone union reads was not wiped
+    assert (parent / "vendor" / "lib" / "l.txt").read_text() == \
+        "lib payload\n"
+    assert (parent / "vendor" / "tools" / "t.txt").read_text().strip() == \
+        "tool in upstream"
+
+
+def test_pull_via_worktree_corrupt_owning_manifest_keeps_record(tmp_path):
+    """F3 corrupt-manifest arm — same topology, but the OWNING root's
+    `gf.toml` fails to parse. The pull must still complete rc=0: the
+    owning manifest drives only pruning and cosmetic moved-with lines,
+    so a `TOMLDecodeError` there degrades to no-siblings — it must not
+    abort a pull whose inputs (wt2's manifest copy, the recorded state)
+    are all readable. No `(moved with …)` line is emitted and the
+    vacated record is left intact.
+
+    Pre-fix signature (verified): `read_manifest` on the corrupt
+    `gf.toml` escapes `pull_shared_bindings` — rc=1, `Traceback` ending
+    in `tomllib.TOMLDecodeError`, raised before any checkout is
+    touched."""
+    up, parent, wt2, rk = _stale_worktree_setup(tmp_path)
+    push_branch(up, "dev", "dev content")
+    (parent / "gf.toml").write_text("x = [\n")
+
+    r = _wt2_retarget_pull(wt2)
+    assert r.returncode == 0, r.stderr
+    assert "Traceback" not in r.stderr
+    assert "TOMLDecodeError" not in r.stderr
+    assert "Pulled api" in r.stdout
+    assert "Pulled tools" in r.stdout
+    # a corrupt owning manifest names no siblings — no moved-with lines
+    assert "(moved with" not in r.stdout
+
+    # the record was never pruned — `_vacate_checkout` fails safe on the
+    # same condition the sibling listing degrades under
+    st = _checkout_state(parent, rk, "master")
+    assert set(st["bindings"]) == {"docs/api", "libs/lib", "tools"}
+    assert set(st["binding_urls"]) == {
+        "vendor/api", "vendor/tools", "vendor/lib"}
+
+    dev_wt = parent / ".gf" / "wt" / rk / "dev"
+    assert (parent / "vendor" / "api").resolve() == (
+        dev_wt / "docs" / "api").resolve()
+    assert (wt2 / "vendor" / "api" / "x.txt").is_file()
+    assert (parent / "vendor" / "lib" / "l.txt").read_text() == \
+        "lib payload\n"
+
+
+def test_pull_via_worktree_nonregular_owning_manifest_keeps_record(
+        tmp_path):
+    """F3 non-regular-manifest arm — a `gf.toml` that exists but is not a
+    regular file (here: a directory) is the same cannot-prove-liveness
+    condition as an absent one: `is_file()` is False, so the vacate scan
+    must skip pruning and the sibling listing must degrade, while the
+    pull completes normally.
+
+    Pre-fix signature (verified): identical to the absent arm — the
+    `mf = {}` fallback emptied the `master` record to
+    `["tools"]`/`{"vendor/tools"}` and `libs/lib` dematerialized."""
+    up, parent, wt2, rk = _stale_worktree_setup(tmp_path)
+    push_branch(up, "dev", "dev content")
+    (parent / "gf.toml").unlink()
+    (parent / "gf.toml").mkdir()
+
+    r = _wt2_retarget_pull(wt2)
+    assert r.returncode == 0, r.stderr
+    assert "Traceback" not in r.stderr
+    assert "Pulled api" in r.stdout
+    assert "Pulled tools" in r.stdout
+    assert "(moved with" not in r.stdout
+
+    st = _checkout_state(parent, rk, "master")
+    assert set(st["bindings"]) == {"docs/api", "libs/lib", "tools"}
+    assert set(st["binding_urls"]) == {
+        "vendor/api", "vendor/tools", "vendor/lib"}
+
+    dev_wt = parent / ".gf" / "wt" / rk / "dev"
+    assert (parent / "vendor" / "api").resolve() == (
+        dev_wt / "docs" / "api").resolve()
+    assert (wt2 / "vendor" / "api" / "x.txt").is_file()
+    assert (parent / "vendor" / "lib" / "l.txt").read_text() == \
+        "lib payload\n"
+
+
+def test_pull_via_worktree_readable_owning_manifest_still_prunes(
+        tmp_path):
+    """F3 control — the fail-safe is not keep-everything: with a READABLE
+    owning manifest the identical retarget pull still prunes the vacated
+    `api` entries (the `master` record shrinks to the live
+    `libs/lib`/`tools`), still reports the unseen sibling
+    `(moved with tools)`, and still keeps `libs/lib` materialized.
+
+    Same observables as the R10-4 core pin — re-asserted here so the F3
+    arms cannot pass by disabling pruning or the sibling report
+    outright."""
+    up, parent, wt2, rk = _stale_worktree_setup(tmp_path)
+    push_branch(up, "dev", "dev content")
+
+    r = _wt2_retarget_pull(wt2)
+    assert r.returncode == 0, r.stderr
+    assert "Pulled api" in r.stdout
+    assert "Pulled tools" in r.stdout
+    assert "Pulled lib (moved with tools)" in r.stdout
+
+    # normal pruning ran: the moved api's entries are gone; the live
+    # siblings' survive
+    st = _checkout_state(parent, rk, "master")
+    assert set(st["bindings"]) == {"libs/lib", "tools"}
+    assert set(st["binding_urls"]) == {"vendor/tools", "vendor/lib"}
+
+    dev_wt = parent / ".gf" / "wt" / rk / "dev"
+    assert (parent / "vendor" / "api").resolve() == (
+        dev_wt / "docs" / "api").resolve()
+    assert (parent / "vendor" / "lib" / "l.txt").read_text() == \
+        "lib payload\n"

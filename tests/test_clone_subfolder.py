@@ -19,8 +19,10 @@ import subprocess
 import tomllib
 from pathlib import Path
 
+import pytest
+
 from conftest import gf, git
-from gf import shelf
+from gf import layout, shelf
 
 
 def _git(*args, check: bool = True) -> subprocess.CompletedProcess:
@@ -386,6 +388,62 @@ def test_clone_subfolder_of_local_gf_child_roundtrips(tmp_path):
     assert (parent / "lib" / "docs" / "api" / "x.txt"
             ).read_text().strip() == "api adv"
     assert (api / "x.txt").read_text().strip() == "api adv"
+
+
+def test_clone_dotted_repo_subdir_spelling_stays_local(tmp_path):
+    """R10-5: a `<repo>.git/<subdir>` spelling that exists under the
+    parent is a plain local path, not host shorthand — `gf clone
+    upx.git/docs/api vendor/api` inside a parent that carries the bare
+    repo `upx.git` resolves by the local walk-up (spec `gf clone`:
+    "a spelled path existing at the anchor is a local path even when
+    its first segment contains a dot"), binds `docs/api` of `upx.git`,
+    and records the spelled `url` verbatim. The recorded spelling then
+    re-resolves on `gf pull` (the anchor is the binding's owning root).
+
+    Pre-fix signature: `upx.git/docs/api` was expanded to
+    `https://upx.git/docs/api` and the clone died probing a bogus host
+    (`ls-remote` fails — the hermetic git config allows no non-local
+    transport)."""
+    parent = _real_parent(tmp_path)
+
+    # Bare repo nested inside the parent, seeded through a throwaway
+    # clone the same way `_upstream` seeds.
+    up = parent / "upx.git"
+    git("init", "--bare", str(up), cwd=parent)
+    work = tmp_path / "_seed_upx"
+    git("clone", str(up), str(work), cwd=tmp_path)
+    (work / "docs" / "api").mkdir(parents=True)
+    (work / "docs" / "api" / "x.txt").write_text("api on master")
+    (work / "outside.txt").write_text("not under docs/api")
+    git("add", "-A", cwd=work)
+    git("commit", "-m", "init", cwd=work)
+    git("push", "-q", "origin", "master", cwd=work)
+
+    r = gf("-C", str(parent), "clone", "upx.git/docs/api", "vendor/api")
+    assert r.returncode == 0
+
+    # The consumer path is a link serving the repo's docs/api content.
+    link = parent / "vendor" / "api"
+    assert link.is_symlink()
+    assert (link / "x.txt").read_text().strip() == "api on master"
+    assert not (link / "outside.txt").exists()
+
+    # The manifest records the spelled local path — never an `https://`
+    # expansion of it.
+    manifest = tomllib.loads((parent / "gf.toml").read_text())
+    entries = manifest["git_folder"]
+    assert [(f["name"], f["url"], f["path"]) for f in entries] == [
+        ("api", "upx.git/docs/api", "vendor/api")]
+
+    # The recorded spelling round-trips through `gf pull`: advancing the
+    # nested bare repo lands new content through the link.
+    git("-C", str(work), "checkout", "-q", "master", cwd=tmp_path)
+    (work / "docs" / "api" / "x.txt").write_text("api adv")
+    git("-C", str(work), "commit", "-aqm", "adv", cwd=tmp_path)
+    git("-C", str(work), "push", "-q", "origin", "master", cwd=tmp_path)
+    r = gf("-C", str(parent), "pull")
+    assert r.returncode == 0
+    assert (link / "x.txt").read_text().strip() == "api adv"
 
 
 # ---------------------------------------------------------------------------
@@ -766,12 +824,13 @@ def test_repo_store_gitdir_leaf_still_resolves(tmp_path):
     assert subdir == ""
 
 
-def test_clone_controls_repo_containing_committed_gf_dir(tmp_path):
-    """Non-`.gf` control + lexical ruling: a normal repo that happens to
-    carry COMMITTED `.gf` content resolves and clones normally for
-    leaves outside `.gf` — while a leaf at-or-inside that `.gf` subtree
-    is refused anyway (the refusal is lexical, "at-or-inside a `.gf`
-    subtree", not conditioned on gf's private layout)."""
+def test_clone_refuses_repo_with_committed_gf_root(tmp_path):
+    """A committed ROOT `.gf` entry poisons the upstream's whole tree:
+    even a leaf outside `.gf` refuses before materialization (the
+    shared checkout would land `.gf` content where gf anchors its own
+    layout — the uniform refusal covers every root entry kind), while a
+    leaf at-or-inside the `.gf` subtree keeps its lexical refusal
+    ("at-or-inside a `.gf` subtree", independent of the tree guard)."""
     repo = tmp_path / "R"
     repo.mkdir()
     git("init", cwd=repo)
@@ -784,20 +843,21 @@ def test_clone_controls_repo_containing_committed_gf_dir(tmp_path):
     git("commit", "-m", "init", cwd=repo)
     parent = _real_parent(tmp_path)
 
-    # ordinary leaves resolve: committed `.gf` content does not poison
-    # the repository's own resolution
-    gf("-C", str(parent), "clone", str(repo / "docs"), "vendor/docs")
-    assert (parent / "vendor" / "docs" / "index.md").read_text() == (
-        "docs index\n")
+    # a leaf outside `.gf` still refuses: materializing the resolved
+    # tree would place its root `.gf` entry inside gf storage
+    r = gf("-C", str(parent), "clone", str(repo / "docs"),
+           "vendor/docs", check=False)
+    assert r.returncode == 1
+    assert "gf-managed storage" in r.stderr
+    assert not os.path.lexists(parent / "vendor" / "docs")
 
-    # but a leaf at-or-inside a `.gf` subtree refuses even here
+    # and a leaf at-or-inside a `.gf` subtree refuses lexically
     r = gf("-C", str(parent), "clone", str(repo / ".gf" / "notes"),
            "x", check=False)
     assert r.returncode == 1
     assert "is inside a '.gf' directory" in r.stderr
     assert not os.path.lexists(parent / "x")
-    assert [e["path"] for e in _manifest_entries(parent)] == [
-        "vendor/docs"]
+    assert _manifest_entries(parent) == []
 # R6-A — pinned-ref (tag/commit) coverage on the store-join path
 #
 # A store narrowed by `--single-branch` carries only `+refs/heads/<b>:...`
@@ -1303,3 +1363,611 @@ def test_create_store_collision_branch_wins_no_tag_line(tmp_path):
     link = parent / "vendor" / "x"
     assert link.resolve() == (rk / "x" / "docs" / "api").resolve()
     assert (link / "x-branch.txt").read_text() == "x branch tip"
+
+
+# ---------------------------------------------------------------------------
+# F2 — a consumer path resolving into `.gf` storage is never a bindable
+# whole-repo child (round-11 ruling; spec `gf init` / `gf clone` /
+# `gf pull`). R7-B's destination guard resolved only the parent chain: the
+# leaf stayed lexical so a live consumer link keeps its re-add path —
+# which also let a LEAF link into `.gf` slip past it. F2 refuses the
+# resolved leaf too: `cmd_init` compares `target.resolve()` against
+# `(parent/.gf).resolve()`, and the child-creation layer
+# (`init_git_folder`, `init_child`, `update_child`'s whole-repo arm)
+# refuses any `co.is_store_checkout`/`layout.in_gf_tree` child. The
+# discriminating fixture is a RECORDLESS store checkout — the worktree
+# record deleted from the store's `worktrees/` while the checkout tree
+# remains — whose orphan consumer link resolves into `.gf/wt` but no
+# longer answers `_is_git_folder_child`: an `init` there plants a fresh
+# gitdir at the record's own path, wedging the checkout key.
+#
+# Verified pre-fix signatures (against d45b79a):
+#   `gf init orphanlink` (link into recordless checkout):
+#       rc 0 "Initialized orphanlink" — a bare `git init` gitdir planted
+#       at `<store>/worktrees/master` (no `gitdir`/`commondir` record
+#       files), manifest gained the `orphanlink` entry; following the
+#       record-missing error's own recovery then dies `git worktree add
+#       did not create the expected worktree record` on every later run.
+#   `gf init interior` (link → `.gf`): rc 0 — gitdir planted at
+#       `<root>/.gf/.gf/git` inside the parent's storage.
+#   `gf clone <up> orphanlink` (dead-checkout link): rc 1 but only via
+#       the occupancy arm — "already exists and is not empty".
+#   `gf pull` of a forged `path = ".gf/forged"` whole-repo binding:
+#       rc 0 "Pulled forged" — `<root>/.gf/forged/` populated with the
+#       upstream tree plus a nested `.gf/git` gitdir.
+#
+# The live-link twin stays pinned: a leaf that IS a live consumer link
+# still re-adds by the already-a-git-folder rule (spec L221) — the
+# `_is_git_folder_child` early return precedes the new refusal in
+# `init_child`, and `update_child`'s `subdir` arms are exempt.
+
+
+def _orphan_link_into_dead_checkout(parent: Path, rk: Path) -> Path:
+    """Remove the `master` worktree record and spell a root-level link
+    into the recordless checkout's mapped subdir.
+
+    The record is gone from `<store>/worktrees/` while the checkout tree
+    `.gf/wt/<rk>/master` and its `.master.state` remain — the dead-
+    checkout shape that turns a consumer link into a wedge vector."""
+    store = _store(parent, rk)
+    shutil.rmtree(store / "worktrees" / "master")
+    link = parent / "orphanlink"
+    link.symlink_to(
+        os.path.relpath(rk / "master" / "docs" / "api", link.parent))
+    return link
+
+
+def test_init_refuses_link_into_recordless_store_checkout(tmp_path):
+    """F2 core wedge pin: with the `master` worktree record removed but
+    its checkout tree intact, `gf init orphanlink` on a link into that
+    recordless checkout must REFUSE — rc 1 with the gf-managed-storage
+    refusal — and plant NOTHING: `worktrees/` stays recordless, the
+    manifest is byte-identical, and a later `gf pull` surfaces the same
+    record-missing error (with its working recovery) it would have
+    given without the init attempt — never the wedge's `did not create
+    the expected worktree record`.
+
+    Pre-fix (verified): rc 0, a bare gitdir planted at
+    `<store>/worktrees/master`, the bogus `orphanlink` entry recorded —
+    and the documented recovery wedged permanently on the occupied
+    record name."""
+    upstream = _upstream(tmp_path)
+    parent = _real_parent(tmp_path)
+    gf("-C", str(parent), "clone", str(upstream / "docs" / "api"),
+       "vendor/api")
+    r = gf("-C", str(parent), "pull")
+    assert "Pulled api" in r.stdout
+
+    rk = _repo_key_dir(parent)
+    store = _store(parent, rk)
+    checkout = rk / "master"
+    state_file = rk / ".master.state"
+    _orphan_link_into_dead_checkout(parent, rk)
+    assert not (store / "worktrees" / "master").exists()
+    assert checkout.is_dir() and state_file.is_file()
+    gf_before = _gf_tree(parent)
+    manifest_before = (parent / "gf.toml").read_bytes()
+
+    r = gf("-C", str(parent), "init", "orphanlink", check=False)
+    assert r.returncode == 1
+    assert "resolves inside gf-managed storage (.gf)" in r.stderr
+
+    # nothing planted: the store's worktree records stay empty, the
+    # checkout tree and manifest are untouched, the whole `.gf` tree is
+    # byte-identical
+    assert [p.name for p in (store / "worktrees").iterdir()] == []
+    assert _gf_tree(parent) == gf_before
+    assert (parent / "gf.toml").read_bytes() == manifest_before
+    assert [(e["name"], e["path"]) for e in _manifest_entries(parent)
+            ] == [("api", "vendor/api")]
+
+    # the next `gf pull` reports the missing record — the same recovery
+    # surface as with no init attempt — and leaves nothing behind
+    r = gf("-C", str(parent), "pull", check=False)
+    assert r.returncode == 1
+    assert "worktree record" in r.stderr and "missing" in r.stderr
+    assert _gf_tree(parent) == gf_before
+
+    # and the error's own documented recovery is NOT wedged: removing
+    # the checkout tree plus its state file lets the next pull create a
+    # REAL record (gitdir file + lock) and serve the binding again —
+    # pre-fix the planted gitdir took the `master` record name and every
+    # later run died `did not create the expected worktree record`
+    shutil.rmtree(checkout)
+    state_file.unlink()
+    r = gf("-C", str(parent), "pull")
+    assert "Pulled api" in r.stdout
+    admin = store / "worktrees" / "master"
+    assert (admin / "gitdir").is_file()
+    assert (admin / "locked").is_file()
+    assert (parent / "vendor" / "api" / "x.txt"
+            ).read_text().strip() == "api on master"
+
+
+def test_init_refuses_gf_interior_spellings(tmp_path):
+    """F2 spelling pins: `gf init` refuses the `.gf` interior however it
+    is spelled — the physical `.gf/wt/<rk>/<ck>/docs/api` path (lexical
+    arm, refused pre-fix too — a green guard) and `interior`, a leaf
+    link whose own realpath IS `.gf` (the resolved arm F2 adds —
+    pre-fix planted a `<root>/.gf/.gf/git` gitdir and recorded the
+    binding). Nothing inside `.gf` may be created and the manifest
+    stays untouched."""
+    upstream = _upstream(tmp_path)
+    parent = _real_parent(tmp_path)
+    gf("-C", str(parent), "clone", str(upstream / "docs" / "api"),
+       "vendor/api")
+    rk = _repo_key_dir(parent)
+    interior_link = parent / "interior"
+    interior_link.symlink_to(layout.GF_DIR)
+    gf_before = _gf_tree(parent)
+    manifest_before = (parent / "gf.toml").read_bytes()
+
+    # direct `.gf/wt` interior spelling — leaf lands inside a checkout
+    spelled = f".gf/wt/{rk.name}/master/docs/api"
+    r = gf("-C", str(parent), "init", spelled, check=False)
+    assert r.returncode == 1
+    assert "resolves inside gf-managed storage (.gf)" in r.stderr
+
+    # leaf link resolving to `.gf` itself — the arm F2's resolved
+    # comparison adds; pre-fix initialized `.gf/.gf/git`
+    r = gf("-C", str(parent), "init", "interior", check=False)
+    assert r.returncode == 1
+    assert "resolves inside gf-managed storage (.gf)" in r.stderr
+
+    assert _gf_tree(parent) == gf_before
+    assert not (parent / ".gf" / ".gf").exists()
+    assert (parent / "gf.toml").read_bytes() == manifest_before
+    assert [(e["name"], e["path"]) for e in _manifest_entries(parent)
+            ] == [("api", "vendor/api")]
+
+
+def test_clone_refuses_dead_checkout_consumer_link(tmp_path):
+    """F2 clone arm: `gf clone <up> orphanlink` onto a link into a
+    recordless checkout is refused by `init_child`'s new
+    `is_store_checkout`/`in_gf_tree` guard — rc 1 naming gf-managed
+    storage, not the pre-fix occupancy refusal (`already exists and is
+    not empty`, which only fired because the orphaned checkout tree
+    still holds files). No record is recreated and the manifest stays
+    untouched."""
+    upstream = _upstream(tmp_path)
+    parent = _real_parent(tmp_path)
+    gf("-C", str(parent), "clone", str(upstream / "docs" / "api"),
+       "vendor/api")
+    rk = _repo_key_dir(parent)
+    store = _store(parent, rk)
+    _orphan_link_into_dead_checkout(parent, rk)
+    gf_before = _gf_tree(parent)
+    manifest_before = (parent / "gf.toml").read_bytes()
+
+    r = gf("-C", str(parent), "clone", str(upstream), "orphanlink",
+           check=False)
+    assert r.returncode == 1
+    assert "resolves inside gf-managed storage (.gf)" in r.stderr
+    assert "already exists and is not empty" not in r.stderr
+
+    assert [p.name for p in (store / "worktrees").iterdir()] == []
+    assert _gf_tree(parent) == gf_before
+    assert (parent / "gf.toml").read_bytes() == manifest_before
+
+
+def test_pull_refuses_forged_gf_manifest_path(tmp_path):
+    """F2 update_child arm: a forged manifest `path = ".gf/forged"` on a
+    whole-repo url is refused — rc 1 naming gf-managed storage. With
+    manifest-read validation the refusal fires at read (fail closed);
+    `update_child`'s `in_gf_tree` guard stays as the in-depth layer for
+    children not reached through a manifest `path`. Pre-fix the same
+    pull SUCCEEDED: `.gf/forged/` was populated with the upstream tree
+    behind a nested `.gf/git` gitdir inside the parent's storage. A
+    subfolder binding's `subdir` arms are exempt — they resolve `child`
+    into `.gf/wt` legitimately, so this guard lives only on the
+    whole-repo arm."""
+    upstream = _upstream(tmp_path)
+    parent = _real_parent(tmp_path)
+    (parent / "gf.toml").write_text(
+        '[[git_folder]]\n'
+        'name = "forged"\n'
+        f'url = "{upstream}"\n'
+        'ref = "latest"\n'
+        'path = ".gf/forged"\n')
+    manifest_before = (parent / "gf.toml").read_bytes()
+
+    r = gf("-C", str(parent), "pull", ".gf/forged", check=False)
+    assert r.returncode == 1
+    # read-time refusal names the binding + storage; the update_child
+    # arm (still reached by non-manifest paths) says "resolves inside"
+    assert "gf-managed storage" in r.stderr and "forged" in r.stderr
+
+    # nothing inside `.gf` was ever created — pre-fix the pull planted
+    # the populated `.gf/forged` child plus its nested `.gf/git`
+    assert not (parent / ".gf").exists()
+    assert (parent / "gf.toml").read_bytes() == manifest_before
+
+
+def test_gf_storage_refusal_controls_unaffected(tmp_path):
+    """F2 controls: the paths the ruling must NOT disturb. A leaf that
+    IS a live consumer link still binds by the already-a-git-folder
+    rule — with the record live, `gf clone <up>/docs/api vendor/api`
+    re-adds the manifest entry without touching store, checkout or
+    link (spec L221) — and ordinary `init`/`clone`/`pull` targets that
+    never resolve into `.gf` stay green."""
+    upstream = _upstream(tmp_path)
+    parent = _real_parent(tmp_path)
+    gf("-C", str(parent), "clone", str(upstream / "docs" / "api"),
+       "vendor/api")
+    rk = _repo_key_dir(parent)
+    store = _store(parent, rk)
+    admin_before = (store / "worktrees" / "master" / "gitdir"
+                    ).read_bytes()
+
+    # live-link re-add: drop the manifest entry, keep the live link —
+    # clone binds it again with no side effects beyond the manifest
+    gf("-C", str(parent), "rm", "vendor/api")
+    assert _manifest_entries(parent) == []
+    link = parent / "vendor" / "api"
+    link.symlink_to(
+        os.path.relpath(rk / "master" / "docs" / "api", link.parent))
+    gf_before = _gf_tree(parent)
+    gf("-C", str(parent), "clone", str(upstream / "docs" / "api"),
+       "vendor/api")
+    assert [(e["name"], e["path"]) for e in _manifest_entries(parent)
+            ] == [("api", "vendor/api")]
+    assert _gf_tree(parent) == gf_before
+    assert (store / "worktrees" / "master" / "gitdir"
+            ).read_bytes() == admin_before
+    assert link.is_symlink()
+
+    # ordinary targets unaffected: whole-repo clone, local init, pull
+    gf("-C", str(parent), "clone", str(upstream), "libs/up")
+    assert (parent / "libs" / "up" / ".gf" / "git" / "HEAD").is_file()
+    assert (parent / "libs" / "up" / "root.txt").is_file()
+    gf("-C", str(parent), "init", "newdir")
+    assert (parent / "newdir" / ".gf" / "git" / "HEAD").is_file()
+    r = gf("-C", str(parent), "pull")
+    assert "Pulled" in r.stdout
+
+
+# ---------------------------------------------------------------------------
+# R12-2 — `gf init` must never RECORD a consumer path carrying a `.gf`
+# segment (spec `gf init`; manifest read-validation rule "normalized ...
+# must contain no `.gf` segment"). F2's guards all resolve through the
+# filesystem: under a plain `sub`, the `sub/.gf/x` realpath is itself —
+# outside the parent's `.gf` — so every pre-existing arm passed it. But
+# the recorded `path = "sub/.gf/x"` is exactly what the manifest reader's
+# own lexical predicate (`_validate_consumer_path`: `.gf` anywhere in the
+# NORMED path's parts) refuses — the init SUCCEEDED, then every later
+# command died on the manifest it wrote, `gf rm` included: a permanent
+# wedge until the manifest is hand-edited. The write side now applies the
+# reader's lexical predicate to `rel` before any side effect, and
+# `init_git_folder` carries the `layout.in_gf_tree` guard `init_child`/
+# `update_child` already had — under a live whole-repo child the spelling
+# also resolves inside the CHILD's `.gf`, so the in-depth layer refuses
+# what the CLI arms would never reach.
+#
+# Verified pre-fix signatures (against 74298d6):
+#   `gf init sub/.gf/x` (plain `sub`): rc 0 "Initialized x in sub/.gf/x" —
+#       `sub/.gf/x/` created and a fresh `sub/.gf/x/.gf/git` gitdir
+#       planted; gf.toml gained `path = "sub/.gf/x"`; the very next
+#       `gf ls` died `gf.toml: git-folder 'x' path 'sub/.gf/x' reaches
+#       inside gf-managed storage (.gf)` — every command wedged.
+#   `gf init sub/.gf/x` (live whole-repo child `sub`): rc 0 — the gitdir
+#       planted at `sub/.gf/x/.gf/git` INSIDE the child's own `.gf`
+#       storage, same manifest wedge on the next command.
+#   `gf init sub/.gf/../y`: rc 0 recorded `sub/y` — green pre- and
+#       post-fix; the reader's `os.path.normpath` drops the `.gf`
+#       segment the `..` consumes, so parity means the WRITE predicate
+#       must also see the normalized rel.
+#   `gf init <leaf link -> .gf/wt/...>`: rc 1 pre- and post-fix — F2's
+#       resolved arm, which the lexical arm must not shadow (the leaf
+#       stays literal in `rel`, so `.gf` never appears in it).
+
+
+def test_init_refuses_midpath_gf_segment(tmp_path):
+    """R12-2 core wedge pin: `gf init sub/.gf/x` with `sub` a plain
+    directory must REFUSE — rc 1 with the `gf:` envelope naming the
+    would-be binding and gf-managed storage — and leave NOTHING: `sub`
+    stays a plain dir (no `.gf` planted inside it), `gf.toml` stays
+    absent, and the refusal is idempotent. The recorded path is the
+    payload: pre-fix (verified) the same init exited 0, wrote
+    `path = "sub/.gf/x"`, and every later command — `ls`, `status`,
+    `rm` included — died on the manifest read refusal."""
+    parent = _real_parent(tmp_path)
+    (parent / "sub").mkdir()
+
+    # refused identically on repeat — nothing accumulates
+    for _ in range(2):
+        r = gf("-C", str(parent), "init", "sub/.gf/x", check=False)
+        assert r.returncode == 1
+        assert "gf: init failed for git-folder 'x'" in r.stderr
+        assert "sub/.gf/x" in r.stderr
+        assert "resolves inside gf-managed storage (.gf)" in r.stderr
+
+        assert not (parent / "sub" / ".gf").exists()
+        assert [p.name for p in (parent / "sub").iterdir()] == []
+        assert not (parent / "gf.toml").exists()
+        assert _manifest_entries(parent) == []
+
+    # no wedge: an absent manifest is a quiet empty success on the very
+    # commands the recorded `.gf` path refused pre-fix
+    assert gf("-C", str(parent), "ls").returncode == 0
+    assert gf("-C", str(parent), "status").returncode == 0
+    assert gf("-C", str(parent), "rm").returncode == 0
+
+
+def test_init_refuses_midpath_gf_segment_in_child(tmp_path):
+    """R12-2 child-storage pin: with `sub` a live whole-repo git-folder,
+    `gf init sub/.gf/x` is refused by the same envelope — and the child's
+    `.gf` storage is byte-identical (still only `git/`): pre-fix
+    (verified) the init exited 0 after planting a fresh gitdir at
+    `sub/.gf/x/.gf/git` INSIDE the child's `.gf`, the shape
+    `init_git_folder`'s new `in_gf_tree` arm covers independently of the
+    `rel` guard. gf.toml keeps only the `sub` binding and `gf ls` still
+    lists it."""
+    parent = _real_parent(tmp_path)
+    gf("-C", str(parent), "init", "sub")
+    assert sorted(p.name for p in (parent / "sub" / ".gf").iterdir()
+                  ) == ["git"]
+    child_gf_before = _gf_tree(parent / "sub")
+    manifest_before = (parent / "gf.toml").read_bytes()
+
+    r = gf("-C", str(parent), "init", "sub/.gf/x", check=False)
+    assert r.returncode == 1
+    assert "gf: init failed for git-folder 'x'" in r.stderr
+    assert "sub/.gf/x" in r.stderr
+    assert "resolves inside gf-managed storage (.gf)" in r.stderr
+
+    # the child's `.gf` is byte-identical — nothing planted inside it —
+    # and the manifest keeps only the `sub` binding
+    assert _gf_tree(parent / "sub") == child_gf_before
+    assert (parent / "gf.toml").read_bytes() == manifest_before
+    assert [(e["name"], e["path"]) for e in _manifest_entries(parent)
+            ] == [("sub", "sub")]
+
+    # no wedge: the surviving manifest reads clean and the child lists
+    r = gf("-C", str(parent), "ls")
+    assert "sub" in r.stdout
+    assert gf("-C", str(parent), "status").returncode == 0
+
+
+def test_init_midpath_gf_controls(tmp_path):
+    """R12-2 controls — the spellings the ruling must NOT disturb:
+
+    - `gf init sub/x` nested under a live whole-repo child stays green:
+      the child's own `.gf` is a SIBLING of `x`, never an ancestor
+      segment of the recorded `sub/x` (the lexical `.gf` predicate is a
+      segment test on the normalized rel, not a descendant test);
+    - `gf init sub/.gf/../y` records `sub/y`: the `..` consumes the
+      `.gf` segment when the leaf's parent is resolved, exactly the
+      `os.path.normpath` the reader applies — a `.gf` segment that
+      normalizes away was never refused;
+    - a leaf symlink into the live `.gf/wt` store checkout keeps F2's
+      refusal: the leaf stays literal in `rel` so the new arm never
+      sees `.gf` in it, and the resolved arm still fires."""
+    upstream = _upstream(tmp_path)
+    parent = _real_parent(tmp_path)
+    gf("-C", str(parent), "clone", str(upstream / "docs" / "api"),
+       "vendor/api")
+    rk = _repo_key_dir(parent)
+    gf("-C", str(parent), "init", "sub")
+
+    # nested init under a whole-repo child — unaffected
+    gf("-C", str(parent), "init", "sub/x")
+    assert (parent / "sub" / "x" / ".gf" / "git" / "HEAD").is_file()
+
+    # normpath parity — `.gf` consumed by `..` records `sub/y`
+    child_gf_before = _gf_tree(parent / "sub")
+    r = gf("-C", str(parent), "init", "sub/.gf/../y")
+    assert "Initialized y in sub/y" in r.stdout
+    assert (parent / "sub" / "y" / ".gf" / "git" / "HEAD").is_file()
+    assert _gf_tree(parent / "sub") == child_gf_before
+
+    # F2 leaf-link refusal preserved — a link into the live `.gf/wt`
+    # checkout is still refused and leaves the `.gf` tree untouched
+    gf_before = _gf_tree(parent)
+    link = parent / "wtlink"
+    link.symlink_to(
+        os.path.relpath(rk / "master" / "docs" / "api", link.parent))
+    r = gf("-C", str(parent), "init", "wtlink", check=False)
+    assert r.returncode == 1
+    assert "resolves inside gf-managed storage (.gf)" in r.stderr
+    assert link.is_symlink()
+    assert _gf_tree(parent) == gf_before
+
+    assert [(e["name"], e["path"]) for e in _manifest_entries(parent)
+            ] == [("api", "vendor/api"), ("sub", "sub"),
+                  ("x", "sub/x"), ("y", "sub/y")]
+    r = gf("-C", str(parent), "ls")
+    assert "sub/y" in r.stdout
+
+
+# ---------------------------------------------------------------------------
+# R14-F10 — `gf clone` must never RECORD a `binding_path` carrying a `.gf`
+# or `.git` segment, and the refusal must precede `init_child`'s
+# `_is_git_folder_child` early return.
+#
+# R12-2 put the manifest reader's lexical predicate into `cmd_init`'s `rel`
+# check, but `cmd_clone` computes `rel` and hands it to `init_child` as
+# `binding_path` — where the already-a-git-folder early return (the
+# deliberate live-consumer-link re-add path, spec L221) waved ANY spelling
+# straight through to the manifest write, ahead of the `.gf` realpath
+# guards below it. The discriminating fixture is a LIVE whole-repo child
+# physically moved under a `.gf`/`.git` segment with its manifest record
+# dropped (`mv regular sub/.gf/regular` + `gf rm regular`): the moved
+# `sub/.gf/regular/.gf/git/HEAD` still answers `_is_git_folder_child`, so
+# pre-fix the clone was "just an add to the manifest" — recording the
+# poisoned `path` verbatim. The realpath refusal can't carry this check: a
+# live consumer link's realpath legitimately sits inside `.gf/wt`, so only
+# the recorded spelling is segment-tested.
+#
+# Verified pre-fix signatures (against HEAD 1629849):
+#   `gf clone <up> sub/.gf/regular` (moved live child): rc 0 "Cloned
+#       regular into sub/.gf/regular" — gf.toml gained
+#       `path = "sub/.gf/regular"` and every later command (`ls`,
+#       `status`, `rm regular`, `pull`) died `gf: gf.toml: git-folder
+#       'regular' path 'sub/.gf/regular' reaches inside gf-managed
+#       storage (.gf)` — a wedge until the manifest is hand-edited.
+#   `gf clone <up> sub/.git/regular`: rc 0 "Cloned regular into
+#       sub/.git/regular" — `path = "sub/.git/regular"` recorded with NO
+#       wedge: the reader's segment predicate is `.gf`-only, so `gf ls`
+#       kept listing a binding spelled inside `.git` storage.
+
+
+def _moved_live_child(parent: Path, dest: str) -> None:
+    """Relocate the live whole-repo child `regular` to `dest` — a `.gf`-
+    or `.git`-carrying spelling — and drop its manifest record.
+
+    The moved `dest/.gf/git` gitdir still answers `_is_git_folder_child`,
+    so `init_child`'s existing-child early return is exactly the path a
+    `binding_path` refusal must precede.
+    """
+    (parent / dest).parent.mkdir(parents=True)
+    shutil.move(str(parent / "regular"), str(parent / dest))
+    r = gf("-C", str(parent), "rm", "regular", check=False)
+    if r.returncode != 0:
+        pytest.fail(f"setup: rm rc={r.returncode}:\n"
+                    f"{r.stdout}\n{r.stderr}")
+    if not (parent / dest / ".gf" / "git" / "HEAD").is_file():
+        pytest.fail("setup: moved child lost its .gf gitdir")
+    if _manifest_entries(parent) != []:
+        pytest.fail(
+            f"setup: manifest not empty: {_manifest_entries(parent)}")
+
+
+def test_clone_refuses_existing_child_under_gf_segment(tmp_path):
+    """R14-F10 core wedge pin: `gf clone <up> sub/.gf/regular` where the
+    spelled path IS a live whole-repo git-folder (relocated there after
+    `gf rm` dropped its record) must REFUSE — rc 1, the `gf:` envelope
+    naming the binding path and `reaches inside gf-managed storage
+    (.gf)` — BEFORE the already-a-git-folder early return can record it.
+    gf.toml stays byte-identical (`git_folder = []`), the moved child is
+    untouched, and the commands a recorded `sub/.gf/regular` wedged
+    pre-fix — `gf ls`, `gf status`, `gf rm` — run clean."""
+    upstream = _upstream(tmp_path)
+    parent = _real_parent(tmp_path)
+    gf("-C", str(parent), "clone", str(upstream), "regular")
+    _moved_live_child(parent, "sub/.gf/regular")
+    manifest_before = (parent / "gf.toml").read_bytes()
+
+    r = gf("-C", str(parent), "clone", str(upstream), "sub/.gf/regular",
+           check=False)
+
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    assert "Cloned" not in r.stdout
+    assert "gf: clone failed for git-folder 'regular'" in r.stderr
+    assert "sub/.gf/regular" in r.stderr
+    assert "inside gf-managed storage (.gf)" in r.stderr
+
+    # the refusal precedes the manifest write — nothing is recorded and
+    # the moved child keeps its live gitdir
+    assert (parent / "gf.toml").read_bytes() == manifest_before
+    assert _manifest_entries(parent) == []
+    assert (parent / "sub" / ".gf" / "regular" / ".gf" / "git" / "HEAD"
+            ).is_file()
+
+    # no wedge: the commands the poisoned `path` refused on read run
+    # clean on the unchanged manifest
+    assert gf("-C", str(parent), "ls").returncode == 0
+    assert gf("-C", str(parent), "status").returncode == 0
+    assert gf("-C", str(parent), "rm", "regular").returncode == 0
+
+
+def test_clone_refuses_existing_child_under_git_segment(tmp_path):
+    """R14-F10 `.git` arm: the same moved-live-child shape under a
+    `.git` segment — `sub/.git/regular` — refuses with `reaches inside
+    git-managed storage (.git)` and records nothing. Pre-fix this was a
+    SILENT poison: the manifest reader's predicate is `.gf`-only, so
+    rc 0 recorded `path = "sub/.git/regular"` and `gf ls` kept listing
+    a binding spelled inside `.git` storage."""
+    upstream = _upstream(tmp_path)
+    parent = _real_parent(tmp_path)
+    gf("-C", str(parent), "clone", str(upstream), "regular")
+    _moved_live_child(parent, "sub/.git/regular")
+    manifest_before = (parent / "gf.toml").read_bytes()
+
+    r = gf("-C", str(parent), "clone", str(upstream),
+           "sub/.git/regular", check=False)
+
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    assert "Cloned" not in r.stdout
+    assert "gf: clone failed for git-folder 'regular'" in r.stderr
+    assert "sub/.git/regular" in r.stderr
+    assert "repository metadata (.git)" in r.stderr or \
+        "inside git-managed storage (.git)" in r.stderr
+
+    assert (parent / "gf.toml").read_bytes() == manifest_before
+    assert _manifest_entries(parent) == []
+    assert (parent / "sub" / ".git" / "regular" / ".gf" / "git" / "HEAD"
+            ).is_file()
+    assert gf("-C", str(parent), "ls").returncode == 0
+    assert gf("-C", str(parent), "status").returncode == 0
+
+
+def test_clone_managed_segment_controls(tmp_path):
+    """R14-F10 controls — the re-add paths the check ordering must NOT
+    disturb:
+
+    - live consumer-link re-add: `vendor/api` re-created onto the
+      still-live `.gf/wt` checkout after `gf rm` — `gf clone` re-binds
+      through the already-a-git-folder early return the new check sits
+      ahead of. Its `binding_path` is the clean lexical `vendor/api`:
+      only the SPELLED parts are segment-tested — a realpath test would
+      refuse the link's `.gf/wt` resolution and break this path;
+    - whole-repo existing-child re-add: `kid/` keeps `.gf/git` while an
+      external edit drops its manifest record — clone re-records it;
+    - a `.gf`-free nested target `sub/x` clones normally.
+    """
+    upstream = _upstream(tmp_path)
+    parent = _real_parent(tmp_path)
+
+    # whole-repo existing-child re-add — `kid` keeps its `.gf` gitdir
+    # while the manifest record is dropped externally; clone re-adds by
+    # the same early return, touching nothing but gf.toml
+    gf("-C", str(parent), "clone", str(upstream), "kid")
+    (parent / "gf.toml").write_text("git_folder = []\n")
+    kid_gf_before = _gf_tree(parent / "kid")
+    r = gf("-C", str(parent), "clone", str(upstream), "kid", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "Cloned kid into kid" in r.stdout
+    assert [(e["name"], e["path"]) for e in _manifest_entries(parent)
+            ] == [("kid", "kid")]
+    assert _gf_tree(parent / "kid") == kid_gf_before
+    assert (parent / "kid" / "root.txt").read_text().strip() == \
+        "root file"
+
+    # live consumer-link re-add — `gf rm` drops the record and the link;
+    # re-creating the link onto the still-live `.gf/wt` checkout lets
+    # clone re-bind through the early return
+    gf("-C", str(parent), "clone", str(upstream / "docs" / "api"),
+       "vendor/api")
+    rk = _repo_key_dir(parent)
+    store = _store(parent, rk)
+    admin_before = (store / "worktrees" / "master" / "gitdir"
+                    ).read_bytes()
+    r = gf("-C", str(parent), "rm", "vendor/api", check=False)
+    if r.returncode != 0:
+        pytest.fail(f"setup: rm rc={r.returncode}:\n"
+                    f"{r.stdout}\n{r.stderr}")
+    link = parent / "vendor" / "api"
+    link.symlink_to(
+        os.path.relpath(rk / "master" / "docs" / "api", link.parent))
+    if not link.is_symlink():
+        pytest.fail("setup: consumer link was not recreated")
+    gf_before = _gf_tree(parent)
+
+    r = gf("-C", str(parent), "clone", str(upstream / "docs" / "api"),
+           "vendor/api", check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "Cloned api into vendor/api" in r.stdout
+    assert _gf_tree(parent) == gf_before
+    assert (store / "worktrees" / "master" / "gitdir"
+            ).read_bytes() == admin_before
+    assert link.is_symlink()
+    assert (link / "x.txt").read_text().strip() == "api on master"
+
+    # a `.gf`-free nested path clones normally
+    r = gf("-C", str(parent), "clone", str(upstream), "sub/x",
+           check=False)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert (parent / "sub" / "x" / ".gf" / "git" / "HEAD").is_file()
+
+    assert [(e["name"], e["path"]) for e in _manifest_entries(parent)
+            ] == [("kid", "kid"), ("api", "vendor/api"), ("x", "sub/x")]

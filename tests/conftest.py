@@ -35,17 +35,53 @@ def _git_env(tmp_path, monkeypatch):
         monkeypatch.setenv(key, "gf-test")
     for key in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
         monkeypatch.setenv(key, "test@git-folders")
-    gitconfig = tmp_path / "gitconfig"
+    # gf's ambient-env scrub now strips the GIT_CONFIG_* file-redirect
+    # vars (GIT_CONFIG/GLOBAL/SYSTEM) from every spawned git, so the
+    # suite pins its config through a redirected HOME instead: git
+    # always reads $HOME/.gitconfig, a channel the scrub cannot close
+    # (HOME is not a GIT_* name). The GIT_CONFIG_* vars are dropped
+    # outright so the fixtures' own unscrubbed `git` calls resolve the
+    # same file a gf child would.
+    home = tmp_path / "home"
+    home.mkdir()
     # Belt-and-braces: git itself refuses every non-local transport
     # (verified on git 2.47.3 — https/ssh/git:// exit 128 "transport not
     # allowed"); local paths and user-invoked file:// stay allowed.
-    gitconfig.write_text(
+    (home / ".gitconfig").write_text(
         "[init]\n\tdefaultBranch = master\n"
         "[protocol]\n\tallow = never\n"
         '[protocol "file"]\n\tallow = user\n'
     )
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
+    monkeypatch.setenv("HOME", str(home))
+    # git reads `$XDG_CONFIG_HOME/git/config` ahead of `~/.gitconfig`;
+    # aim it at an empty dir so a host XDG config cannot leak in.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for key in ("GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+        monkeypatch.delenv(key, raising=False)
+
+
+@contextlib.contextmanager
+def deny_file_transport(tmp_path, monkeypatch):
+    """Refuse git's file transport inside the block, then restore.
+
+    Rewrites the suite's $HOME-anchored `.gitconfig` — the channel every
+    spawned git still reads now that the ambient-env scrub strips the
+    GIT_CONFIG_* env vars outright (a swapped GIT_CONFIG_GLOBAL value
+    would reach only the fixtures' own unscrubbed `git` calls, never a
+    gf child). The deny content restates the `_git_env` contract because
+    the file fully replaces the pinned global config.
+    """
+    gitconfig = Path(os.environ["HOME"]) / ".gitconfig"
+    prev = gitconfig.read_text()
+    gitconfig.write_text(
+        "[init]\n\tdefaultBranch = master\n"
+        "[protocol]\n\tallow = never\n"
+        '[protocol "file"]\n\tallow = never\n')
+    try:
+        yield
+    finally:
+        gitconfig.write_text(prev)
 
 
 class Result:

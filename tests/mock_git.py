@@ -66,6 +66,11 @@ class Repo:
     head_sha: str | None = None
     worktrees: list[Worktree] = field(default_factory=list)
     stashes: list[dict] = field(default_factory=list)
+    # Poison pin: when True, `ls-tree <sha> .gf` on this repo reports a
+    # root `.gf` entry — a committed blob/tree/symlink/gitlink alike.
+    # `fetch` carries the flag across so an upstream's poison reaches
+    # the store/child repo the entry guard probes.
+    gf_entry: bool = False
 
     def resolve(self, ref: str) -> str:
         if re.fullmatch(r"[0-9a-f]{40}", ref):
@@ -435,9 +440,33 @@ class MockGitBackend(GitBackend):
                 lines.append(f"{source.refs[ref]}\t{ref}")
             return GitResult(0, "\n".join(lines) + "\n" if lines else "", "")
 
+        if cmd == "ls-tree":
+            # `ls-tree <sha> [<path>]` — the `.gf` root-entry guard's
+            # probe. Trees carry no root `.gf` by default; `Repo.gf_entry`
+            # poisons a repo's trees so the refusal can be exercised.
+            # Only a root `.gf` pathspec reports the entry — a nested
+            # `sub/.gf` stays legal, as in real git.
+            pos = self._positionals(args[1:])
+            sha = pos[0] if pos else ""
+            specs = pos[1:]
+            if (
+                sha and repo.gf_entry
+                and any(s.rstrip("/") == ".gf" for s in specs)
+            ):
+                return GitResult(0, f"040000 tree {sha}\t.gf\n", "")
+            return GitResult(0, "", "")
+
         if cmd == "config":
             if len(args) >= 3 and args[1] == "--get":
                 key = f"{args[2]}.{args[3]}" if len(args) == 4 else args[2]
+                if key.startswith("remote.") and key.endswith(".url"):
+                    # `config --get remote.<name>.url` answers the remote
+                    # URL wherever the model recorded it — a `config`
+                    # write or a seeded `remotes` entry alike.
+                    url = self._remote_url(repo, key[7:-4])
+                    if url:
+                        return GitResult(0, url + "\n", "")
+                    return GitResult(1, "", "")
                 vals = repo.config.get(key)
                 if vals:
                     return GitResult(0, "\n".join(vals) + "\n", "")
@@ -457,6 +486,11 @@ class MockGitBackend(GitBackend):
             remote_url = self._remote_url(repo, remote_name)
             if remote_url:
                 source = self._target_repo(remote_url)
+                if source.gf_entry:
+                    # A poisoned root entry travels with the fetched
+                    # objects; the guard's `ls-tree` on THIS repo must
+                    # see it too.
+                    repo.gf_entry = True
                 if repo.mirror:
                     # mirror copies refs one-to-one
                     for ref, sha in source.refs.items():
